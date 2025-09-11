@@ -7,7 +7,7 @@ from psycopg_pool import ConnectionPool
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-from schema_agent import generate_schema
+from schema_agent import generate_schema  # AI schema generator
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -117,7 +117,7 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- AI-powered schema (with fallback) ----------
+# ---------- AI-powered schema ----------
 
 def run_schema(conn, site_id, payload):
     site_url, account_name = get_site_info(conn, site_id)
@@ -127,15 +127,20 @@ def run_schema(conn, site_id, payload):
 
     name = (payload or {}).get("name") or account_name
     if not name:
+        from urllib.parse import urlparse
         try:
-            from urllib.parse import urlparse
             name = urlparse(site_url).netloc
         except Exception:
             name = site_url
 
-    schema = generate_schema(biz_type=biz_type, site_name=name, site_url=site_url, extras=extras)
+    schema = generate_schema(
+        biz_type=biz_type,
+        site_name=name,
+        site_url=site_url,
+        extras=extras
+    )
 
-    # --- Fallback als schema leeg is ---
+    # ✅ Fallback afdwingen zodat output nooit null wordt
     if not schema or not isinstance(schema, dict) or not schema.get("@type"):
         schema = {
             "@context": "https://schema.org",
@@ -171,6 +176,7 @@ DISPATCH = {
     "keywords": run_keywords,
     "faq": run_faq,
     "report": run_report,
+    # 'schema' wordt apart afgehandeld omdat DB-info nodig is
 }
 
 # ---------- Job processing ----------
