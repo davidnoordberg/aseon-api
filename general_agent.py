@@ -1,14 +1,13 @@
-# general_agent.py
 import os, json, time, signal, sys, uuid
 from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-from schema_agent import generate_schema
+# schema_agent importeren we nu NIET, we doen fallback test
+# from schema_agent import generate_schema
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -68,19 +67,6 @@ def claim_one_job(conn):
 def finish_job(conn, job_id, ok, output=None, err=None):
     with conn.cursor() as cur:
         if ok:
-            safe_output = output if isinstance(output, dict) else {}
-            try:
-                preview = json.dumps(safe_output)[:200]
-            except Exception:
-                preview = "<unserializable>"
-            print(json.dumps({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "level": "INFO",
-                "msg": "finish_job_write",
-                "job_id": str(job_id),
-                "preview": preview
-            }), flush=True)
-
             cur.execute("""
                 UPDATE jobs
                 SET status='done',
@@ -88,7 +74,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                     finished_at=NOW(),
                     error=NULL
                 WHERE id=%s
-            """, (Json(normalize_output(safe_output)), job_id))
+            """, (json.dumps(normalize_output(output or {})), job_id))
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
@@ -99,6 +85,8 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                 WHERE id=%s
             """, (err_text, job_id))
         conn.commit()
+
+# ---------- Crawl integration ----------
 
 def get_site_info(conn, site_id):
     with conn.cursor() as cur:
@@ -120,6 +108,8 @@ def run_crawl(conn, site_id, payload):
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
+# ---------- AI-powered keywords ----------
+
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed", "home")
     market = (payload or {}).get("market", {})
@@ -127,33 +117,25 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
+# ---------- TEMP schema fallback ----------
+
 def run_schema(conn, site_id, payload):
     site_url, account_name = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
-    extras = dict(payload or {})
-    extras.pop("biz_type", None)
+    name = (payload or {}).get("name") or account_name or "TestSite"
 
-    name = (payload or {}).get("name") or account_name
-    if not name:
-        from urllib.parse import urlparse
-        try:
-            name = urlparse(site_url).netloc
-        except Exception:
-            name = site_url
+    dummy_schema = {
+        "@context": "https://schema.org",
+        "@type": biz_type,
+        "name": name,
+        "url": site_url,
+        "note": "This is a dummy schema to verify DB output storage."
+    }
 
-    schema = generate_schema(
-        biz_type=biz_type,
-        site_name=name,
-        site_url=site_url,
-        extras=extras
-    )
+    log("info", "schema_generated_dummy", schema=dummy_schema)
+    return {"schema": dummy_schema, "biz_type": biz_type, "name": name, "url": site_url}
 
-    log("info", "schema_generated", preview=json.dumps(schema)[:300] if isinstance(schema, dict) else str(schema)[:300])
-
-    if not schema or not isinstance(schema, dict) or not schema.get("@type"):
-        schema = {"@context": "https://schema.org", "@type": biz_type, "name": name, "url": site_url}
-
-    return {"schema": schema, "biz_type": biz_type, "name": name, "url": site_url}
+# ---------- Other jobtypes (stubs) ----------
 
 def run_faq(site_id, payload):
     topic = (payload or {}).get("topic") or "general"
@@ -180,6 +162,8 @@ DISPATCH = {
     "report": run_report,
 }
 
+# ---------- Job processing ----------
+
 def process_job(conn, job):
     jtype = job["type"]
     site_id = job["site_id"]
@@ -198,6 +182,8 @@ def process_job(conn, job):
 
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
+
+# ---------- Main loop ----------
 
 def main():
     global running
