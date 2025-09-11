@@ -10,28 +10,24 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
 
 from psycopg_pool import ConnectionPool
-from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-# ------- Config -------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.2.0")
+app = FastAPI(title="Aseon API", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # zet later strakker op je domein
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Connection pool (sync, stabiel)
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
-# ------- SQL -------
 CREATE_TABLES_SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -74,7 +70,6 @@ def normalize_url(u: str) -> str:
         u = u + "/"
     return u
 
-# ------- Models -------
 class AccountIn(BaseModel):
     name: str = Field(min_length=1)
     email: EmailStr
@@ -117,25 +112,18 @@ class JobOut(BaseModel):
     finished_at: Optional[str] = None
     error: Optional[str] = None
 
-# ------- Error handler (zorgt dat 500 in JSON komt) -------
 @app.exception_handler(Exception)
 def unhandled_ex_handler(request: Request, exc: Exception):
-    # Log naar stdout (Render logs)
     print("UNHANDLED ERROR:", repr(exc))
     traceback.print_exc()
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal Server Error", "error": str(exc)},
-    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "error": str(exc)})
 
-# ------- Startup: tabellen maken -------
 @app.on_event("startup")
 def on_startup():
     with pool.connection() as conn:
         conn.execute(CREATE_TABLES_SQL)
         conn.commit()
 
-# ------- Health -------
 @app.get("/healthz")
 def healthz():
     try:
@@ -145,18 +133,16 @@ def healthz():
     except Exception:
         return {"ok": False, "db": False}
 
-# ------- Accounts -------
+# ---------- UPSERT op email ----------
 @app.post("/accounts", response_model=AccountOut)
 def create_account(body: AccountIn):
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM accounts WHERE email=%s", (body.email,))
-        exists = cur.fetchone()
-        if exists:
-            raise HTTPException(status_code=409, detail="Email already exists")
         cur.execute(
             """
             INSERT INTO accounts (name, email)
             VALUES (%s, %s)
+            ON CONFLICT (email) DO UPDATE
+               SET name = EXCLUDED.name
             RETURNING id, name, email, created_at
             """,
             (body.name, body.email),
@@ -174,14 +160,12 @@ def get_account_by_email(email: EmailStr = Query(..., description="Lookup by ema
             raise HTTPException(status_code=404, detail="Account not found")
         return row
 
-# ------- Sites -------
 @app.post("/sites", response_model=SiteOut)
 def create_site(body: SiteIn):
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT 1 FROM accounts WHERE id=%s", (body.account_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=400, detail="account_id does not exist")
-
         url_norm = normalize_url(body.url)
         cur.execute(
             """
@@ -195,18 +179,13 @@ def create_site(body: SiteIn):
         conn.commit()
         return row
 
-# ------- Jobs -------
 @app.post("/jobs", response_model=JobOut)
 def create_job(body: JobIn):
     with pool.connection() as conn, conn.cursor() as cur:
-        # check site
         cur.execute("SELECT 1 FROM sites WHERE id=%s", (body.site_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=400, detail="site_id does not exist")
-
-        # payload veilig naar JSONB
         payload_jsonb = Json(body.payload) if body.payload is not None else None
-
         cur.execute(
             """
             INSERT INTO jobs (site_id, type, payload)
