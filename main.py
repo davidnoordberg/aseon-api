@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg
+from psycopg.types.json import Json  # <-- JSON adapter voor psycopg3
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -213,13 +214,16 @@ async def create_job(body: JobIn):
         if not site_exists:
             raise HTTPException(status_code=400, detail="site_id does not exist")
 
+        # Belangrijk: gebruik Json() adapter; die zet Python dict -> JSON voor jsonb
+        payload_param = Json(body.payload) if body.payload is not None else None
+
         await cur.execute(
             """
             INSERT INTO jobs (site_id, type, payload)
             VALUES (%s, %s, %s)
             RETURNING id, site_id, type, payload, status, created_at, started_at, finished_at, error
             """,
-            (body.site_id, body.type, json.dumps(body.payload) if body.payload else None),
+            (body.site_id, body.type, payload_param),
         )
         row = await cur.fetchone()
         return {
