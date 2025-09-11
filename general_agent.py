@@ -5,11 +5,13 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from crawl_light import crawl_site  # << nieuw
+
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))  # MVP: 1 per claim
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_ERROR_LEN = 500
 
-DSN = os.environ["DATABASE_URL"]  # verplicht
+DSN = os.environ["DATABASE_URL"]
 
 running = True
 
@@ -40,10 +42,6 @@ def normalize_output(obj):
     return json.loads(json.dumps(obj, default=default))
 
 def claim_one_job(conn):
-    """
-    Atomair claimen: selecteer + lock + update naar 'running' en geef direct de rij terug.
-    Dit voorkomt de psycopg fout 'the last operation didn't produce records (BEGIN)'.
-    """
     with conn.cursor() as cur:
         cur.execute("""
             WITH j AS (
@@ -60,7 +58,7 @@ def claim_one_job(conn):
             WHERE jobs.id = j.id
             RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
-        row = cur.fetchone()  # None als er geen queued jobs zijn
+        row = cur.fetchone()
         conn.commit()
         return row
 
@@ -86,17 +84,24 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             """, (err_text, job_id))
         conn.commit()
 
-# ---------- Jobtype stubs ----------
+# ---------- Crawl integration ----------
 
-def run_crawl(site_id, payload):
-    depth = int((payload or {}).get("depth", 1))
+def get_site_url(conn, site_id):
+    with conn.cursor() as cur:
+        cur.execute("SELECT url FROM sites WHERE id=%s", (site_id,))
+        row = cur.fetchone()
+        if not row or not row["url"]:
+            raise ValueError("Site URL not found")
+        return row["url"]
+
+def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
-    notes = [f"stub crawl: depth={depth}, max_pages={max_pages}"]
-    return {
-        "pages_checked": min(max_pages, 10),
-        "status_codes": {"200": 8, "301": 1, "404": 1},
-        "notes": notes
-    }
+    ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
+    start_url = get_site_url(conn, site_id)
+    result = crawl_site(start_url, max_pages=max_pages, ua=ua)
+    return result
+
+# ---------- Other jobtypes (stubs) ----------
 
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed") or "home"
@@ -147,23 +152,34 @@ def run_report(site_id, payload):
     return {"format": "markdown", "report": report_md}
 
 DISPATCH = {
-    "crawl": run_crawl,
     "keywords": run_keywords,
     "faq": run_faq,
     "schema": run_schema,
     "report": run_report,
 }
 
+# ---------- Job processing ----------
+
 def process_job(conn, job):
     jtype = job["type"]
     site_id = job["site_id"]
     payload = job.get("payload") or {}
+
+    if jtype == "crawl":
+        log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
+        output = run_crawl(conn, site_id, payload)
+        log("info", "job_done", id=str(job["id"]), type=jtype)
+        return output
+
     if jtype not in DISPATCH:
         raise ValueError(f"Unknown job type: {jtype}")
+
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
     output = DISPATCH[jtype](site_id, payload)
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
+
+# ---------- Main loop ----------
 
 def main():
     global running
