@@ -1,11 +1,31 @@
 services:
   - type: web
     name: aseon-api
+    env: python
+    plan: starter
+    region: frankfurt
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    buildCommand: ""
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
     envVars:
       - key: DATABASE_URL
-        sync: false         # zet je in de Render UI
+        sync: false   # zet ‘m in de Render UI
       - key: ENV
-        value: production
+        value: "production"
+
+  - type: worker
+    name: aseon-agent
+    env: python
+    plan: starter
+    region: frankfurt
+    runtime: python
+    startCommand: python general_agent.py
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: POLL_INTERVAL_SEC
+        value: "2"
+      - key: BATCH_SIZE
+        value: "1"
