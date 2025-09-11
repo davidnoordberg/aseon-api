@@ -6,7 +6,7 @@ from openai import OpenAI
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# Vast instructieblok: SEO, AEO, GEO best practices
+# Vast instructieblok
 _BASE_SYS = """
 You are an expert Schema.org JSON-LD generator.
 Your job is to produce PERFECT, production-ready structured data.
@@ -19,26 +19,17 @@ Rules:
 Types you must support:
 1. Organization / LocalBusiness
    - Fields: name, url, logo?, sameAs[], address?, telephone?
-   - GEO: link entities with sameAs (LinkedIn, Wikidata, socials)
 2. Article
    - Fields: headline, description, author{name,url}, datePublished, mainEntityOfPage, image
 3. FAQPage
    - Fields: mainEntity: [Question + acceptedAnswer{text}]
-   - AEO: Answers must be ≤80 words, factual, no marketing fluff
-   - Google: 2–3 FAQ items recommended for rich results
+   - Answers must be ≤80 words, factual, no marketing fluff
 4. OfferCatalog / Product
    - Fields: name, description, url, itemListElement[]
-   - Products/offers must have name + url at minimum
-
-General rules:
-- Do not fabricate data (phone numbers, addresses, emails). If unknown, omit.
-- Language: match the site’s language if given.
-- Entities: use sameAs with absolute URLs to authoritative sources.
-- Ensure Google Rich Results eligibility: required fields must always be present.
-- Validate JSON before returning: must be parseable.
 """
 
 def _call_llm(prompt: str) -> dict:
+    # Eerste poging met strikt JSON-format
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -49,43 +40,34 @@ def _call_llm(prompt: str) -> dict:
             response_format={"type": "json_object"},
             temperature=0.3,
         )
-        content = resp.choices[0].message.content
-        return json.loads(content)
-    except Exception:
-        return {}
+        return json.loads(resp.choices[0].message.content)
+    except Exception as e1:
+        # Tweede poging zonder response_format (meer vrijheid)
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": _BASE_SYS},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as e2:
+            print(json.dumps({
+                "level": "ERROR",
+                "msg": "schema_llm_failed",
+                "error": str(e2)
+            }), flush=True)
+            return {}
 
 def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
-    """Minimal fallback if model fails"""
-    if biz_type == "FAQPage":
-        return {
-            "@context": "https://schema.org",
-            "@type": "FAQPage",
-            "mainEntity": [
-                {
-                    "@type": "Question",
-                    "name": "Example question",
-                    "acceptedAnswer": {
-                        "@type": "Answer",
-                        "text": "Example answer (fallback)."
-                    }
-                }
-            ]
-        }
-    elif biz_type == "Article":
-        return {
-            "@context": "https://schema.org",
-            "@type": "Article",
-            "headline": f"{site_name} Article",
-            "description": f"Auto-generated fallback for {site_url}",
-            "mainEntityOfPage": site_url
-        }
-    else:  # Organization, LocalBusiness, Product, OfferCatalog
-        return {
-            "@context": "https://schema.org",
-            "@type": biz_type,
-            "name": site_name,
-            "url": site_url
-        }
+    return {
+        "@context": "https://schema.org",
+        "@type": biz_type,
+        "name": site_name,
+        "url": site_url
+    }
 
 def validate_schema(data: dict, biz_type: str) -> tuple[bool, str | None]:
     if not isinstance(data, dict):
@@ -121,17 +103,23 @@ def generate_schema(
     }
 
     prompt = f"Generate a JSON-LD object for:\n{json.dumps(payload, ensure_ascii=False)}"
-
     data = _call_llm(prompt)
 
-    # Als model faalt → fallback
+    # Fallback als AI faalt
     if not isinstance(data, dict) or not data.get("@type"):
-        return _fallback_schema(bt, name, site_url)
+        data = _fallback_schema(bt, name, site_url)
 
+    # Context altijd verplicht
     data.setdefault("@context", "https://schema.org")
 
+    # Validatie
     ok, err = validate_schema(data, bt)
     if not ok:
-        return _fallback_schema(bt, name, site_url)
+        print(json.dumps({
+            "level": "WARN",
+            "msg": "schema_invalid",
+            "error": err
+        }), flush=True)
+        data = _fallback_schema(bt, name, site_url)
 
     return data
