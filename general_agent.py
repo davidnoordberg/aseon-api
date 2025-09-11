@@ -7,7 +7,7 @@ from psycopg_pool import ConnectionPool
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-from schema_agent import generate_schema  # << nieuw
+from schema_agent import generate_schema
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -117,25 +117,33 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- AI-powered schema ----------
+# ---------- AI-powered schema (with fallback) ----------
 
 def run_schema(conn, site_id, payload):
-    # Defaults uit DB
     site_url, account_name = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
-    # optionele velden uit payload
     extras = dict(payload or {})
     extras.pop("biz_type", None)
-    # naam: payload override > account_name > domain
+
     name = (payload or {}).get("name") or account_name
     if not name:
-        # fallback: haal host uit URL
         try:
             from urllib.parse import urlparse
             name = urlparse(site_url).netloc
         except Exception:
             name = site_url
+
     schema = generate_schema(biz_type=biz_type, site_name=name, site_url=site_url, extras=extras)
+
+    # --- Fallback als schema leeg is ---
+    if not schema or not isinstance(schema, dict) or not schema.get("@type"):
+        schema = {
+            "@context": "https://schema.org",
+            "@type": biz_type,
+            "name": name,
+            "url": site_url
+        }
+
     return {"schema": schema, "biz_type": biz_type, "name": name, "url": site_url}
 
 # ---------- Other jobtypes (stubs) ----------
@@ -163,7 +171,6 @@ DISPATCH = {
     "keywords": run_keywords,
     "faq": run_faq,
     "report": run_report,
-    # 'schema' wordt apart afgehandeld omdat DB-info nodig is
 }
 
 # ---------- Job processing ----------
