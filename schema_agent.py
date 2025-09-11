@@ -39,38 +39,60 @@ General rules:
 """
 
 def _call_llm(prompt: str) -> dict:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": _BASE_SYS},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-    )
-    content = resp.choices[0].message.content
     try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": _BASE_SYS},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        content = resp.choices[0].message.content
         return json.loads(content)
     except Exception:
         return {}
 
 def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
     """Minimal fallback if model fails"""
-    return {
-        "@context": "https://schema.org",
-        "@type": biz_type,
-        "name": site_name,
-        "url": site_url
-    }
+    if biz_type == "FAQPage":
+        return {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [
+                {
+                    "@type": "Question",
+                    "name": "Example question",
+                    "acceptedAnswer": {
+                        "@type": "Answer",
+                        "text": "Example answer (fallback)."
+                    }
+                }
+            ]
+        }
+    elif biz_type == "Article":
+        return {
+            "@context": "https://schema.org",
+            "@type": "Article",
+            "headline": f"{site_name} Article",
+            "description": f"Auto-generated fallback for {site_url}",
+            "mainEntityOfPage": site_url
+        }
+    else:  # Organization, LocalBusiness, Product, OfferCatalog
+        return {
+            "@context": "https://schema.org",
+            "@type": biz_type,
+            "name": site_name,
+            "url": site_url
+        }
 
 def validate_schema(data: dict, biz_type: str) -> tuple[bool, str | None]:
-    """Lightweight validator: checks required fields per type"""
     if not isinstance(data, dict):
         return False, "Schema is not a dict"
     if "@type" not in data:
         return False, "Missing @type"
     t = data.get("@type")
-    # Check per type
     if t == "Organization" and not data.get("name"):
         return False, "Organization missing name"
     if t == "Article" and not data.get("headline"):
@@ -87,16 +109,6 @@ def generate_schema(
     extras: dict | None = None,
     rag_context: str | None = None
 ) -> dict:
-    """
-    Generate schema.org JSON-LD
-
-    biz_type: one of Organization | LocalBusiness | Article | FAQPage | OfferCatalog | Product
-    site_name: default name of the site/account
-    site_url: absolute site URL
-    language: optional site language
-    extras: additional payload fields (faq list, author, logo, sameAs etc.)
-    rag_context: optional string with context text from site (future RAG integration)
-    """
     extras = extras or {}
     bt = (biz_type or "Organization").strip()
     name = site_name or urlparse(site_url).netloc
@@ -112,17 +124,14 @@ def generate_schema(
 
     data = _call_llm(prompt)
 
-    # Fallback if model fails
+    # Als model faalt → fallback
     if not isinstance(data, dict) or not data.get("@type"):
         return _fallback_schema(bt, name, site_url)
 
-    # Ensure context always present
     data.setdefault("@context", "https://schema.org")
 
-    # Validate
     ok, err = validate_schema(data, bt)
     if not ok:
-        # If invalid → fallback minimal schema
         return _fallback_schema(bt, name, site_url)
 
     return data
