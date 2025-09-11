@@ -7,6 +7,7 @@ from psycopg_pool import ConnectionPool
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
+from schema_agent import generate_schema  # << nieuw
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -87,18 +88,23 @@ def finish_job(conn, job_id, ok, output=None, err=None):
 
 # ---------- Crawl integration ----------
 
-def get_site_url(conn, site_id):
+def get_site_info(conn, site_id):
     with conn.cursor() as cur:
-        cur.execute("SELECT url FROM sites WHERE id=%s", (site_id,))
+        cur.execute("""
+            SELECT s.url, a.name AS account_name
+            FROM sites s
+            JOIN accounts a ON a.id = s.account_id
+            WHERE s.id = %s
+        """, (site_id,))
         row = cur.fetchone()
         if not row or not row["url"]:
-            raise ValueError("Site URL not found")
-        return row["url"]
+            raise ValueError("Site not found")
+        return row["url"], row.get("account_name")
 
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
-    start_url = get_site_url(conn, site_id)
+    start_url, _ = get_site_info(conn, site_id)
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
@@ -110,6 +116,27 @@ def run_keywords(site_id, payload):
     lang = market.get("language", "en")
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
+
+# ---------- AI-powered schema ----------
+
+def run_schema(conn, site_id, payload):
+    # Defaults uit DB
+    site_url, account_name = get_site_info(conn, site_id)
+    biz_type = (payload or {}).get("biz_type", "Organization")
+    # optionele velden uit payload
+    extras = dict(payload or {})
+    extras.pop("biz_type", None)
+    # naam: payload override > account_name > domain
+    name = (payload or {}).get("name") or account_name
+    if not name:
+        # fallback: haal host uit URL
+        try:
+            from urllib.parse import urlparse
+            name = urlparse(site_url).netloc
+        except Exception:
+            name = site_url
+    schema = generate_schema(biz_type=biz_type, site_name=name, site_url=site_url, extras=extras)
+    return {"schema": schema, "biz_type": biz_type, "name": name, "url": site_url}
 
 # ---------- Other jobtypes (stubs) ----------
 
@@ -124,18 +151,6 @@ def run_faq(site_id, payload):
         })
     return {"topic": topic, "faqs": faqs}
 
-def run_schema(site_id, payload):
-    page_url = (payload or {}).get("page_url") or "https://example.com/"
-    biz_type = (payload or {}).get("biz_type", "Organization")
-    schema = {
-        "@context": "https://schema.org",
-        "@type": biz_type,
-        "url": page_url,
-        "name": "Aseon Client",
-        "description": "Auto-generated schema (MVP)."
-    }
-    return {"schema": schema}
-
 def run_report(site_id, payload):
     fmt = (payload or {}).get("format", "markdown")
     report_md = "# Aseon Report (MVP)\n\n- Crawl: OK\n- Keywords: OK\n- FAQ: OK\n- Schema: OK\n"
@@ -147,8 +162,8 @@ def run_report(site_id, payload):
 DISPATCH = {
     "keywords": run_keywords,
     "faq": run_faq,
-    "schema": run_schema,
     "report": run_report,
+    # 'schema' wordt apart afgehandeld omdat DB-info nodig is
 }
 
 # ---------- Job processing ----------
@@ -158,17 +173,17 @@ def process_job(conn, job):
     site_id = job["site_id"]
     payload = job.get("payload") or {}
 
-    if jtype == "crawl":
-        log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
-        output = run_crawl(conn, site_id, payload)
-        log("info", "job_done", id=str(job["id"]), type=jtype)
-        return output
-
-    if jtype not in DISPATCH:
-        raise ValueError(f"Unknown job type: {jtype}")
-
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
-    output = DISPATCH[jtype](site_id, payload)
+
+    if jtype == "crawl":
+        output = run_crawl(conn, site_id, payload)
+    elif jtype == "schema":
+        output = run_schema(conn, site_id, payload)
+    else:
+        if jtype not in DISPATCH:
+            raise ValueError(f"Unknown job type: {jtype}")
+        output = DISPATCH[jtype](site_id, payload)
+
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
