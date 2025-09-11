@@ -6,7 +6,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from crawl_light import crawl_site
-from keywords_ai import generate_keywords  # << nieuw
+from keywords_agent import generate_keywords
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
