@@ -5,7 +5,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from crawl_light import crawl_site  # << nieuw
+from crawl_light import crawl_site
+from keywords_ai import generate_keywords  # << nieuw
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -101,24 +102,16 @@ def run_crawl(conn, site_id, payload):
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
-# ---------- Other jobtypes (stubs) ----------
+# ---------- AI-powered keywords ----------
 
 def run_keywords(site_id, payload):
-    seed = (payload or {}).get("seed") or "home"
-    lang = ((payload or {}).get("market") or {}).get("language", "en")
-    country = ((payload or {}).get("market") or {}).get("country", "NL")
-    kws = [
-        f"{seed} tips",
-        f"{seed} pricing",
-        f"{seed} best practices",
-        f"{seed} faq",
-        f"{seed} alternatives",
-    ]
-    groups = {
-        "informational": kws[:3],
-        "transactional": kws[3:],
-    }
-    return {"seed": seed, "language": lang, "country": country, "keywords": kws, "groups": groups}
+    seed = (payload or {}).get("seed", "home")
+    market = (payload or {}).get("market", {})
+    lang = market.get("language", "en")
+    country = market.get("country", "US")
+    return generate_keywords(seed, language=lang, country=country, n=30)
+
+# ---------- Other jobtypes (stubs) ----------
 
 def run_faq(site_id, payload):
     topic = (payload or {}).get("topic") or "general"
