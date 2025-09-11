@@ -3,6 +3,8 @@ import os
 import json
 import traceback
 from typing import Optional, Literal, Any, Dict
+from uuid import UUID
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +19,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.2.1")
+app = FastAPI(title="Aseon API", version="0.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,8 +28,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Psycopg pool (sync) met dict_row zodat we dicts terugkrijgen
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
+# ---------- SQL ----------
 CREATE_TABLES_SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -70,60 +74,65 @@ def normalize_url(u: str) -> str:
         u = u + "/"
     return u
 
+# ---------- Modellen ----------
 class AccountIn(BaseModel):
     name: str = Field(min_length=1)
     email: EmailStr
 
 class AccountOut(BaseModel):
-    id: str
+    id: UUID
     name: str
     email: EmailStr
-    created_at: str
+    created_at: datetime
 
 class SiteIn(BaseModel):
-    account_id: str
+    account_id: UUID
     url: str
     language: str = Field(min_length=2, max_length=5)
     country: str = Field(min_length=2, max_length=2)
 
 class SiteOut(BaseModel):
-    id: str
-    account_id: str
+    id: UUID
+    account_id: UUID
     url: AnyHttpUrl
     language: str
     country: str
-    created_at: str
+    created_at: datetime
 
 JobType = Literal["crawl", "keywords", "faq", "schema", "report"]
 
 class JobIn(BaseModel):
-    site_id: str
+    site_id: UUID
     type: JobType
     payload: Optional[Dict[str, Any]] = None
 
 class JobOut(BaseModel):
-    id: str
-    site_id: str
+    id: UUID
+    site_id: UUID
     type: str
     payload: Optional[Dict[str, Any]] = None
     status: str
-    created_at: str
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     error: Optional[str] = None
 
+# ---------- Error handler ----------
 @app.exception_handler(Exception)
 def unhandled_ex_handler(request: Request, exc: Exception):
+    # log naar stdout voor Render logs
     print("UNHANDLED ERROR:", repr(exc))
     traceback.print_exc()
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "error": str(exc)})
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
+# ---------- Lifecycle ----------
 @app.on_event("startup")
 def on_startup():
     with pool.connection() as conn:
         conn.execute(CREATE_TABLES_SQL)
         conn.commit()
 
+# ---------- Health ----------
 @app.get("/healthz")
 def healthz():
     try:
@@ -133,7 +142,7 @@ def healthz():
     except Exception:
         return {"ok": False, "db": False}
 
-# ---------- UPSERT op email ----------
+# ---------- Accounts (UPSERT op email) ----------
 @app.post("/accounts", response_model=AccountOut)
 def create_account(body: AccountIn):
     with pool.connection() as conn, conn.cursor() as cur:
@@ -160,10 +169,11 @@ def get_account_by_email(email: EmailStr = Query(..., description="Lookup by ema
             raise HTTPException(status_code=404, detail="Account not found")
         return row
 
+# ---------- Sites ----------
 @app.post("/sites", response_model=SiteOut)
 def create_site(body: SiteIn):
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM accounts WHERE id=%s", (body.account_id,))
+        cur.execute("SELECT 1 FROM accounts WHERE id=%s", (str(body.account_id),))
         if not cur.fetchone():
             raise HTTPException(status_code=400, detail="account_id does not exist")
         url_norm = normalize_url(body.url)
@@ -173,16 +183,17 @@ def create_site(body: SiteIn):
             VALUES (%s, %s, %s, %s)
             RETURNING id, account_id, url, language, country, created_at
             """,
-            (body.account_id, url_norm, body.language.lower(), body.country.upper()),
+            (str(body.account_id), url_norm, body.language.lower(), body.country.upper()),
         )
         row = cur.fetchone()
         conn.commit()
         return row
 
+# ---------- Jobs ----------
 @app.post("/jobs", response_model=JobOut)
 def create_job(body: JobIn):
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM sites WHERE id=%s", (body.site_id,))
+        cur.execute("SELECT 1 FROM sites WHERE id=%s", (str(body.site_id),))
         if not cur.fetchone():
             raise HTTPException(status_code=400, detail="site_id does not exist")
         payload_jsonb = Json(body.payload) if body.payload is not None else None
@@ -192,21 +203,21 @@ def create_job(body: JobIn):
             VALUES (%s, %s, %s)
             RETURNING id, site_id, type, payload, status, created_at, started_at, finished_at, error
             """,
-            (body.site_id, body.type, payload_jsonb),
+            (str(body.site_id), body.type, payload_jsonb),
         )
         row = cur.fetchone()
         conn.commit()
         return row
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
-def get_job(job_id: str):
+def get_job(job_id: UUID):
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT id, site_id, type, payload, status, created_at, started_at, finished_at, error
             FROM jobs WHERE id=%s
             """,
-            (job_id,),
+            (str(job_id),),
         )
         row = cur.fetchone()
         if not row:
