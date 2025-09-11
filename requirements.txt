@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.1
 psycopg[binary,pool]==3.2.9   # laatste stabiele versie
 pydantic==2.8.2
 python-dotenv==1.0.1
+asyncpg==0.29.0
