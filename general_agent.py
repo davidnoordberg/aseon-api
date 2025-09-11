@@ -40,26 +40,28 @@ def normalize_output(obj):
     return json.loads(json.dumps(obj, default=default))
 
 def claim_one_job(conn):
+    """
+    Atomair claimen: selecteer + lock + update naar 'running' en geef direct de rij terug.
+    Dit voorkomt de psycopg fout 'the last operation didn't produce records (BEGIN)'.
+    """
     with conn.cursor() as cur:
         cur.execute("""
-            BEGIN;
-            SELECT id, site_id, type, payload
-            FROM jobs
-            WHERE status = 'queued'
-            ORDER BY created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        """)
-        row = cur.fetchone()
-        if not row:
-            cur.execute("COMMIT")
-            return None
-        cur.execute("""
+            WITH j AS (
+                SELECT id
+                FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
             UPDATE jobs
-            SET status='running', started_at=NOW()
-            WHERE id=%s
-        """, (row["id"],))
-        cur.execute("COMMIT")
+            SET status = 'running', started_at = NOW()
+            FROM j
+            WHERE jobs.id = j.id
+            RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
+        """)
+        row = cur.fetchone()  # None als er geen queued jobs zijn
+        conn.commit()
         return row
 
 def finish_job(conn, job_id, ok, output=None, err=None):
