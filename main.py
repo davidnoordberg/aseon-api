@@ -1,32 +1,37 @@
+# app/main.py
 import os
 import json
+import traceback
 from typing import Optional, Literal, Any, Dict
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
 
-import psycopg
+from psycopg_pool import ConnectionPool
+from psycopg import sql
 from psycopg.rows import dict_row
-from psycopg.types.json import Json  # adapter voor JSON -> jsonb
+from psycopg.types.json import Json
 
+# ------- Config -------
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.1.0")
+app = FastAPI(title="Aseon API", version="0.2.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # zet later strakker op je domein
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Eén async-verbinding die we hergebruiken
-db: Optional[psycopg.AsyncConnection] = None
+# Connection pool (sync, stabiel)
+pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
-
-# ---------- SQL ----------
+# ------- SQL -------
 CREATE_TABLES_SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -59,7 +64,6 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
-
 def normalize_url(u: str) -> str:
     if not u:
         return u
@@ -70,8 +74,7 @@ def normalize_url(u: str) -> str:
         u = u + "/"
     return u
 
-
-# ---------- Pydantic ----------
+# ------- Models -------
 class AccountIn(BaseModel):
     name: str = Field(min_length=1)
     email: EmailStr
@@ -114,49 +117,43 @@ class JobOut(BaseModel):
     finished_at: Optional[str] = None
     error: Optional[str] = None
 
+# ------- Error handler (zorgt dat 500 in JSON komt) -------
+@app.exception_handler(Exception)
+def unhandled_ex_handler(request: Request, exc: Exception):
+    # Log naar stdout (Render logs)
+    print("UNHANDLED ERROR:", repr(exc))
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "error": str(exc)},
+    )
 
-# ---------- lifecycle ----------
+# ------- Startup: tabellen maken -------
 @app.on_event("startup")
-async def on_startup():
-    global db
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
+def on_startup():
+    with pool.connection() as conn:
+        conn.execute(CREATE_TABLES_SQL)
+        conn.commit()
 
-    # dict_row geeft ons dicts terug i.p.v. tuples
-    db = await psycopg.AsyncConnection.connect(DATABASE_URL, row_factory=dict_row)
-    async with db.cursor() as cur:
-        await cur.execute(CREATE_TABLES_SQL)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    global db
-    if db:
-        await db.close()
-
-
-# ---------- health ----------
+# ------- Health -------
 @app.get("/healthz")
-async def healthz():
+def healthz():
     try:
-        async with db.cursor() as cur:
-            await cur.execute("SELECT 1;")
-            await cur.fetchone()
+        with pool.connection() as conn:
+            conn.execute("SELECT 1;")
+        return {"ok": True, "db": True}
     except Exception:
         return {"ok": False, "db": False}
-    return {"ok": True, "db": True}
 
-
-# ---------- accounts ----------
+# ------- Accounts -------
 @app.post("/accounts", response_model=AccountOut)
-async def create_account(body: AccountIn):
-    async with db.cursor() as cur:
-        await cur.execute("SELECT id FROM accounts WHERE email=%s", (body.email,))
-        exists = await cur.fetchone()
+def create_account(body: AccountIn):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM accounts WHERE email=%s", (body.email,))
+        exists = cur.fetchone()
         if exists:
-            # 409: bestaat al
             raise HTTPException(status_code=409, detail="Email already exists")
-
-        await cur.execute(
+        cur.execute(
             """
             INSERT INTO accounts (name, email)
             VALUES (%s, %s)
@@ -164,38 +161,29 @@ async def create_account(body: AccountIn):
             """,
             (body.name, body.email),
         )
-        row = await cur.fetchone()
-        # row is dict door dict_row
-        row["id"] = str(row["id"])
-        row["created_at"] = row["created_at"].isoformat()
+        row = cur.fetchone()
+        conn.commit()
         return row
 
 @app.get("/accounts", response_model=AccountOut)
-async def get_account_by_email(email: EmailStr = Query(..., description="Lookup by email")):
-    async with db.cursor() as cur:
-        await cur.execute(
-            "SELECT id, name, email, created_at FROM accounts WHERE email=%s", (email,)
-        )
-        row = await cur.fetchone()
+def get_account_by_email(email: EmailStr = Query(..., description="Lookup by email")):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, name, email, created_at FROM accounts WHERE email=%s", (email,))
+        row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Account not found")
-        row["id"] = str(row["id"])
-        row["created_at"] = row["created_at"].isoformat()
         return row
 
-
-# ---------- sites ----------
+# ------- Sites -------
 @app.post("/sites", response_model=SiteOut)
-async def create_site(body: SiteIn):
-    async with db.cursor() as cur:
-        await cur.execute("SELECT 1 FROM accounts WHERE id=%s", (body.account_id,))
-        acc = await cur.fetchone()
-        if not acc:
+def create_site(body: SiteIn):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM accounts WHERE id=%s", (body.account_id,))
+        if not cur.fetchone():
             raise HTTPException(status_code=400, detail="account_id does not exist")
 
         url_norm = normalize_url(body.url)
-
-        await cur.execute(
+        cur.execute(
             """
             INSERT INTO sites (account_id, url, language, country)
             VALUES (%s, %s, %s, %s)
@@ -203,96 +191,45 @@ async def create_site(body: SiteIn):
             """,
             (body.account_id, url_norm, body.language.lower(), body.country.upper()),
         )
-        row = await cur.fetchone()
-        row["id"] = str(row["id"])
-        row["account_id"] = str(row["account_id"])
-        row["created_at"] = row["created_at"].isoformat()
+        row = cur.fetchone()
+        conn.commit()
         return row
 
-
-# ---------- jobs ----------
+# ------- Jobs -------
 @app.post("/jobs", response_model=JobOut)
-async def create_job(body: JobIn):
-    async with db.cursor() as cur:
-        await cur.execute("SELECT 1 FROM sites WHERE id=%s", (body.site_id,))
-        site_exists = await cur.fetchone()
-        if not site_exists:
+def create_job(body: JobIn):
+    with pool.connection() as conn, conn.cursor() as cur:
+        # check site
+        cur.execute("SELECT 1 FROM sites WHERE id=%s", (body.site_id,))
+        if not cur.fetchone():
             raise HTTPException(status_code=400, detail="site_id does not exist")
 
-        # Gebruik Json() adapter: Python dict -> JSON -> jsonb
-        payload_param = Json(body.payload) if body.payload is not None else None
+        # payload veilig naar JSONB
+        payload_jsonb = Json(body.payload) if body.payload is not None else None
 
-        await cur.execute(
+        cur.execute(
             """
             INSERT INTO jobs (site_id, type, payload)
             VALUES (%s, %s, %s)
             RETURNING id, site_id, type, payload, status, created_at, started_at, finished_at, error
             """,
-            (body.site_id, body.type, payload_param),
+            (body.site_id, body.type, payload_jsonb),
         )
-        row = await cur.fetchone()
-
-        # Defensief decoderen van payload (sommige drivers variëren)
-        payload_value = row.get("payload")
-        if isinstance(payload_value, (bytes, bytearray, memoryview)):
-            try:
-                payload_value = json.loads(bytes(payload_value).decode("utf-8"))
-            except Exception:
-                payload_value = None
-        elif isinstance(payload_value, str):
-            try:
-                payload_value = json.loads(payload_value)
-            except Exception:
-                pass  # als het al str-json is die je wilt laten staan
-
-        out = {
-            "id": str(row["id"]),
-            "site_id": str(row["site_id"]),
-            "type": row["type"],
-            "payload": payload_value,
-            "status": row["status"],
-            "created_at": row["created_at"].isoformat(),
-            "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-            "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
-            "error": row["error"],
-        }
-        return out
-
+        row = cur.fetchone()
+        conn.commit()
+        return row
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
-async def get_job(job_id: str):
-    async with db.cursor() as cur:
-        await cur.execute(
+def get_job(job_id: str):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
             """
             SELECT id, site_id, type, payload, status, created_at, started_at, finished_at, error
             FROM jobs WHERE id=%s
             """,
             (job_id,),
         )
-        row = await cur.fetchone()
+        row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
-
-        payload_value = row.get("payload")
-        if isinstance(payload_value, (bytes, bytearray, memoryview)):
-            try:
-                payload_value = json.loads(bytes(payload_value).decode("utf-8"))
-            except Exception:
-                payload_value = None
-        elif isinstance(payload_value, str):
-            try:
-                payload_value = json.loads(payload_value)
-            except Exception:
-                pass
-
-        return {
-            "id": str(row["id"]),
-            "site_id": str(row["site_id"]),
-            "type": row["type"],
-            "payload": payload_value,
-            "status": row["status"],
-            "created_at": row["created_at"].isoformat(),
-            "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-            "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
-            "error": row["error"],
-        }
+        return row
