@@ -6,7 +6,6 @@ from openai import OpenAI
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# Vast instructieblok
 _BASE_SYS = """
 You are an expert Schema.org JSON-LD generator.
 Your job is to produce PERFECT, production-ready structured data.
@@ -28,8 +27,7 @@ Types you must support:
    - Fields: name, description, url, itemListElement[]
 """
 
-def _call_llm(prompt: str) -> dict:
-    # Eerste poging met strikt JSON-format
+def _call_llm(prompt: str) -> dict | None:
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -40,9 +38,9 @@ def _call_llm(prompt: str) -> dict:
             response_format={"type": "json_object"},
             temperature=0.3,
         )
-        return json.loads(resp.choices[0].message.content)
+        content = resp.choices[0].message.content
+        return json.loads(content)
     except Exception as e1:
-        # Tweede poging zonder response_format (meer vrijheid)
         try:
             resp = client.chat.completions.create(
                 model=MODEL,
@@ -52,14 +50,15 @@ def _call_llm(prompt: str) -> dict:
                 ],
                 temperature=0.3,
             )
-            return json.loads(resp.choices[0].message.content)
+            content = resp.choices[0].message.content
+            return json.loads(content)
         except Exception as e2:
             print(json.dumps({
                 "level": "ERROR",
                 "msg": "schema_llm_failed",
                 "error": str(e2)
             }), flush=True)
-            return {}
+            return None
 
 def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
     return {
@@ -105,14 +104,12 @@ def generate_schema(
     prompt = f"Generate a JSON-LD object for:\n{json.dumps(payload, ensure_ascii=False)}"
     data = _call_llm(prompt)
 
-    # Fallback als AI faalt
-    if not isinstance(data, dict) or not data.get("@type"):
+    if not isinstance(data, dict) or not data:
         data = _fallback_schema(bt, name, site_url)
 
-    # Context altijd verplicht
     data.setdefault("@context", "https://schema.org")
+    data.setdefault("@type", bt)
 
-    # Validatie
     ok, err = validate_schema(data, bt)
     if not ok:
         print(json.dumps({
