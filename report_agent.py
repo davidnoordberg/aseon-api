@@ -1,97 +1,74 @@
 # report_agent.py
-import os, io, re, json, base64
-from datetime import datetime
-from typing import Dict, Any
+import os, json, base64
+from io import BytesIO
+from xhtml2pdf import pisa
 
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
-from reportlab.lib.styles import getSampleStyleSheet
-
-styles = getSampleStyleSheet()
-
-def _strip_html(text: str) -> str:
-    """Verwijder HTML-tags en hou alleen platte tekst over"""
-    if not text:
-        return ""
-    return re.sub(r"<[^>]+>", "", text)
-
-def _split_blocks(report_text: str):
+# Dummy: hier zou je je echte bundeling doen (crawl, keywords, faq, schema, quick wins, plan)
+def _assemble_html(site_info: dict, sections: dict) -> str:
+    # Minimale HTML layout
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <style>
+          body {{ font-family: Arial, sans-serif; margin: 40px; }}
+          h1 {{ color: #2c3e50; }}
+          h2 {{ color: #34495e; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
+          pre {{ background: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }}
+          .section {{ margin-bottom: 30px; }}
+        </style>
+      </head>
+      <body>
+        <h1>SEO Report for {site_info.get("url")}</h1>
+        <p><b>Language:</b> {site_info.get("language")}<br/>
+        <b>Country:</b> {site_info.get("country")}</p>
     """
-    Splits report text in gewone paragrafen en codeblokken
-    - Codeblokken: ```...``` of <pre>...</pre>
-    - Rest: platte tekst
-    """
-    blocks = []
-    code_pattern = re.compile(r"```(.*?)```", re.S)
-    pos = 0
-    for m in code_pattern.finditer(report_text):
-        if m.start() > pos:
-            blocks.append(("text", report_text[pos:m.start()]))
-        blocks.append(("code", m.group(1)))
-        pos = m.end()
-    if pos < len(report_text):
-        blocks.append(("text", report_text[pos:]))
-    return blocks
+    for name, content in sections.items():
+        html += f"<div class='section'><h2>{name.title()}</h2>"
+        if isinstance(content, dict) or isinstance(content, list):
+            html += f"<pre>{json.dumps(content, indent=2, ensure_ascii=False)}</pre>"
+        else:
+            html += f"<p>{content}</p>"
+        html += "</div>"
+    html += "</body></html>"
+    return html
 
-def _make_pdf(report_text: str) -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4)
-    story = []
+def _html_to_pdf_bytes(html: str) -> bytes:
+    result = BytesIO()
+    pisa.CreatePDF(html, dest=result)
+    return result.getvalue()
 
-    blocks = _split_blocks(report_text)
-
-    for kind, content in blocks:
-        if kind == "text":
-            text = _strip_html(content).strip()
-            if text:
-                story.append(Paragraph(text, styles["Normal"]))
-                story.append(Spacer(1, 12))
-        elif kind == "code":
-            code = content.strip()
-            story.append(Preformatted(code, styles["Code"]))
-            story.append(Spacer(1, 12))
-
-    doc.build(story)
-    return buf.getvalue()
-
-def generate_report(conn, job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Genereert een rapport in PDF of HTML/Markdown
-    """
+def generate_report(conn, job: dict) -> dict:
     site_id = job["site_id"]
     payload = job.get("payload") or {}
-    fmt = payload.get("format", "markdown")
+    fmt = (payload.get("format") or "both").lower()
 
-    # Voor nu: dummy inhoud — kan uitgebreid worden met echte data uit crawl/faq/etc.
-    report_md = f"""# SEO Report
-Site ID: {site_id}
-Generated: {datetime.utcnow().isoformat()}
+    # haal site info uit DB
+    with conn.cursor() as cur:
+        cur.execute("SELECT url, language, country FROM sites WHERE id=%s", (site_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Site not found")
+        site_info = {"url": row[0], "language": row[1], "country": row[2]}
 
-## Crawl
-- Crawl OK
-
-## Keywords
-- Keyword cluster OK
-
-## FAQ
-- FAQ OK
-
-## Schema
-- Schema OK
-"""
-    report_html = f"<h1>SEO Report</h1><p>Site ID: {site_id}</p><p>Generated: {datetime.utcnow().isoformat()}</p>"
-
-    out: Dict[str, Any] = {
-        "site_id": site_id,
-        "generated_at": datetime.utcnow().isoformat(),
-        "format": fmt,
-        "report_md": report_md,
-        "report_html": report_html,
-        "_aseon": {"source": "report_agent.py", "version": "2.0"},
+    # dummy sections (hier kun je get_latest_job_output(conn, site_id, "crawl") enz. doen)
+    sections = {
+        "crawl": {"status": "ok", "pages": 5},
+        "keywords": ["seo tips", "fast api", "pdf export"],
+        "faq": [{"q":"Wat is SEO?","a":"Zoekmachineoptimalisatie."}],
+        "schema": {"@context":"https://schema.org","@type":"Organization","name":"Test"},
+        "quick_wins": ["Add meta description", "Fix missing H1"],
+        "plan": "Focus on content clustering + schema markup."
     }
 
-    if fmt == "pdf" or fmt == "both":
-        pdf_bytes = _make_pdf(report_md)
+    # Bouw HTML
+    html = _assemble_html(site_info, sections)
+
+    out = {}
+    if fmt in ("html","both"):
+        out["html"] = html
+    if fmt in ("pdf","both"):
+        pdf_bytes = _html_to_pdf_bytes(html)
         out["pdf_base64"] = base64.b64encode(pdf_bytes).decode("utf-8")
 
     return out
