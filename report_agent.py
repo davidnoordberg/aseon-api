@@ -35,20 +35,18 @@ def _safe_get(d: Dict[str, Any], path: List[str], default=None):
 
 
 def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, Dict[str, Any]]:
-    # Forceer dat we altijd een echte lijst strings hebben
     types = list(types)
+    placeholders = ",".join(["%s"] * len(types))  # bv. %s,%s,%s,%s
+    sql = f"""
+        SELECT DISTINCT ON (type) id, type, output, finished_at
+          FROM jobs
+         WHERE site_id=%s
+           AND status='done'
+           AND type IN ({placeholders})
+         ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (type) id, type, output, finished_at
-              FROM jobs
-             WHERE site_id=%s
-               AND status='done'
-               AND type = ANY(%s::text[])
-             ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
-            """,
-            (site_id, types),
-        )
+        cur.execute(sql, (site_id, *types))
         out = {}
         for row in cur.fetchall():
             out[row["type"]] = {
