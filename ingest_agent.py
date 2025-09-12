@@ -1,70 +1,161 @@
 # ingest_agent.py
-import os, json, time
-from typing import List, Dict, Any
-from openai import OpenAI
+# Ingests crawl output -> pgvector documents table
+# - memory-slim: stream per page, small batches
+# - robust: explicit ::vector cast, rollbacks on error
+# - configurable via env
+
+from __future__ import annotations
+import os, json, math, time
+from typing import List, Dict, Any, Iterable, Tuple
+
+import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
+from openai import OpenAI
+
+# -------------------- Config --------------------
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "8"))
-EMBED_SLEEP_SEC = float(os.getenv("EMBED_SLEEP_SEC", "0.1"))
+# Chunking
+MAX_CHARS = int(os.getenv("INGEST_MAX_CHARS", "1800"))
+OVERLAP   = int(os.getenv("INGEST_OVERLAP", "200"))
+# Batching embeddings -> minder API overhead / mem pressure
+BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "8"))
+# Optioneel throttling om spikes te dempen (0 = uit)
+SLEEP_BETWEEN_BATCHES = float(os.getenv("INGEST_SLEEP_BETWEEN_BATCHES", "0"))
+# Skip lege/te korte chunks
+MIN_CHARS = int(os.getenv("INGEST_MIN_CHARS", "40"))
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
-    chunks, i, n = [], 0, len(text or "")
+# -------------------- Helpers --------------------
+
+def _chunk_text(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> Iterable[str]:
+    """Plain char-based chunking (fast/robust)."""
+    if not text:
+        return []
+    n = len(text)
+    i = 0
+    out: List[str] = []
     while i < n:
         end = min(i + max_chars, n)
         chunk = text[i:end].strip()
-        if chunk: chunks.append(chunk)
-        i = max(end - overlap, end)  # move forward, keep small overlap
-    return chunks
+        if len(chunk) >= MIN_CHARS:
+            out.append(chunk)
+        nxt = end - overlap
+        if nxt <= i:  # guard
+            nxt = end
+        i = nxt
+    return out
 
 def _page_to_textbits(p: Dict[str, Any]) -> List[str]:
-    bits = []
-    for k in ("title","h1","meta_description"):
+    bits: List[str] = []
+    # title / h1 / meta
+    for k in ("title", "h1", "meta_description"):
         v = p.get(k)
         if v: bits.append(str(v))
-    for h in (p.get("h2") or []): bits.append(h)
-    for h in (p.get("h3") or []): bits.append(h)
-    # voeg korte body-paragrafen toe (beperkt)
-    for para in (p.get("paragraphs") or [])[:2]:
-        bits.append(para)
-    return [b for b in (bits or []) if isinstance(b, str) and b.strip()]
+    # h2 / h3 (lists)
+    for h in (p.get("h2") or []):
+        if h: bits.append(str(h))
+    for h in (p.get("h3") or []):
+        if h: bits.append(str(h))
+    # Optioneel: korte “paragraphs” die je crawler kan zetten
+    for para in (p.get("paragraphs") or [])[:3]:
+        if para and isinstance(para, str):
+            bits.append(para)
+    return bits
+
+def _build_content(p: Dict[str, Any]) -> str:
+    return "\n".join(_page_to_textbits(p)).strip()
+
+def _batched(seq: List[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+# -------------------- Public API --------------------
 
 def ingest_crawl_output(conn, site_id: str, crawl_output: Dict[str, Any]) -> int:
+    """
+    Neemt crawl_output (zoals uit crawl_light) en schrijft chunks + embeddings
+    naar 'documents' (site_id, url, language, content, metadata, embedding).
+    Returnt het aantal ingevoegde chunks.
+    """
     pages = (crawl_output or {}).get("pages") or []
-    to_embed: List[Dict[str, Any]] = []
+    if not pages:
+        return 0
 
-    for p in pages:
-        url = p.get("final_url") or p.get("url")
-        if not url: continue
-        bits = _page_to_textbits(p)
-        if not bits: continue
-        content = "\n".join(bits).strip()
-        if not content: continue
-        for chunk in _chunk_text(content, max_chars=900, overlap=120):
-            to_embed.append({"url": url, "text": chunk})
+    inserted_total = 0
 
-    inserted = 0
-    if not to_embed:
-        return inserted
+    try:
+        with conn.cursor() as cur:
+            for p in pages:
+                url = p.get("final_url") or p.get("url")
+                if not url:
+                    continue
 
-    with conn.cursor(row_factory=dict_row) as cur:
-        # batch embed + insert
-        for i in range(0, len(to_embed), EMBED_BATCH_SIZE):
-            batch = to_embed[i:i+EMBED_BATCH_SIZE]
-            texts = [b["text"] for b in batch]
+                # taal (optioneel) — crawler kan language meegeven; anders NULL
+                language = p.get("language")
 
-            # OpenAI embeddings (batched)
-            emb_resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-            vectors = [item.embedding for item in emb_resp.data]
+                content = _build_content(p)
+                if not content:
+                    continue
 
-            for rec, vec in zip(batch, vectors):
-                cur.execute("""
-                    INSERT INTO documents (site_id, url, language, content, metadata, embedding)
-                    VALUES (%s, %s, NULL, %s, %s, %s)
-                """, (site_id, rec["url"], rec["text"], json.dumps({"source":"crawl"}), vec))
-                inserted += 1
-            conn.commit()
-            time.sleep(EMBED_SLEEP_SEC)
-    return inserted
+                # Build chunks
+                chunks = list(_chunk_text(content))
+                if not chunks:
+                    continue
+
+                # Embed in batches
+                for batch in _batched(chunks, BATCH_SIZE):
+                    # 1) Embeddings call (batched)
+                    resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+                    vecs = [d.embedding for d in resp.data]  # list[list[float]]
+
+                    # 2) Insert rows (explicit ::vector cast)
+                    params: List[Tuple[Any, ...]] = []
+                    for chunk, vec in zip(batch, vecs):
+                        meta = {"source": "crawl"}
+                        params.append((site_id, url, language, chunk, Json(meta), vec))
+
+                    # single executemany to minimize roundtrips
+                    cur.executemany(
+                        """
+                        INSERT INTO documents (site_id, url, language, content, metadata, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s::vector)
+                        """,
+                        params,
+                    )
+                    inserted_total += len(batch)
+
+                    # Flush per batch to keep memory low and avoid long xacts
+                    conn.commit()
+
+                    if SLEEP_BETWEEN_BATCHES > 0:
+                        time.sleep(SLEEP_BETWEEN_BATCHES)
+
+        # Final ensure
+        conn.commit()
+        return inserted_total
+
+    except Exception as e:
+        # Zorg dat de transactie niet 'aborted' blijft
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # Propagate verder; general_agent logt als ingest_failed
+        raise
+
+# -------------------- Quick CLI smoke (optional) --------------------
+if __name__ == "__main__":
+    # Minimal smoketest (expects DATABASE_URL env & a tiny crawl_output JSON on stdin)
+    import sys
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        print("DATABASE_URL not set", file=sys.stderr)
+        sys.exit(1)
+    payload = json.load(sys.stdin)
+    with psycopg.connect(dsn, row_factory=dict_row) as c:
+        site_id = os.environ.get("SITE_ID") or payload.get("site_id") or "00000000-0000-0000-0000-000000000000"
+        n = ingest_crawl_output(c, site_id, payload)
+        print(json.dumps({"inserted": n}))
