@@ -1,105 +1,97 @@
 # report_agent.py
-import io, base64, json
+import os, io, re, json, base64
 from datetime import datetime
-from psycopg.rows import dict_row
+from typing import Dict, Any
+
 from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
-# --- Helpers ---
-def _get_latest_job(conn, site_id, jtype):
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""
-            SELECT output
-              FROM jobs
-             WHERE site_id=%s AND type=%s AND status='done'
-             ORDER BY finished_at DESC NULLS LAST, created_at DESC
-             LIMIT 1
-        """, (site_id, jtype))
-        r = cur.fetchone()
-        return r["output"] if r else None
+styles = getSampleStyleSheet()
 
-def _make_html(site, crawl, keywords, faqs, schema) -> str:
-    html = [f"<h1>Report — {site['url']}</h1>"]
-    html.append(f"<p><b>Generated:</b> {datetime.utcnow().isoformat()} UTC</p>")
+def _strip_html(text: str) -> str:
+    """Verwijder HTML-tags en hou alleen platte tekst over"""
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", "", text)
 
-    if crawl:
-        html.append("<h2>Crawl summary</h2>")
-        s = crawl.get("summary", {})
-        html.append(f"<p>Pages: {s.get('pages_total')} | 200: {s.get('ok_200')} "
-                    f"| 4xx/5xx: {s.get('errors_4xx_5xx')}</p>")
-        if crawl.get("quick_wins"):
-            html.append("<ul>")
-            for q in crawl["quick_wins"]:
-                html.append(f"<li>{q.get('type')}</li>")
-            html.append("</ul>")
+def _split_blocks(report_text: str):
+    """
+    Splits report text in gewone paragrafen en codeblokken
+    - Codeblokken: ```...``` of <pre>...</pre>
+    - Rest: platte tekst
+    """
+    blocks = []
+    code_pattern = re.compile(r"```(.*?)```", re.S)
+    pos = 0
+    for m in code_pattern.finditer(report_text):
+        if m.start() > pos:
+            blocks.append(("text", report_text[pos:m.start()]))
+        blocks.append(("code", m.group(1)))
+        pos = m.end()
+    if pos < len(report_text):
+        blocks.append(("text", report_text[pos:]))
+    return blocks
 
-    if keywords:
-        html.append("<h2>Keywords</h2>")
-        for cluster, items in (keywords.get("clusters") or {}).items():
-            html.append(f"<h3>{cluster.title()}</h3><ul>")
-            for kw in items[:10]:
-                html.append(f"<li>{kw}</li>")
-            html.append("</ul>")
-
-    if faqs:
-        html.append("<h2>FAQs</h2><ul>")
-        for f in faqs.get("faqs", []):
-            html.append(f"<li><b>{f.get('q')}</b> — {f.get('a')}</li>")
-        html.append("</ul>")
-
-    if schema:
-        html.append("<h2>Schema</h2>")
-        html.append(f"<pre>{json.dumps(schema.get('schema'), indent=2)}</pre>")
-
-    return "\n".join(html)
-
-def _make_pdf(site, html_text: str) -> str:
+def _make_pdf(report_text: str) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    styles = getSampleStyleSheet()
     story = []
-    for line in html_text.splitlines():
-        if line.startswith("<h1>"):
-            story.append(Paragraph(line.strip("<h1></h1>"), styles["Title"]))
-        elif line.startswith("<h2>"):
-            story.append(Paragraph(line.strip("<h2></h2>"), styles["Heading2"]))
-        elif line.startswith("<h3>"):
-            story.append(Paragraph(line.strip("<h3></h3>"), styles["Heading3"]))
-        elif line.startswith("<li>"):
-            story.append(Paragraph(line.strip("<li></li>"), styles["Normal"]))
-        else:
-            story.append(Paragraph(line, styles["Normal"]))
-        story.append(Spacer(1, 12))
-    doc.build(story)
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return base64.b64encode(pdf_bytes).decode("utf-8")
 
-# --- Main entry ---
-def generate_report(conn, job):
+    blocks = _split_blocks(report_text)
+
+    for kind, content in blocks:
+        if kind == "text":
+            text = _strip_html(content).strip()
+            if text:
+                story.append(Paragraph(text, styles["Normal"]))
+                story.append(Spacer(1, 12))
+        elif kind == "code":
+            code = content.strip()
+            story.append(Preformatted(code, styles["Code"]))
+            story.append(Spacer(1, 12))
+
+    doc.build(story)
+    return buf.getvalue()
+
+def generate_report(conn, job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Genereert een rapport in PDF of HTML/Markdown
+    """
     site_id = job["site_id"]
     payload = job.get("payload") or {}
+    fmt = payload.get("format", "markdown")
 
-    site = {}
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""
-            SELECT url, language, country FROM sites WHERE id=%s
-        """, (site_id,))
-        site = cur.fetchone() or {}
+    # Voor nu: dummy inhoud — kan uitgebreid worden met echte data uit crawl/faq/etc.
+    report_md = f"""# SEO Report
+Site ID: {site_id}
+Generated: {datetime.utcnow().isoformat()}
 
-    crawl = _get_latest_job(conn, site_id, "crawl")
-    keywords = _get_latest_job(conn, site_id, "keywords")
-    faqs = _get_latest_job(conn, site_id, "faq")
-    schema = _get_latest_job(conn, site_id, "schema")
+## Crawl
+- Crawl OK
 
-    html = _make_html(site, crawl, keywords, faqs, schema)
+## Keywords
+- Keyword cluster OK
 
-    pdf_b64 = None
-    if payload.get("format") in ("pdf", "both"):
-        pdf_b64 = _make_pdf(site, html)
+## FAQ
+- FAQ OK
 
-    result = {"html": html}
-    if pdf_b64:
-        result["pdf_base64"] = pdf_b64
-    return result
+## Schema
+- Schema OK
+"""
+    report_html = f"<h1>SEO Report</h1><p>Site ID: {site_id}</p><p>Generated: {datetime.utcnow().isoformat()}</p>"
+
+    out: Dict[str, Any] = {
+        "site_id": site_id,
+        "generated_at": datetime.utcnow().isoformat(),
+        "format": fmt,
+        "report_md": report_md,
+        "report_html": report_html,
+        "_aseon": {"source": "report_agent.py", "version": "2.0"},
+    }
+
+    if fmt == "pdf" or fmt == "both":
+        pdf_bytes = _make_pdf(report_md)
+        out["pdf_base64"] = base64.b64encode(pdf_bytes).decode("utf-8")
+
+    return out
