@@ -1,12 +1,14 @@
-import os, json, time, signal, sys, uuid
+# general_agent.py
+import os, json, time, signal, uuid
 from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-# schema_agent importeren we nu NIET, we doen fallback test
+# schema_agent niet nodig voor de isolatietest
 # from schema_agent import generate_schema
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
@@ -18,12 +20,7 @@ DSN = os.environ["DATABASE_URL"]
 running = True
 
 def log(level, msg, **kwargs):
-    payload = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "level": level.upper(),
-        "msg": msg,
-        **kwargs,
-    }
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
     print(json.dumps(payload), flush=True)
 
 def handle_sigterm(signum, frame):
@@ -67,34 +64,58 @@ def claim_one_job(conn):
 def finish_job(conn, job_id, ok, output=None, err=None):
     with conn.cursor() as cur:
         if ok:
+            safe_output = output if isinstance(output, dict) else {}
+            if not safe_output:
+                # Forceer *altijd* niet-lege output zodat API nooit null toont
+                safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
+            safe_output = normalize_output(safe_output)
+
+            # Log wat we gaan schrijven
+            preview = None
+            try:
+                preview = json.dumps(safe_output)[:400]
+            except Exception:
+                preview = "<unserializable>"
+
+            log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
+
+            # Schrijf en verifieer rechtstreeks met RETURNING
             cur.execute("""
                 UPDATE jobs
-                SET status='done',
-                    output=%s,
-                    finished_at=NOW(),
-                    error=NULL
-                WHERE id=%s
-            """, (json.dumps(normalize_output(output or {})), job_id))
+                   SET status='done',
+                       output=%s,
+                       finished_at=NOW(),
+                       error=NULL
+                 WHERE id=%s
+             RETURNING jsonb_typeof(output) AS out_type, output;
+            """, (Json(safe_output), job_id))
+            wrote = cur.fetchone()
+            conn.commit()
+
+            log("info", "finish_job_post_write",
+                job_id=str(job_id),
+                out_type=wrote["out_type"] if wrote else None,
+                wrote_preview=(json.dumps(wrote["output"])[:400] if wrote and wrote.get("output") is not None else None)
+            )
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
                 UPDATE jobs
-                SET status='failed',
-                    finished_at=NOW(),
-                    error=%s
-                WHERE id=%s
+                   SET status='failed',
+                       finished_at=NOW(),
+                       error=%s
+                 WHERE id=%s
             """, (err_text, job_id))
-        conn.commit()
-
-# ---------- Crawl integration ----------
+            conn.commit()
+            log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
 
 def get_site_info(conn, site_id):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT s.url, a.name AS account_name
-            FROM sites s
-            JOIN accounts a ON a.id = s.account_id
-            WHERE s.id = %s
+              FROM sites s
+              JOIN accounts a ON a.id = s.account_id
+             WHERE s.id = %s
         """, (site_id,))
         row = cur.fetchone()
         if not row or not row["url"]:
@@ -108,8 +129,6 @@ def run_crawl(conn, site_id, payload):
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
-# ---------- AI-powered keywords ----------
-
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed", "home")
     market = (payload or {}).get("market", {})
@@ -117,35 +136,36 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- TEMP schema fallback ----------
-
+# ---------- TEMP: schema dummy die altijd een niet-lege dict returnt ----------
 def run_schema(conn, site_id, payload):
     site_url, account_name = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
-    name = (payload or {}).get("name") or account_name or "TestSite"
+    name = (payload or {}).get("name") or account_name or "Aseon Dummy"
 
     dummy_schema = {
         "@context": "https://schema.org",
         "@type": biz_type,
         "name": name,
         "url": site_url,
-        "note": "This is a dummy schema to verify DB output storage."
+        "note": "dummy schema to verify output storage path"
     }
+    if biz_type == "FAQPage":
+        dummy_schema["mainEntity"] = [{
+            "@type": "Question",
+            "name": "Example question",
+            "acceptedAnswer": {"@type": "Answer", "text": "Example answer (dummy)."}
+        }]
 
-    log("info", "schema_generated_dummy", schema=dummy_schema)
-    return {"schema": dummy_schema, "biz_type": biz_type, "name": name, "url": site_url}
-
-# ---------- Other jobtypes (stubs) ----------
+    out = {"schema": dummy_schema, "biz_type": biz_type, "name": name, "url": site_url}
+    log("info", "schema_generated_dummy", preview=json.dumps(out)[:400])
+    return out
 
 def run_faq(site_id, payload):
     topic = (payload or {}).get("topic") or "general"
     count = int((payload or {}).get("count", 6))
     faqs = []
     for i in range(count):
-        faqs.append({
-            "q": f"What is {topic} ({i+1})?",
-            "a": f"{topic.capitalize()} explained in a simple, concise way (stub)."
-        })
+        faqs.append({"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub)."})
     return {"topic": topic, "faqs": faqs}
 
 def run_report(site_id, payload):
@@ -161,8 +181,6 @@ DISPATCH = {
     "faq": run_faq,
     "report": run_report,
 }
-
-# ---------- Job processing ----------
 
 def process_job(conn, job):
     jtype = job["type"]
@@ -183,11 +201,12 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
-# ---------- Main loop ----------
-
 def main():
     global running
-    log("info", "agent_boot", poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE)
+    log("info", "agent_boot",
+        poll_interval=POLL_INTERVAL_SEC,
+        batch_size=BATCH_SIZE,
+        git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
