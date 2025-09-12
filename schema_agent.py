@@ -1,9 +1,5 @@
 # schema_agent.py
-# Aseon - Schema.org JSON-LD generator (multi-type, payload controls, strict validation)
-
-import os
-import json
-from typing import Optional, Dict, Any, List
+import os, json
 from urllib.parse import urlparse
 from openai import OpenAI
 
@@ -12,247 +8,147 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 _BASE_SYS = """
 You are an expert Schema.org JSON-LD generator.
-Return a SINGLE valid JSON object. No comments, no markdown, no backticks.
+Return ONE valid JSON object only. No explanations. No comments.
+ALWAYS include "@context": "https://schema.org".
+NEVER invent facts not present in the provided site context or explicit extras.
+If data is missing, omit the field instead of guessing.
+
+Schema types to support:
+1) Organization / LocalBusiness
+   Fields: name, url, logo?, sameAs[], address?, telephone?
+2) Article
+   Fields: headline, description, author{name,url}, datePublished, mainEntityOfPage, image
+3) FAQPage
+   Fields: mainEntity: [ { @type: "Question", name, acceptedAnswer: { @type: "Answer", text } } ]
+   - Q&As MUST be grounded in the provided context. If not present in context, do not include.
+   - Each Answer MUST be ≤ 80 words, factual, neutral, no marketing fluff.
+4) OfferCatalog / Product
+   Fields: name, description, url, itemListElement[]
+
 Rules:
-- Always include "@context":"https://schema.org".
-- Output must be strictly valid JSON-LD for the requested type.
-- Never invent data (no fake phone, address, price). Omit unknown optional fields.
-- Keep FAQ answers ≤ 80 words, factual, no marketing fluff.
-- Follow the provided language when writing text fields if present.
-Supported types & minimum fields:
-1) Organization / LocalBusiness:
-   - @type, name, url
-   - Optional: logo, sameAs[], address, telephone
-2) Article:
-   - @type, headline, description, author {name, url?}, datePublished (ISO8601), mainEntityOfPage (url), image (url)
-3) FAQPage:
-   - @type, mainEntity: [ { @type:"Question", name, acceptedAnswer: { @type:"Answer", text } } ]
-4) OfferCatalog:
-   - @type, name, description, url, itemListElement: [ { @type:"ListItem", position, item: { @type:"Offer", name, url } } ]
-5) Product:
-   - @type, name, description, url
-General:
-- Use fields we provide as hints (defaults/extras). Do not copy the context text verbatim; synthesize concise, factual fields.
-- If the requested FAQ count is provided, produce AT MOST that many questions.
+- Language/locale should follow provided language if available.
+- Use extras.sameAs as-is (if provided). Do not add random profiles.
+- Do not include phone, address, or prices unless provided.
 """
 
-def _clamp_words(text: str, max_words: int = 80) -> str:
-    if not isinstance(text, str):
-        return ""
-    words = text.strip().split()
-    if len(words) <= max_words:
-        return text.strip()
-    return " ".join(words[:max_words]).strip()
-
-def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> Dict[str, Any]:
-    bt = biz_type or "Organization"
-    base: Dict[str, Any] = {
-        "@context": "https://schema.org",
-        "@type": bt,
-        "name": site_name,
-        "url": site_url
-    }
-    if bt == "FAQPage":
-        base["mainEntity"] = [{
-            "@type": "Question",
-            "name": "What is this site about?",
-            "acceptedAnswer": {"@type": "Answer", "text": "This site provides information about our products and services."}
-        }]
-    return base
-
-def _ensure_context_type(data: Dict[str, Any], biz_type: str) -> None:
-    data.setdefault("@context", "https://schema.org")
-    data["@type"] = data.get("@type") or biz_type or "Organization"
-
-def _merge_sameas(data: Dict[str, Any], same_as: Optional[List[str]]) -> None:
-    if not same_as:
-        return
-    cur = data.get("sameAs") or []
-    if not isinstance(cur, list):
-        cur = []
-    merged = []
-    seen = set()
-    for url in list(cur) + list(same_as):
-        if not isinstance(url, str):
-            continue
-        u = url.strip()
-        if not u or u in seen:
-            continue
-        if not (u.startswith("http://") or u.startswith("https://")):
-            continue
-        seen.add(u)
-        merged.append(u)
-    if merged:
-        data["sameAs"] = merged
-
-def _trim_faq_answers(data: Dict[str, Any], max_q: Optional[int], lang: Optional[str]) -> None:
-    if data.get("@type") != "FAQPage":
-        return
-    ents = data.get("mainEntity")
-    if not isinstance(ents, list):
-        data["mainEntity"] = []
-        return
-    out = []
-    for i, q in enumerate(ents):
-        if not isinstance(q, dict):
-            continue
-        name = q.get("name")
-        ans = (q.get("acceptedAnswer") or {})
-        text = ans.get("text") if isinstance(ans, dict) else None
-        if not name or not text:
-            continue
-        ans["@type"] = "Answer"
-        ans["text"] = _clamp_words(str(text), 80)
-        out.append({
-            "@type": "Question",
-            "name": str(name).strip(),
-            "acceptedAnswer": ans
-        })
-        if max_q is not None and len(out) >= max_q:
-            break
-    data["mainEntity"] = out
-
-def _validate_minimal(data: Dict[str, Any], biz_type: str) -> (bool, Optional[str]):
-    if not isinstance(data, dict):
-        return False, "Schema is not an object"
-    if "@type" not in data:
-        return False, "Missing @type"
-    t = data.get("@type")
-    # Normalize common alias: LocalBusiness subtype is allowed
-    if biz_type in ("Organization", "LocalBusiness") and t in ("Organization", "LocalBusiness"):
-        if not data.get("name") or not data.get("url"):
-            return False, "Organization/LocalBusiness missing name or url"
-        return True, None
-    if biz_type == "Article" or t == "Article":
-        required = ["headline", "description", "author", "datePublished", "mainEntityOfPage", "image"]
-        missing = [k for k in required if not data.get(k)]
-        if missing:
-            return False, "Article missing: " + ",".join(missing)
-        return True, None
-    if biz_type == "FAQPage" or t == "FAQPage":
-        ents = data.get("mainEntity")
-        if not isinstance(ents, list) or not ents:
-            return False, "FAQPage missing mainEntity"
-        for q in ents:
-            if not isinstance(q, dict): return False, "FAQPage invalid Question"
-            if q.get("@type") != "Question": return False, "FAQPage Question missing @type"
-            a = q.get("acceptedAnswer")
-            if not isinstance(a, dict) or a.get("@type") != "Answer" or not a.get("text"):
-                return False, "FAQPage acceptedAnswer invalid"
-        return True, None
-    if biz_type == "OfferCatalog" or t == "OfferCatalog":
-        if not data.get("name") or not data.get("description") or not data.get("url"):
-            return False, "OfferCatalog missing basic fields"
-        il = data.get("itemListElement")
-        if not isinstance(il, list) or not il:
-            return False, "OfferCatalog missing itemListElement"
-        return True, None
-    if biz_type == "Product" or t == "Product":
-        if not data.get("name") or not data.get("description") or not data.get("url"):
-            return False, "Product missing name/description/url"
-        return True, None
-    # Fallback: at least have name+url if present
-    return True, None
-
-def _call_llm(prompt: str, use_json_mode: bool = True) -> Optional[Dict[str, Any]]:
+def _call_llm(prompt: str, expect_json: bool = True) -> dict | None:
     try:
-        if use_json_mode:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": _BASE_SYS},
-                          {"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.3,
-            )
-        else:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": _BASE_SYS},
-                          {"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": _BASE_SYS},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"} if expect_json else None,
+            temperature=0.2,
+        )
         content = resp.choices[0].message.content
         return json.loads(content)
-    except Exception as e1:
-        # Retry without JSON mode once
-        if use_json_mode:
-            try:
-                resp = client.chat.completions.create(
-                    model=MODEL,
-                    messages=[{"role": "system", "content": _BASE_SYS},
-                              {"role": "user", "content": prompt}],
-                    temperature=0.3,
-                )
-                content = resp.choices[0].message.content
-                return json.loads(content)
-            except Exception as e2:
-                print(json.dumps({"level": "ERROR", "msg": "schema_llm_failed", "error": str(e2)}), flush=True)
-        else:
-            print(json.dumps({"level": "ERROR", "msg": "schema_llm_failed", "error": str(e1)}), flush=True)
-        return None
+    except Exception:
+        try:
+            # fallback: no JSON mode, still try to parse
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": _BASE_SYS},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+            )
+            content = resp.choices[0].message.content
+            return json.loads(content)
+        except Exception as e2:
+            print(json.dumps({"level":"ERROR","msg":"schema_llm_failed","error":str(e2)}), flush=True)
+            return None
+
+def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
+    return {"@context": "https://schema.org", "@type": biz_type, "name": site_name, "url": site_url}
+
+def validate_schema(data: dict, biz_type: str) -> tuple[bool, str | None]:
+    if not isinstance(data, dict): return False, "Schema is not a dict"
+    if "@type" not in data: return False, "Missing @type"
+    t = data.get("@type")
+    if t == "Organization" and not data.get("name"):
+        return False, "Organization missing name"
+    if t == "Article" and not data.get("headline"):
+        return False, "Article missing headline"
+    if t == "FAQPage":
+        main = data.get("mainEntity")
+        if not main or not isinstance(main, list) or len(main) == 0:
+            return False, "FAQPage missing mainEntity"
+        # basic check on structure
+        for q in main:
+            if not isinstance(q, dict): return False, "FAQ item is not object"
+            if q.get("@type") != "Question": return False, "FAQ item must be Question"
+            a = (q.get("acceptedAnswer") or {})
+            if a.get("@type") != "Answer" or not a.get("text"):
+                return False, "FAQ item missing acceptedAnswer.text"
+    return True, None
+
+def _trim_faq_answers(data: dict, max_words: int):
+    main = data.get("mainEntity") or []
+    cleaned = []
+    for q in main:
+        if not isinstance(q, dict): continue
+        a = (q.get("acceptedAnswer") or {}).get("text") or ""
+        words = " ".join(a.split()).split(" ")
+        if len(words) > max_words:
+            a = " ".join(words[:max_words])
+        cleaned.append({
+            "@type": "Question",
+            "name": q.get("name"),
+            "acceptedAnswer": {"@type":"Answer","text": a}
+        })
+    data["mainEntity"] = cleaned
 
 def generate_schema(
     biz_type: str,
-    site_name: Optional[str],
+    site_name: str | None,
     site_url: str,
-    language: Optional[str] = None,
-    country: Optional[str] = None,
-    extras: Optional[Dict[str, Any]] = None,
-    rag_context: Optional[str] = None,
-    faq_count: Optional[int] = None
-) -> Dict[str, Any]:
-    """
-    Returns ONLY the JSON-LD object (dict). Caller (general_agent) can wrap it with metadata.
-    """
+    language: str | None = None,
+    extras: dict | None = None,
+    rag_context: str | None = None,
+    faq_count: int = 3,
+    max_faq_words: int = 80
+) -> dict:
     extras = extras or {}
     bt = (biz_type or "Organization").strip()
     name = site_name or urlparse(site_url).netloc
 
-    # Build payload for the prompt
-    request_payload = {
+    # Prompt instructing STRICT grounding
+    payload = {
         "biz_type": bt,
-        "defaults": {
-            "name": name,
-            "url": site_url,
-            "language": language,
-            "country": country
-        },
-        "controls": {
-            "faq_max_items": int(faq_count) if (isinstance(faq_count, int) and faq_count > 0) else None
-        },
-        "extras": {
-            # sameAs can be provided here; we will merge after generation as well
-            "sameAs": list(extras.get("sameAs", [])) if isinstance(extras.get("sameAs"), list) else []
-        },
-        "context_excerpt": (rag_context or "")[:2000]  # keep prompt compact
+        "defaults": {"name": name, "url": site_url, "language": language},
+        "extras": extras,
+        "faq_constraints": {"count": faq_count, "max_words": max_faq_words},
+        "context": rag_context or "(no context provided)"
     }
 
     prompt = (
-        "Generate a single JSON-LD object for the following request. "
-        "Respect the rules above (valid JSON, required fields, ≤80 words for FAQ answers, no invented data). "
-        "Do not include explanations.\n\n"
-        + json.dumps(request_payload, ensure_ascii=False)
+        "Generate strictly grounded Schema.org JSON-LD.\n"
+        "Only include facts present in `context` or `extras`.\n"
+        "If a field is unknown, omit it. Never invent services or contact data.\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
-    data = _call_llm(prompt, use_json_mode=True)
+    data = _call_llm(prompt, expect_json=True)
     if not isinstance(data, dict) or not data:
         data = _fallback_schema(bt, name, site_url)
 
-    # Normalize type/context
-    _ensure_context_type(data, bt)
+    # Enforce required keys
+    data.setdefault("@context", "https://schema.org")
+    data.setdefault("@type", bt)
 
-    # Merge sameAs from extras (dedupe)
-    _merge_sameas(data, request_payload["extras"]["sameAs"])
+    # FAQ post-trim & count limit
+    if data.get("@type") == "FAQPage":
+        # Keep at most `faq_count`
+        main = (data.get("mainEntity") or [])[:faq_count]
+        data["mainEntity"] = main
+        _trim_faq_answers(data, max_faq_words)
 
-    # Enforce FAQ trims & count
-    _trim_faq_answers(data, request_payload["controls"]["faq_max_items"], language)
-
-    # Validate
-    ok, err = _validate_minimal(data, bt)
+    ok, err = validate_schema(data, bt)
     if not ok:
-        print(json.dumps({"level": "WARN", "msg": "schema_invalid", "error": err}), flush=True)
+        print(json.dumps({"level":"WARN","msg":"schema_invalid","error":err}), flush=True)
         data = _fallback_schema(bt, name, site_url)
-        # If fallback is FAQ, still clamp/trim to count
-        _trim_faq_answers(data, request_payload["controls"]["faq_max_items"], language)
 
     return data
