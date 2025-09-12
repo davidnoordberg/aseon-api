@@ -8,22 +8,14 @@ from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-from schema_agent import generate_schema
-# ingest is optioneel — alleen als env Aseon ingest wil
-try:
-    from ingest_agent import ingest_crawl_output
-except Exception:
-    ingest_crawl_output = None  # graceful
+from schema_agent import generate_schema  # <-- echte AI schema
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_ERROR_LEN = 500
 
-# Feature toggles
-INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
-SCHEMA_USE_CRAWL_SAMEAS = os.getenv("SCHEMA_USE_CRAWL_SAMEAS", "true").lower() == "true"
-
 DSN = os.environ["DATABASE_URL"]
+
 running = True
 
 def log(level, msg, **kwargs):
@@ -64,11 +56,10 @@ def claim_one_job(conn):
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs
-               SET status = 'running',
-                   started_at = NOW()
-              FROM j
-             WHERE jobs.id = j.id
-         RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
+            SET status = 'running', started_at = NOW()
+            FROM j
+            WHERE jobs.id = j.id
+            RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
         row = cur.fetchone()
         conn.commit()
@@ -79,13 +70,21 @@ def finish_job(conn, job_id, ok, output=None, err=None):
         if ok:
             safe_output = output if isinstance(output, dict) else {}
             if not safe_output:
-                safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
+                safe_output = {
+                    "_aseon": {
+                        "note": "forced-nonempty-output",
+                        "at": datetime.now(timezone.utc).isoformat()
+                    }
+                }
             safe_output = normalize_output(safe_output)
+
             try:
                 preview = json.dumps(safe_output)[:400]
             except Exception:
                 preview = "<unserializable>"
+
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
+
             cur.execute("""
                 UPDATE jobs
                    SET status='done',
@@ -97,6 +96,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             """, (Json(safe_output), job_id))
             wrote = cur.fetchone()
             conn.commit()
+
             log("info", "finish_job_post_write",
                 job_id=str(job_id),
                 out_type=(wrote["out_type"] if wrote and "out_type" in wrote else None),
@@ -114,7 +114,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             conn.commit()
             log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
 
-# ---------- DB helpers ----------
+# ---------- Helpers ----------
 
 def get_site_info(conn, site_id):
     with conn.cursor() as cur:
@@ -129,38 +129,80 @@ def get_site_info(conn, site_id):
             raise ValueError("Site not found")
         return row["url"], row.get("account_name"), row.get("language"), row.get("country")
 
-def get_latest_crawl_output(conn, site_id):
+def latest_job_output(conn, site_id, jtype):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT output
               FROM jobs
-             WHERE site_id = %s
-               AND type = 'crawl'
-               AND status = 'done'
-             ORDER BY finished_at DESC NULLS LAST, created_at DESC
+             WHERE site_id = %s AND type = %s AND status = 'done'
+             ORDER BY created_at DESC
              LIMIT 1
-        """, (site_id,))
-        row = cur.fetchone()
-        return row["output"] if row and row.get("output") else None
+        """, (site_id, jtype))
+        r = cur.fetchone()
+        return (r or {}).get("output") if r else None
 
-# ---------- Crawl ----------
+def documents_count(conn, site_id):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM documents WHERE site_id=%s", (site_id,))
+            r = cur.fetchone()
+            return int((r or {}).get("n") or 0)
+    except Exception:
+        return 0
+
+def build_crawl_context(crawl_out: dict, max_pages: int = 8) -> str | None:
+    if not crawl_out: return None
+    pages = (crawl_out or {}).get("pages") or []
+    items = []
+    for p in pages[:max_pages]:
+        frag = {
+            "url": p.get("final_url") or p.get("url"),
+            "title": p.get("title"),
+            "h1": p.get("h1"),
+            "h2": p.get("h2"),
+            "h3": p.get("h3"),
+            "meta_description": p.get("meta_description"),
+        }
+        items.append(frag)
+    ctx = {
+        "source": "crawl",
+        "pages": items
+    }
+    return json.dumps(ctx, ensure_ascii=False)
+
+def pick_context(conn, site_id, use_flag: str | None) -> tuple[str | None, str]:
+    """
+    Context preference:
+      - "documents": use RAG (documents table) if available
+      - "crawl":     use latest crawl summary (titles/h1/h2/h3/descriptions)
+      - "auto"/None: prefer documents > crawl > none
+      - anything else: none
+    """
+    use = (use_flag or "auto").lower()
+    if use not in ("documents","crawl","auto","none"):
+        use = "auto"
+
+    if use == "documents" or use == "auto":
+        n = documents_count(conn, site_id)
+        if n > 0:
+            return json.dumps({"source":"documents","note":f"{n} chunks available"}), "documents"
+
+    if use == "crawl" or use == "auto":
+        crawl = latest_job_output(conn, site_id, "crawl")
+        ctx = build_crawl_context(crawl)
+        if ctx:
+            return ctx, "crawl"
+
+    return None, "none"
+
+# ---------- Job runners ----------
 
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
-    ua = (payload or {}).get("user_agent") or "AseonBot/0.3 (+https://aseon.ai)"
+    ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
     start_url, _, _, _ = get_site_info(conn, site_id)
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
-
-    # Optioneel: ingest naar documents (RAG)
-    if INGEST_ENABLED and ingest_crawl_output:
-        try:
-            inserted = ingest_crawl_output(conn, site_id, result)
-            log("info", "ingest_done", chunks=int(inserted))
-        except Exception as e:
-            log("error", "ingest_failed", error=str(e))
     return result
-
-# ---------- Keywords ----------
 
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed", "home")
@@ -169,54 +211,51 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- FAQ (stub/example — echte RAG-agent apart) ----------
-
-def run_faq(site_id, payload):
-    topic = (payload or {}).get("topic") or "general"
-    count = int((payload or {}).get("count", 6))
-    faqs = []
-    for i in range(count):
-        faqs.append({"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub)."})
-    return {"topic": topic, "faqs": faqs}
-
-# ---------- Schema (AI) ----------
-
 def run_schema(conn, site_id, payload):
     site_url, account_name, language, country = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
-    faq_count = (payload or {}).get("count") or (payload or {}).get("faq_count")
-    extras = dict((payload or {}).get("extras") or {})  # may include sameAs
+    extras = (payload or {}).get("extras") or {}
+    count = int((payload or {}).get("count", 3))  # default 3 for FAQPage
+    use_context = (payload or {}).get("use_context")  # "documents" | "crawl" | "auto" | "none"
 
-    # optioneel sameAs uit crawl meenemen
-    context_used = "none"
-    crawl = get_latest_crawl_output(conn, site_id)
-    if SCHEMA_USE_CRAWL_SAMEAS and crawl and isinstance(crawl, dict):
-        detected = crawl.get("social_profiles") or []
-        if detected:
-            lst = list(extras.get("sameAs", [])) if isinstance(extras.get("sameAs"), list) else []
-            # merge + dedupe
-            seen = set(lst)
-            for u in detected:
-                if isinstance(u, str) and u and u not in seen:
-                    lst.append(u); seen.add(u)
-            extras["sameAs"] = lst
-            context_used = "crawl"
+    # Choose context
+    rag_context, context_used = pick_context(conn, site_id, use_context)
 
+    # Generate schema (AI)
     schema_obj = generate_schema(
         biz_type=biz_type,
-        site_name=account_name or "Website",
+        site_name=account_name,
         site_url=site_url,
         language=language,
-        country=country,
         extras=extras,
-        rag_context=None,
-        faq_count=int(faq_count) if (isinstance(faq_count, int) and faq_count > 0) else None
+        rag_context=rag_context,
+        faq_count=count,
+        max_faq_words=80
     )
+
+    # If FAQPage, ensure <= count and <= max words (extra safety)
+    if isinstance(schema_obj, dict) and schema_obj.get("@type") == "FAQPage":
+        main = schema_obj.get("mainEntity") or []
+        main = main[:count]
+        cleaned = []
+        for item in main:
+            if not isinstance(item, dict): continue
+            q = item.get("name"); ans = (item.get("acceptedAnswer") or {}).get("text") or ""
+            if not q or not ans: continue
+            words = " ".join(ans.split()).split(" ")
+            if len(words) > 80:
+                ans = " ".join(words[:80])
+            cleaned.append({
+                "@type": "Question",
+                "name": q,
+                "acceptedAnswer": {"@type":"Answer","text": ans}
+            })
+        schema_obj["mainEntity"] = cleaned
 
     out = {
         "schema": schema_obj,
         "biz_type": biz_type,
-        "name": account_name or "Website",
+        "name": account_name,
         "url": site_url,
         "language": language,
         "country": country,
@@ -225,7 +264,16 @@ def run_schema(conn, site_id, payload):
     log("info", "schema_generated_ai", preview=json.dumps(out)[:400])
     return out
 
-# ---------- Report (stub) ----------
+def run_faq(site_id, payload):
+    topic = (payload or {}).get("topic") or "general"
+    count = int((payload or {}).get("count", 6))
+    faqs = []
+    for i in range(count):
+        faqs.append({
+            "q": f"What is {topic} ({i+1})?",
+            "a": f"{topic.capitalize()} explained (stub)."
+        })
+    return {"topic": topic, "faqs": faqs}
 
 def run_report(site_id, payload):
     fmt = (payload or {}).get("format", "markdown")
@@ -240,8 +288,6 @@ DISPATCH = {
     "faq": run_faq,
     "report": run_report,
 }
-
-# ---------- Job processing ----------
 
 def process_job(conn, job):
     jtype = job["type"]
@@ -262,17 +308,13 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
-# ---------- Main loop ----------
-
 def main():
     global running
     log("info", "agent_boot",
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V14_SOCIAL_SAMEAS",
-        ingest_enabled=INGEST_ENABLED
-    )
+        marker="AGENT_VERSION_V14_SCHEMA_CONTEXT")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
