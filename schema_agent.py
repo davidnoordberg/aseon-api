@@ -1,6 +1,7 @@
 # schema_agent.py
 import os, json
 from urllib.parse import urlparse
+from typing import Optional, Tuple, Dict, Any
 from openai import OpenAI
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -14,9 +15,9 @@ Hard rules (must follow):
 - Return a single valid JSON object (no arrays), no comments/explanations.
 - Always include "@context":"https://schema.org".
 - Only emit fields you can infer from the input (domain/name) or that are explicitly provided.
-- Do NOT fabricate phone numbers, addresses, coordinates, prices, ratings, or opening hours.
+- Do NOT fabricate phone numbers, addresses, geo coordinates, opening hours, prices, ratings, or reviews.
 - Respect the requested language if provided (field values should be in that language).
-- Keep any FAQ answers concise (≤80 words), factual, and non-promotional.
+- Keep any FAQ answers concise (≤80 words), factual, non-promotional.
 
 Supported types and minimum fields:
 1) Organization / LocalBusiness:
@@ -31,10 +32,10 @@ Supported types and minimum fields:
    - name, description, url
    - itemListElement[] for OfferCatalog if items present
 
-Output must be compact and valid JSON-LD.
+Output must be compact and valid JSON-LD. If context is insufficient to safely fill a field, omit it.
 """
 
-def _call_llm(prompt: str) -> dict | None:
+def _call_llm(prompt: str) -> Optional[Dict[str, Any]]:
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -48,7 +49,7 @@ def _call_llm(prompt: str) -> dict | None:
         content = resp.choices[0].message.content
         return json.loads(content)
     except Exception:
-        # Fallback pass without response_format in case the model returns plain JSON text
+        # Retry zonder response_format (sommige modellen geven plain JSON terug)
         try:
             resp = client.chat.completions.create(
                 model=MODEL,
@@ -68,7 +69,7 @@ def _call_llm(prompt: str) -> dict | None:
             }), flush=True)
             return None
 
-def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
+def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> Dict[str, Any]:
     return {
         "@context": "https://schema.org",
         "@type": biz_type,
@@ -76,14 +77,14 @@ def _fallback_schema(biz_type: str, site_name: str, site_url: str) -> dict:
         "url": site_url
     }
 
-def validate_schema(data: dict, biz_type: str) -> tuple[bool, str | None]:
+def validate_schema(data: Dict[str, Any], biz_type: str) -> Tuple[bool, Optional[str]]:
     if not isinstance(data, dict):
         return False, "Schema is not a dict"
     if "@type" not in data:
         return False, "Missing @type"
-    # basic sanity by type
+
     t = data.get("@type")
-    if t == "Organization" or t == "LocalBusiness":
+    if t in ("Organization", "LocalBusiness"):
         if not data.get("name") or not data.get("url"):
             return False, f"{t} missing name or url"
     if t == "Article":
@@ -92,20 +93,26 @@ def validate_schema(data: dict, biz_type: str) -> tuple[bool, str | None]:
                 return False, f"Article missing {k}"
     if t == "FAQPage":
         me = data.get("mainEntity")
-        if not me or not isinstance(me, list) or not me[0].get("acceptedAnswer"):
-            return False, "FAQPage missing mainEntity/acceptedAnswer"
+        if not me or not isinstance(me, list):
+            return False, "FAQPage missing mainEntity"
+        # Ensure at least first item has an acceptedAnswer with text
+        first = me[0] if me else {}
+        aa = (first or {}).get("acceptedAnswer")
+        if not aa or not isinstance(aa, dict) or not aa.get("text"):
+            return False, "FAQPage missing acceptedAnswer"
     return True, None
 
 def generate_schema(
     biz_type: str,
-    site_name: str | None,
+    site_name: Optional[str],
     site_url: str,
-    language: str | None = None,
-    extras: dict | None = None,
-    rag_context: str | None = None
-) -> dict:
+    language: Optional[str] = None,
+    extras: Optional[Dict[str, Any]] = None,
+    rag_context: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Genereer JSON-LD voor het opgegeven type. Geen verzonnen data.
+    Genereer JSON-LD voor het opgegeven type, zonder verzonnen data.
+    'rag_context' kan crawl/FAQ/outline-samenvattingen bevatten voor betere specificiteit.
     """
     extras = extras or {}
     bt = (biz_type or "Organization").strip()
@@ -124,8 +131,9 @@ def generate_schema(
     }
 
     prompt = (
-        "Generate a single JSON-LD object that follows the rules. "
-        "Only include fields you can infer from this input:\n"
+        "Generate ONE JSON-LD object that follows the rules. "
+        "Use the provided context when helpful. "
+        "Only include fields you can safely infer; do NOT fabricate contact info.\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
