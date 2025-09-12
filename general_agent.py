@@ -8,8 +8,7 @@ from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-# schema_agent niet nodig voor de isolatietest
-# from schema_agent import generate_schema
+# schema_agent niet nodig voor deze isolatietest
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -20,7 +19,12 @@ DSN = os.environ["DATABASE_URL"]
 running = True
 
 def log(level, msg, **kwargs):
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level.upper(),
+        "msg": msg,
+        **kwargs,
+    }
     print(json.dumps(payload), flush=True)
 
 def handle_sigterm(signum, frame):
@@ -66,12 +70,11 @@ def finish_job(conn, job_id, ok, output=None, err=None):
         if ok:
             safe_output = output if isinstance(output, dict) else {}
             if not safe_output:
-                # Forceer *altijd* niet-lege output zodat API nooit null toont
+                # Forceer altijd niet-lege output zodat API nooit null toont
                 safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
             safe_output = normalize_output(safe_output)
 
-            # Log wat we gaan schrijven
-            preview = None
+            # Log wat we gaan schrijven (preview)
             try:
                 preview = json.dumps(safe_output)[:400]
             except Exception:
@@ -79,7 +82,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
 
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
 
-            # Schrijf en verifieer rechtstreeks met RETURNING
+            # Schrijf en verifieer met RETURNING
             cur.execute("""
                 UPDATE jobs
                    SET status='done',
@@ -94,7 +97,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
 
             log("info", "finish_job_post_write",
                 job_id=str(job_id),
-                out_type=wrote["out_type"] if wrote else None,
+                out_type=(wrote["out_type"] if wrote and "out_type" in wrote else None),
                 wrote_preview=(json.dumps(wrote["output"])[:400] if wrote and wrote.get("output") is not None else None)
             )
         else:
@@ -108,6 +111,8 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             """, (err_text, job_id))
             conn.commit()
             log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
+
+# ---------- Crawl integration ----------
 
 def get_site_info(conn, site_id):
     with conn.cursor() as cur:
@@ -129,6 +134,8 @@ def run_crawl(conn, site_id, payload):
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
+# ---------- Keywords ----------
+
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed", "home")
     market = (payload or {}).get("market", {})
@@ -136,7 +143,8 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- TEMP: schema dummy die altijd een niet-lege dict returnt ----------
+# ---------- TEMP: Schema dummy die altijd niet-lege dict returnt ----------
+
 def run_schema(conn, site_id, payload):
     site_url, account_name = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
@@ -160,12 +168,17 @@ def run_schema(conn, site_id, payload):
     log("info", "schema_generated_dummy", preview=json.dumps(out)[:400])
     return out
 
+# ---------- Other jobtypes (stubs) ----------
+
 def run_faq(site_id, payload):
     topic = (payload or {}).get("topic") or "general"
     count = int((payload or {}).get("count", 6))
     faqs = []
     for i in range(count):
-        faqs.append({"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub)."})
+        faqs.append({
+            "q": f"What is {topic} ({i+1})?",
+            "a": f"{topic.capitalize()} explained (stub)."
+        })
     return {"topic": topic, "faqs": faqs}
 
 def run_report(site_id, payload):
@@ -181,6 +194,8 @@ DISPATCH = {
     "faq": run_faq,
     "report": run_report,
 }
+
+# ---------- Job processing ----------
 
 def process_job(conn, job):
     jtype = job["type"]
@@ -201,12 +216,15 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
+# ---------- Main loop ----------
+
 def main():
     global running
     log("info", "agent_boot",
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
-        git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown")
+        git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
+        marker="AGENT_VERSION_V7_DUMMY_WITH_WRITE_VERIFY")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
