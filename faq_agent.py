@@ -13,14 +13,16 @@ def _embed(text: str) -> List[float]:
     return client.embeddings.create(model=EMBED_MODEL, input=[text]).data[0].embedding
 
 def _make_context_from_documents(conn, site_id: str, topic: str, k: int = 5) -> tuple[str, str]:
+    from psycopg.rows import dict_row
     try:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
+            # CAST het parameter-argument expliciet naar vector
             cur.execute("""
                 SELECT url, content
                   FROM documents
-                 WHERE site_id=%s
-                 ORDER BY embedding <-> %s
+                 WHERE site_id = %s
+                 ORDER BY embedding <-> %s::vector
                  LIMIT %s
             """, (site_id, qvec, k))
             rows = cur.fetchall()
@@ -28,9 +30,12 @@ def _make_context_from_documents(conn, site_id: str, topic: str, k: int = 5) -> 
             ctx = "\n\n".join([f"[{i+1}] {r['url']}\n{r['content']}" for i, r in enumerate(rows)])
             return ctx, "documents"
     except Exception as e:
+        # heel belangrijk: abort terugdraaien, anders faalt de fallback ook
+        try: conn.rollback()
+        except Exception: pass
         print(json.dumps({"level":"WARN","msg":"faq_vector_search_failed","error":str(e)}), flush=True)
 
-    # LIKE fallback
+    # LIKE-fallback in een schone transactie
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
@@ -44,9 +49,12 @@ def _make_context_from_documents(conn, site_id: str, topic: str, k: int = 5) -> 
             ctx = "\n\n".join([f"[{i+1}] {r['url']}\n{r['content']}" for i, r in enumerate(rows)])
             return ctx, "like"
     except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
         print(json.dumps({"level":"ERROR","msg":"faq_like_search_failed","error":str(e)}), flush=True)
 
     return "", "none"
+
 
 def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     topic = (payload or {}).get("topic") or "general"
