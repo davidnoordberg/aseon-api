@@ -1,5 +1,5 @@
 # crawl_light.py
-# Light++ crawler voor Aseon (BFS, robots-respect, caps, issues & quick_wins)
+# Light++ crawler voor Aseon (BFS, robots-respect, caps, issues & quick_wins, social detection)
 # Doel: stabiel op 2GB/1CPU, snelle signalen voor SEO/AEO/GEO agents.
 
 import os
@@ -21,16 +21,38 @@ from urllib.robotparser import RobotFileParser
 REQ_TIMEOUT = float(os.getenv("CRAWL_REQ_TIMEOUT_SEC", "6"))
 CONTENT_CAP_BYTES = int(os.getenv("CRAWL_CONTENT_CAP_BYTES", "150000"))  # 150 KB
 MAX_QUEUE = int(os.getenv("CRAWL_MAX_QUEUE", "200"))
-HARD_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES_HARD", "12"))
+HARD_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES_HARD", "20"))
 
 DEFAULT_UA = os.getenv(
     "CRAWL_UA",
     "AseonBot/0.3 (+https://aseon.ai; support@aseon.ai)"
 )
 
-# Host matching controls
+# Host matching
 ALLOW_WWW_EQUIV = os.getenv("CRAWL_ALLOW_WWW_EQUIV", "true").lower() == "true"
 ALLOW_SUBDOMAINS = os.getenv("CRAWL_ALLOW_SUBDOMAINS", "false").lower() == "true"
+
+# Social whitelist (comma-separated domains allowed, we match by suffix)
+_DEFAULT_SOCIALS = [
+    "twitter.com",
+    "x.com",
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "youtube.com",
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "producthunt.com",
+    "crunchbase.com",
+    "wikidata.org",
+    "wikipedia.org"
+]
+SOCIAL_WHITELIST = [
+    d.strip().lower() for d in os.getenv("CRAWL_SOCIAL_WHITELIST", ",".join(_DEFAULT_SOCIALS)).split(",")
+    if d.strip()
+]
 
 
 @dataclass
@@ -56,10 +78,8 @@ def _netloc_key(netloc: str) -> str:
     nl = (netloc or "").strip().lower()
     if not nl:
         return nl
-    # strip port
     if ":" in nl:
         nl = nl.split(":", 1)[0]
-    # strip leading 'www.' als de setting dit toelaat
     if ALLOW_WWW_EQUIV and nl.startswith("www."):
         nl = nl[4:]
     return nl
@@ -86,7 +106,6 @@ def _norm_url(u: str) -> str:
         scheme = parsed.scheme or "https"
         netloc = parsed.netloc
         path = parsed.path or "/"
-        # strip fragments; keep query
         return urlparse.urlunparse((scheme, netloc, path, "", parsed.query, ""))
     except Exception:
         return u
@@ -113,13 +132,6 @@ def _extract_meta_robots(soup: BeautifulSoup) -> Tuple[Optional[bool], Optional[
     return (None, None)
 
 
-def _extract_lang(soup: BeautifulSoup) -> Optional[str]:
-    html_tag = soup.find("html")
-    if html_tag and html_tag.get("lang"):
-        return html_tag.get("lang").strip()
-    return None
-
-
 def _safe_text(x: Optional[str], cap: int) -> Optional[str]:
     if not x:
         return None
@@ -133,7 +145,7 @@ def _iter_links(soup: BeautifulSoup, base: str) -> List[str]:
     out = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if href.startswith("#"):
+        if not href or href.startswith("#"):
             continue
         absu = urlparse.urljoin(base, href)
         out.append(absu)
@@ -153,9 +165,8 @@ def _fetch_capped(session: requests.Session, url: str) -> Tuple[int, bytes, List
     """
     chain: List[str] = []
     try:
-        # We gebruiken allow_redirects=False om zelf chain te loggen.
         current = url
-        for _ in range(6):  # max 6 redirects
+        for _ in range(6):  # max redirects
             resp = session.get(current, timeout=REQ_TIMEOUT, allow_redirects=False, stream=True)
             status = resp.status_code
             chain.append(_norm_url(current))
@@ -168,7 +179,6 @@ def _fetch_capped(session: requests.Session, url: str) -> Tuple[int, bytes, List
                     pass
                 continue
 
-            # HTML body capped lezen
             body = bytearray()
             for chunk in resp.iter_content(chunk_size=16384):
                 if chunk:
@@ -183,7 +193,6 @@ def _fetch_capped(session: requests.Session, url: str) -> Tuple[int, bytes, List
                 pass
             return status, bytes(body), chain, final_url
 
-        # te veel redirects
         return 310, b"", chain, _norm_url(current)
     except requests.RequestException:
         return 0, b"", chain, _norm_url(url)
@@ -279,15 +288,44 @@ def _build_quick_wins(pages: List[PageResult]) -> List[Dict[str, Any]]:
     return wins
 
 
+def _is_social_domain(netloc: str) -> bool:
+    nl = (netloc or "").lower()
+    if ":" in nl:
+        nl = nl.split(":", 1)[0]
+    if nl.startswith("www."):
+        nl = nl[4:]
+    return any(nl == d or nl.endswith("." + d) for d in SOCIAL_WHITELIST)
+
+
+def _canonical_social_url(u: str) -> Optional[str]:
+    try:
+        p = urlparse.urlparse(u)
+        if not _is_social_domain(p.netloc):
+            return None
+        # strip query/fragment; normalize path basic
+        path = p.path or "/"
+        # drop trailing slashes (except root)
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        # heuristics: drop obvious share/intent paths
+        bad_segments = ("/share", "/intent", "/oauth", "/login", "/signup")
+        if any(seg in path.lower() for seg in bad_segments):
+            return None
+        return urlparse.urlunparse(("https", p.netloc.lower(), path, "", "", ""))
+    except Exception:
+        return None
+
+
 def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dict[str, Any]:
     """
-    BFS crawl (same-site) met robots-respect, caps, en basis-issues.
+    BFS crawl (same-site) met robots-respect, caps, basis-issues + social detectie.
     Return shape:
     {
       "start_url": ...,
       "pages": [ PageResult as dict ... ],
       "summary": {...},
-      "quick_wins": [...]
+      "quick_wins": [...],
+      "social_profiles": ["https://twitter.com/...", ...]
     }
     """
     max_pages = max(1, min(int(max_pages), HARD_MAX_PAGES))
@@ -307,8 +345,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
         rp.set_url(robots_url)
         rp.read()
     except Exception:
-        # bij failure: conservatief toestaan (of disallow?), we kiezen toestaan
-        pass
+        pass  # bij failure: toestaan
 
     session = _get_session(ua)
 
@@ -319,6 +356,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
 
     pages: List[PageResult] = []
     capped_by_runtime = False
+    social_profiles: Set[str] = set()
 
     def enqueue(u: str):
         if len(seen) >= MAX_QUEUE:
@@ -343,7 +381,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
                 pages.append(PageResult(
                     url=url,
                     final_url=url,
-                    status=999,  # pseudo-status: robots blocked
+                    status=999,  # pseudo: robots blocked
                     redirect_chain=[],
                     title=None,
                     meta_description=None,
@@ -382,6 +420,10 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
                 if _same_site(l, root_netloc_key):
                     internal_links += 1
                     enqueue(l)
+                # social detectie (ook als het externe links zijn)
+                soc = _canonical_social_url(l)
+                if soc:
+                    social_profiles.add(soc)
 
         # bouw page result
         page = PageResult(
@@ -431,5 +473,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
         "start_url": root,
         "pages": pages_out,
         "summary": summary,
-        "quick_wins": quick_wins
+        "quick_wins": quick_wins,
+        "social_profiles": sorted(list(social_profiles))
     }
