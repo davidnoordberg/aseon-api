@@ -8,7 +8,7 @@ from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-# schema_agent niet nodig voor dummy test
+from schema_agent import generate_schema  # <-- echte schema agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -114,12 +114,12 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             conn.commit()
             log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
 
-# ---------- Crawl integration ----------
+# ---------- Helpers ----------
 
 def get_site_info(conn, site_id):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT s.url, a.name AS account_name
+            SELECT s.url, s.language, s.country, a.name AS account_name
               FROM sites s
               JOIN accounts a ON a.id = s.account_id
              WHERE s.id = %s
@@ -127,12 +127,14 @@ def get_site_info(conn, site_id):
         row = cur.fetchone()
         if not row or not row["url"]:
             raise ValueError("Site not found")
-        return row["url"], row.get("account_name")
+        return row["url"], row.get("language"), row.get("country"), row.get("account_name")
+
+# ---------- Crawl ----------
 
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
-    start_url, _ = get_site_info(conn, site_id)
+    start_url, _, _, _ = get_site_info(conn, site_id)
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
     return result
 
@@ -143,42 +145,44 @@ def run_keywords(site_id, payload):
     market = (payload or {}).get("market", {})
     lang = market.get("language", "en")
     country = market.get("country", "US")
-    return generate_keywords(seed, language=lang, country=country, n=30)
+    return generate_keywords(seed, language=lang, country=country, n=int((payload or {}).get("n", 30)))
 
-# ---------- Schema dummy ----------
+# ---------- Schema (AI) ----------
 
 def run_schema(conn, site_id, payload):
-    site_url, account_name = get_site_info(conn, site_id)
-    biz_type = (payload or {}).get("biz_type", "Organization")
-    name = (payload or {}).get("name") or account_name or "Aseon Dummy"
+    """
+    Gebruikt schema_agent.generate_schema(...) i.p.v. dummy.
+    Houdt de bestaande output-shape aan voor frontend compatibiliteit.
+    """
+    site_url, site_lang, site_country, account_name = get_site_info(conn, site_id)
 
-    dummy_schema = {
-        "@context": "https://schema.org",
-        "@type": biz_type,
-        "name": name,
-        "url": site_url,
-        "note": "dummy schema to verify output storage path"
-    }
-    if biz_type == "FAQPage":
-        dummy_schema["mainEntity"] = [{
-            "@type": "Question",
-            "name": "Example question",
-            "acceptedAnswer": {
-                "@type": "Answer",
-                "text": "Example answer (dummy)."
-            }
-        }]
+    # payload hints
+    biz_type = (payload or {}).get("biz_type", "Organization")
+    name = (payload or {}).get("name") or account_name or "Aseon"
+    extras = (payload or {}).get("extras") or {}
+    rag_context = (payload or {}).get("context")  # optioneel
+
+    schema_obj = generate_schema(
+        biz_type=biz_type,
+        site_name=name,
+        site_url=site_url,
+        language=site_lang,
+        extras=extras,
+        rag_context=rag_context
+    )
 
     out = {
-        "schema": dummy_schema,
+        "schema": schema_obj,
         "biz_type": biz_type,
         "name": name,
-        "url": site_url
+        "url": site_url,
+        "language": site_lang,
+        "country": site_country
     }
-    log("info", "schema_generated_dummy", preview=json.dumps(out)[:400])
+    log("info", "schema_generated_ai", preview=json.dumps(out)[:400])
     return out
 
-# ---------- Other jobtypes (stubs) ----------
+# ---------- FAQ (stub for now) ----------
 
 def run_faq(site_id, payload):
     topic = (payload or {}).get("topic") or "general"
@@ -190,6 +194,8 @@ def run_faq(site_id, payload):
             "a": f"{topic.capitalize()} explained (stub)."
         })
     return {"topic": topic, "faqs": faqs}
+
+# ---------- Report ----------
 
 def run_report(site_id, payload):
     fmt = (payload or {}).get("format", "markdown")
@@ -234,7 +240,7 @@ def main():
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V8_FORCE_JSONB")
+        marker="AGENT_VERSION_V9_SCHEMA_AI_ENABLED")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
