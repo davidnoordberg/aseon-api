@@ -10,7 +10,7 @@ from crawl_light import crawl_site
 from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
-from faq_agent import generate_faqs  # <<< NIEUW: echte FAQ agent
+from faq_agent import generate_faqs  # echte FAQ agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -18,16 +18,10 @@ MAX_ERROR_LEN = 500
 INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 
 DSN = os.environ["DATABASE_URL"]
-
 running = True
 
 def log(level, msg, **kwargs):
-    payload = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "level": level.upper(),
-        "msg": msg,
-        **kwargs,
-    }
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
     print(json.dumps(payload), flush=True)
 
 def handle_sigterm(signum, frame):
@@ -40,10 +34,8 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 def normalize_output(obj):
     def default(o):
-        if isinstance(o, datetime):
-            return o.isoformat()
-        if isinstance(o, uuid.UUID):
-            return str(o)
+        if isinstance(o, datetime): return o.isoformat()
+        if isinstance(o, uuid.UUID): return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
 
@@ -51,18 +43,16 @@ def claim_one_job(conn):
     with conn.cursor() as cur:
         cur.execute("""
             WITH j AS (
-                SELECT id
-                FROM jobs
-                WHERE status = 'queued'
-                ORDER BY created_at
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                SELECT id FROM jobs
+                 WHERE status='queued'
+                 ORDER BY created_at
+                 LIMIT 1
+                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE jobs
-               SET status = 'running', started_at = NOW()
-              FROM j
-             WHERE jobs.id = j.id
-         RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
+            UPDATE jobs SET status='running', started_at=NOW()
+             FROM j
+            WHERE jobs.id=j.id
+        RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
         row = cur.fetchone()
         conn.commit()
@@ -82,22 +72,15 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
             cur.execute("""
                 UPDATE jobs
-                   SET status='done',
-                       output=%s,
-                       finished_at=NOW(),
-                       error=NULL
+                   SET status='done', output=%s, finished_at=NOW(), error=NULL
                  WHERE id=%s
              RETURNING jsonb_typeof(output) AS out_type, output;
             """, (Json(safe_output), job_id))
-            cur.fetchone()
-            conn.commit()
+            cur.fetchone(); conn.commit()
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
-                UPDATE jobs
-                   SET status='failed',
-                       finished_at=NOW(),
-                       error=%s
+                UPDATE jobs SET status='failed', finished_at=NOW(), error=%s
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
@@ -118,6 +101,18 @@ def get_site_info(conn, site_id):
             raise ValueError("Site not found")
         return row
 
+def get_latest_job_output(conn, site_id, jtype):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT output
+              FROM jobs
+             WHERE site_id=%s AND type=%s AND status='done'
+             ORDER BY finished_at DESC NULLS LAST, created_at DESC
+             LIMIT 1
+        """, (site_id, jtype))
+        r = cur.fetchone()
+        return (r or {}).get("output") if r else None
+
 # ---------- Crawl ----------
 
 def run_crawl(conn, site_id, payload):
@@ -126,7 +121,6 @@ def run_crawl(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     result = crawl_site(site["url"], max_pages=max_pages, ua=ua)
 
-    # Ingest (RAG) – titels/H1–H3 + korte meta
     if INGEST_ENABLED:
         try:
             inserted = ingest_crawl_output(conn, site_id, result)
@@ -148,37 +142,46 @@ def run_keywords(site_id, payload):
 
 def run_schema(conn, site_id, payload):
     site = get_site_info(conn, site_id)
-    biz_type = (payload or {}).get("biz_type", "Organization")
-    extras = (payload or {}).get("extras") or {}
-    use_context = (payload or {}).get("use_context", "auto")
-    count = int((payload or {}).get("count", 3))
+    biz_type   = (payload or {}).get("biz_type", "Organization")
+    extras     = (payload or {}).get("extras") or {}
+    use_ctx    = (payload or {}).get("use_context", "auto")
+    count      = int((payload or {}).get("count", 3))
+
+    faqs_for_schema = None
+    context_used = "none"
+    if biz_type == "FAQPage" and use_ctx in ("auto", "faq", "documents", "crawl"):
+        latest_faq = get_latest_job_output(conn, site_id, "faq")
+        if latest_faq and isinstance(latest_faq.get("faqs"), list) and latest_faq["faqs"]:
+            faqs_for_schema = latest_faq["faqs"]
+            context_used = "faq"
+
     data = generate_schema(
         biz_type=biz_type,
         site_name=site.get("account_name"),
         site_url=site.get("url"),
         language=site.get("language"),
-        extras={**extras, "count": count, "use_context": use_context}
+        extras={**extras, "count": count, "faqs": faqs_for_schema, "use_context": use_ctx}
     )
-    out = {
+
+    return {
         "schema": data,
         "biz_type": biz_type,
         "name": site.get("account_name"),
         "url": site.get("url"),
         "language": site.get("language"),
-        "country": site.get("country")
+        "country": site.get("country"),
+        "_context_used": context_used if biz_type == "FAQPage" else None
     }
-    return out
 
-# ---------- FAQ (AI + RAG) ----------
+# ---------- FAQ ----------
 
 def run_faq(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     out = generate_faqs(conn, site_id, payload or {})
-    # Include light site meta for frontend convenience
     out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
     return out
 
-# ---------- Report stub (blijft stub tot laatste stap) ----------
+# ---------- Report (stub) ----------
 
 def run_report(site_id, payload):
     fmt = (payload or {}).get("format", "markdown")
@@ -191,10 +194,7 @@ def run_report(site_id, payload):
 # ---------- Dispatcher ----------
 
 def process_job(conn, job):
-    jtype = job["type"]
-    site_id = job["site_id"]
-    payload = job.get("payload") or {}
-
+    jtype = job["type"]; site_id = job["site_id"]; payload = job.get("payload") or {}
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
 
     if jtype == "crawl":
@@ -213,16 +213,12 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
-# ---------- Main loop ----------
-
 def main():
     global running
     log("info", "agent_boot",
-        poll_interval=POLL_INTERVAL_SEC,
-        batch_size=BATCH_SIZE,
+        poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_FAQ_AI_ON",
-        ingest_enabled=INGEST_ENABLED)
+        marker="AGENT_VERSION_FAQ_SCHEMA_TIED", ingest_enabled=INGEST_ENABLED)
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
@@ -230,8 +226,7 @@ def main():
             with pool.connection() as conn:
                 job = claim_one_job(conn)
                 if not job:
-                    time.sleep(POLL_INTERVAL_SEC)
-                    continue
+                    time.sleep(POLL_INTERVAL_SEC); continue
                 try:
                     output = process_job(conn, job)
                     finish_job(conn, job["id"], True, output, None)
@@ -241,7 +236,6 @@ def main():
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
             time.sleep(POLL_INTERVAL_SEC)
-
     log("info", "agent_exit")
 
 if __name__ == "__main__":
