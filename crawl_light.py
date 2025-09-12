@@ -28,6 +28,10 @@ DEFAULT_UA = os.getenv(
     "AseonBot/0.3 (+https://aseon.ai; support@aseon.ai)"
 )
 
+# Host matching controls
+ALLOW_WWW_EQUIV = os.getenv("CRAWL_ALLOW_WWW_EQUIV", "true").lower() == "true"
+ALLOW_SUBDOMAINS = os.getenv("CRAWL_ALLOW_SUBDOMAINS", "false").lower() == "true"
+
 
 @dataclass
 class PageResult:
@@ -47,9 +51,31 @@ class PageResult:
     issues: List[str]
 
 
-def _same_host(u: str, root_netloc: str) -> bool:
+def _netloc_key(netloc: str) -> str:
+    """Normaliseer host: lowercase, strip poort, strip leidende 'www.' voor vergelijking."""
+    nl = (netloc or "").strip().lower()
+    if not nl:
+        return nl
+    # strip port
+    if ":" in nl:
+        nl = nl.split(":", 1)[0]
+    # strip leading 'www.' als de setting dit toelaat
+    if ALLOW_WWW_EQUIV and nl.startswith("www."):
+        nl = nl[4:]
+    return nl
+
+
+def _same_site(u: str, root_netloc_key: str) -> bool:
+    """Zelfde site? Exacte hostmatch na normalisatie, of (optioneel) subdomain-allow."""
     try:
-        return urlparse.urlparse(u).netloc == root_netloc
+        nl = _netloc_key(urlparse.urlparse(u).netloc)
+        if not nl:
+            return False
+        if nl == root_netloc_key:
+            return True
+        if ALLOW_SUBDOMAINS and nl.endswith("." + root_netloc_key):
+            return True
+        return False
     except Exception:
         return False
 
@@ -80,7 +106,6 @@ def _extract_meta_robots(soup: BeautifulSoup) -> Tuple[Optional[bool], Optional[
         nf = True if "nofollow" in toks else (False if "follow" in toks else None)
         return (ni, nf)
 
-    # robots
     tag = soup.find("meta", attrs={"name": re.compile(r"^(robots|googlebot)$", re.I)})
     if tag and tag.get("content"):
         return parse_meta(tag.get("content"))
@@ -137,7 +162,6 @@ def _fetch_capped(session: requests.Session, url: str) -> Tuple[int, bytes, List
             if status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
                 loc = urlparse.urljoin(current, resp.headers["Location"])
                 current = loc
-                # sluit response vroegtijdig
                 try:
                     resp.close()
                 except Exception:
@@ -148,7 +172,6 @@ def _fetch_capped(session: requests.Session, url: str) -> Tuple[int, bytes, List
             body = bytearray()
             for chunk in resp.iter_content(chunk_size=16384):
                 if chunk:
-                    # cap op bytes
                     if len(body) + len(chunk) > CONTENT_CAP_BYTES:
                         body.extend(chunk[: max(0, CONTENT_CAP_BYTES - len(body))])
                         break
@@ -175,7 +198,6 @@ def _parse_html(url: str, body: bytes) -> Tuple[Optional[str], Optional[str], Op
     if not body:
         return (None, None, None, None, [], [])
 
-    # BeautifulSoup tolerant voor broken HTML
     soup = BeautifulSoup(body, "html.parser")
 
     title = _safe_text(soup.title.string if soup.title else None, 300)
@@ -259,7 +281,7 @@ def _build_quick_wins(pages: List[PageResult]) -> List[Dict[str, Any]]:
 
 def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dict[str, Any]:
     """
-    BFS crawl (same-host) met robots-respect, caps, en basis-issues.
+    BFS crawl (same-site) met robots-respect, caps, en basis-issues.
     Return shape:
     {
       "start_url": ...,
@@ -276,7 +298,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
         start_url = "https://" + start_url
     parsed_root = urlparse.urlparse(start_url)
     root = _norm_url(start_url)
-    root_netloc = parsed_root.netloc
+    root_netloc_key = _netloc_key(parsed_root.netloc)
 
     # Robots
     robots_url = urlparse.urljoin(root, "/robots.txt")
@@ -304,7 +326,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
         nu = _norm_url(u)
         if nu in seen:
             return
-        if not _same_host(nu, root_netloc):
+        if not _same_site(nu, root_netloc_key):
             return
         seen.add(nu)
         try:
@@ -318,7 +340,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
         # robots check
         try:
             if not rp.can_fetch(ua, url):
-                # markeer als "blocked" maar voeg wel entry toe voor transparantie
                 pages.append(PageResult(
                     url=url,
                     final_url=url,
@@ -337,7 +358,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
                 ))
                 continue
         except Exception:
-            # als robotparser faalt → ga door
             pass
 
         status, body, chain, final_url = _fetch_capped(session, url)
@@ -359,7 +379,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = DEFAULT_UA) -> Dic
             links = _iter_links(soup, final_url or url)
             internal_links = 0
             for l in links:
-                if _same_host(l, root_netloc):
+                if _same_site(l, root_netloc_key):
                     internal_links += 1
                     enqueue(l)
 
