@@ -11,6 +11,7 @@ from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
 from faq_agent import generate_faqs  # echte FAQ agent
+import report_agent  # <<< NIEUW: voor echte report-generatie
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -181,15 +182,12 @@ def run_faq(conn, site_id, payload):
     out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
     return out
 
-# ---------- Report (stub) ----------
+# ---------- Report (nu echte bundeling via report_agent) ----------
 
-def run_report(site_id, payload):
-    fmt = (payload or {}).get("format", "markdown")
-    report_md = "# Aseon Report (MVP)\n\n- Crawl: OK\n- Keywords: OK\n- FAQ: OK\n- Schema: OK\n"
-    if fmt == "html":
-        html = "<h1>Aseon Report (MVP)</h1><ul><li>Crawl: OK</li><li>Keywords: OK</li><li>FAQ: OK</li><li>Schema: OK</li></ul>"
-        return {"format": "html", "report": html}
-    return {"format": "markdown", "report": report_md}
+def run_report(conn, site_id, payload):
+    # Houd interface gelijk aan de rest van de dispatcher (conn, site_id, payload)
+    job_stub = {"site_id": site_id, "payload": payload or {}}
+    return report_agent.generate_report(conn, job_stub)
 
 # ---------- Dispatcher ----------
 
@@ -206,7 +204,7 @@ def process_job(conn, job):
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
     elif jtype == "report":
-        output = run_report(site_id, payload)
+        output = run_report(conn, site_id, payload)
     else:
         raise ValueError(f"Unknown job type: {jtype}")
 
