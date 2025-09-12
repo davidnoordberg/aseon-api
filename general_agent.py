@@ -11,35 +11,51 @@ from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
 from faq_agent import generate_faqs  # echte FAQ agent
+from report_agent import generate_report  # NIEUW: volledige report agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))  # (gereserveerd voor toekomstig batchen)
 MAX_ERROR_LEN = 500
 INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 
+# Vereist: DATABASE_URL (Render Postgres)
 DSN = os.environ["DATABASE_URL"]
 running = True
 
+
 def log(level, msg, **kwargs):
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
-    print(json.dumps(payload), flush=True)
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level.upper(),
+        "msg": msg,
+        **kwargs
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
 
 def handle_sigterm(signum, frame):
     global running
     log("info", "received_shutdown")
     running = False
 
+
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
+
 def normalize_output(obj):
+    """Zorgt dat output JSON-serializable is (datetimes/UUIDs naar strings)."""
     def default(o):
-        if isinstance(o, datetime): return o.isoformat()
-        if isinstance(o, uuid.UUID): return str(o)
+        if isinstance(o, datetime):
+            return o.isoformat()
+        if isinstance(o, uuid.UUID):
+            return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
 
+
 def claim_one_job(conn):
+    """Claim precies 1 queued job, FIFO, met SKIP LOCKED."""
     with conn.cursor() as cur:
         cur.execute("""
             WITH j AS (
@@ -49,42 +65,59 @@ def claim_one_job(conn):
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
             )
-            UPDATE jobs SET status='running', started_at=NOW()
-             FROM j
-            WHERE jobs.id=j.id
+            UPDATE jobs
+               SET status='running', started_at=NOW()
+              FROM j
+             WHERE jobs.id = j.id
         RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
         row = cur.fetchone()
         conn.commit()
         return row
 
+
 def finish_job(conn, job_id, ok, output=None, err=None):
+    """Rond job af met status done/failed en (optionele) output of error."""
     with conn.cursor() as cur:
         if ok:
             safe_output = output if isinstance(output, dict) else {}
             if not safe_output:
-                safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
+                # garandeer non-empty dict voor downstream clients
+                safe_output = {
+                    "_aseon": {
+                        "note": "forced-nonempty-output",
+                        "at": datetime.now(timezone.utc).isoformat()
+                    }
+                }
             safe_output = normalize_output(safe_output)
             try:
-                preview = json.dumps(safe_output)[:400]
+                preview = json.dumps(safe_output, ensure_ascii=False)[:400]
             except Exception:
                 preview = "<unserializable>"
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
             cur.execute("""
                 UPDATE jobs
-                   SET status='done', output=%s, finished_at=NOW(), error=NULL
+                   SET status='done',
+                       output=%s,
+                       finished_at=NOW(),
+                       error=NULL
                  WHERE id=%s
              RETURNING jsonb_typeof(output) AS out_type, output;
             """, (Json(safe_output), job_id))
-            cur.fetchone(); conn.commit()
+            cur.fetchone()
+            conn.commit()
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
-                UPDATE jobs SET status='failed', finished_at=NOW(), error=%s
+                UPDATE jobs
+                   SET status='failed',
+                       finished_at=NOW(),
+                       error=%s
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
             log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
+
 
 # ---------- Helpers ----------
 
@@ -101,6 +134,7 @@ def get_site_info(conn, site_id):
             raise ValueError("Site not found")
         return row
 
+
 def get_latest_job_output(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
@@ -112,6 +146,7 @@ def get_latest_job_output(conn, site_id, jtype):
         """, (site_id, jtype))
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
+
 
 # ---------- Crawl ----------
 
@@ -126,8 +161,10 @@ def run_crawl(conn, site_id, payload):
             inserted = ingest_crawl_output(conn, site_id, result)
             log("info", "ingest_done", chunks=inserted)
         except Exception as e:
+            # ingest mag nooit de crawl-output blokkeren
             log("error", "ingest_failed", error=str(e))
     return result
+
 
 # ---------- Keywords ----------
 
@@ -137,6 +174,7 @@ def run_keywords(site_id, payload):
     lang = market.get("language", "en")
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
+
 
 # ---------- Schema ----------
 
@@ -173,28 +211,46 @@ def run_schema(conn, site_id, payload):
         "_context_used": context_used if biz_type == "FAQPage" else None
     }
 
+
 # ---------- FAQ ----------
 
 def run_faq(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     out = generate_faqs(conn, site_id, payload or {})
-    out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
+    out["site"] = {
+        "url": site.get("url"),
+        "language": site.get("language"),
+        "country": site.get("country")
+    }
     return out
 
-# ---------- Report (stub) ----------
 
-def run_report(site_id, payload):
-    fmt = (payload or {}).get("format", "markdown")
-    report_md = "# Aseon Report (MVP)\n\n- Crawl: OK\n- Keywords: OK\n- FAQ: OK\n- Schema: OK\n"
-    if fmt == "html":
-        html = "<h1>Aseon Report (MVP)</h1><ul><li>Crawl: OK</li><li>Keywords: OK</li><li>FAQ: OK</li><li>Schema: OK</li></ul>"
-        return {"format": "html", "report": html}
-    return {"format": "markdown", "report": report_md}
+# ---------- Report (volledig) ----------
+
+def run_report(conn, site_id, payload):
+    """
+    Bouwt en bundelt rapport (Markdown/HTML) op basis van de laatste crawl/keywords/faq/schema jobs.
+    Output-structuur is direct geschikt voor wegschrijven naar jobs.output.
+    """
+    try:
+        return generate_report(conn, site_id, payload or {})
+    except Exception as e:
+        # Defensieve fallback zodat job niet leeg faalt
+        log("error", "report_generate_failed", error=str(e))
+        return {
+            "format": "markdown",
+            "report": "# Aseon Report\n\n_Genereren mislukt; zie agent logs._\n",
+            "_aseon": {"error": str(e)}
+        }
+
 
 # ---------- Dispatcher ----------
 
 def process_job(conn, job):
-    jtype = job["type"]; site_id = job["site_id"]; payload = job.get("payload") or {}
+    """Voert job uit obv type en retourneert output-dict voor finish_job()."""
+    jtype = job["type"]
+    site_id = job["site_id"]
+    payload = job.get("payload") or {}
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
 
     if jtype == "crawl":
@@ -206,19 +262,25 @@ def process_job(conn, job):
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
     elif jtype == "report":
-        output = run_report(site_id, payload)
+        output = run_report(conn, site_id, payload)
     else:
         raise ValueError(f"Unknown job type: {jtype}")
 
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
+
 def main():
     global running
-    log("info", "agent_boot",
-        poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE,
+    log(
+        "info",
+        "agent_boot",
+        poll_interval=POLL_INTERVAL_SEC,
+        batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_FAQ_SCHEMA_TIED", ingest_enabled=INGEST_ENABLED)
+        marker="AGENT_VERSION_FAQ_SCHEMA_REPORT",
+        ingest_enabled=INGEST_ENABLED
+    )
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
@@ -226,7 +288,8 @@ def main():
             with pool.connection() as conn:
                 job = claim_one_job(conn)
                 if not job:
-                    time.sleep(POLL_INTERVAL_SEC); continue
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 try:
                     output = process_job(conn, job)
                     finish_job(conn, job["id"], True, output, None)
@@ -236,7 +299,9 @@ def main():
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
             time.sleep(POLL_INTERVAL_SEC)
+
     log("info", "agent_exit")
+
 
 if __name__ == "__main__":
     main()
