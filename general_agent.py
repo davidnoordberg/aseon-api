@@ -1,14 +1,16 @@
 # general_agent.py
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
+from typing import Any, Optional
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Json
 
 from crawl_light import crawl_site
-from keywords_agent import generate_keywords
-from schema_agent import generate_schema  # AI schema generator
+from keywords_agent import generate_keywords   # Zorg dat deze module in /agent staat
+from schema_agent import generate_schema       # AI schema generator (LLM)
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -18,7 +20,7 @@ DSN = os.environ["DATABASE_URL"]
 
 running = True
 
-def log(level, msg, **kwargs):
+def log(level: str, msg: str, **kwargs):
     payload = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "level": level.upper(),
@@ -32,11 +34,10 @@ def handle_sigterm(signum, frame):
     log("info", "received_shutdown")
     running = False
 
-import signal as _signal
-_signal.signal(_signal.SIGTERM, handle_sigterm)
-_signal.signal(_signal.SIGINT, handle_sigterm)
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
 
-def normalize_output(obj):
+def normalize_output(obj: Any) -> Any:
     def default(o):
         if isinstance(o, datetime):
             return o.isoformat()
@@ -66,7 +67,7 @@ def claim_one_job(conn):
         conn.commit()
         return row
 
-def finish_job(conn, job_id, ok, output=None, err=None):
+def finish_job(conn, job_id, ok: bool, output: Optional[dict] = None, err: Optional[Exception] = None):
     with conn.cursor() as cur:
         if ok:
             safe_output = output if isinstance(output, dict) else {}
@@ -130,9 +131,9 @@ def get_site_info(conn, site_id):
             raise ValueError("Site not found")
         return row["url"], row.get("language"), row.get("country"), row.get("account_name")
 
-def fetch_latest_job_output(conn, site_id, jtype):
+def fetch_latest_job_output(conn, site_id, jtype: str):
     """
-    Haalt het output JSON van de meest recente 'done' job voor deze site en type.
+    Haal output JSON van meest recente 'done' job (zelfde site + type).
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -147,11 +148,10 @@ def fetch_latest_job_output(conn, site_id, jtype):
         row = cur.fetchone()
         return row["output"] if row else None
 
-def build_crawl_context(crawl_output, max_pages=15, max_chars=12000) -> str:
+def build_crawl_context(crawl_output: dict, max_pages: int = 15, max_chars: int = 12000) -> str:
     """
-    Zet crawl-resultaat om naar compacte context voor LLM.
-    Verwacht structuur zoals: {"pages":[{url,title,meta_description,h1,h2,h3,...}], "summary":..., "quick_wins":[...]}
-    Trimt netjes om tokens te sparen.
+    Maak compacte context van crawl-resultaat voor de LLM.
+    Verwacht keys: pages[], summary, quick_wins[].
     """
     if not isinstance(crawl_output, dict):
         return ""
@@ -166,7 +166,7 @@ def build_crawl_context(crawl_output, max_pages=15, max_chars=12000) -> str:
             "url": p.get("url"),
             "status": p.get("status"),
             "title": p.get("title"),
-            "meta_description": p.get("meta_description"),
+            "meta_description": p.get("meta_description") or p.get("description"),
             "h1": p.get("h1"),
             "h2": p.get("h2"),
             "h3": p.get("h3"),
@@ -195,15 +195,16 @@ def run_keywords(site_id, payload):
     market = (payload or {}).get("market", {})
     lang = market.get("language", "en")
     country = market.get("country", "US")
-    return generate_keywords(seed, language=lang, country=country, n=int((payload or {}).get("n", 30)))
+    n = int((payload or {}).get("n", 30))
+    return generate_keywords(seed, language=lang, country=country, n=n)
 
 # ---------- Schema (AI + auto-context uit crawl) ----------
 
 def run_schema(conn, site_id, payload):
     """
-    Gebruikt schema_agent.generate_schema(...) met automatische context uit de
-    meest recente crawl-output. Payload-context blijft mogelijk en wordt
-    gebruikt als crawl ontbreekt.
+    Gebruikt schema_agent.generate_schema(...) met automatische context uit
+    de meest recente crawl-output. Payload 'context' blijft mogelijk
+    en wordt gebruikt wanneer crawl ontbreekt.
     """
     site_url, site_lang, site_country, account_name = get_site_info(conn, site_id)
 
@@ -215,15 +216,17 @@ def run_schema(conn, site_id, payload):
 
     # Auto RAG: pak laatste crawl
     crawl_out = fetch_latest_job_output(conn, site_id, "crawl")
-    rag_context = None
     if crawl_out:
-        rag_context = "Crawl summary for this site (titles/meta/H1-H3 & issues):\n" + build_crawl_context(crawl_out)
+        rag_context = "Crawl summary (titles/meta/H1–H3/issues):\n" + build_crawl_context(crawl_out)
+        context_used = "crawl"
         log("info", "schema_rag_context_attached", size=len(rag_context))
     elif explicit_context:
         rag_context = explicit_context
+        context_used = "payload"
         log("info", "schema_explicit_context_attached", size=len(rag_context))
     else:
         rag_context = "(no crawl context available; generate minimal valid JSON-LD only with safe, non-fabricated fields)"
+        context_used = "none"
         log("info", "schema_no_context", note="fallback_minimal")
 
     schema_obj = generate_schema(
@@ -242,7 +245,7 @@ def run_schema(conn, site_id, payload):
         "url": site_url,
         "language": site_lang,
         "country": site_country,
-        "_context_used": "crawl" if crawl_out else ("payload" if explicit_context else "none")
+        "_context_used": context_used
     }
     log("info", "schema_generated_ai", preview=json.dumps(out)[:400])
     return out
