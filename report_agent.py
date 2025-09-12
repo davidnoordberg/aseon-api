@@ -6,6 +6,7 @@ import base64
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+from psycopg.types.array import adapt_array
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
 from reportlab.lib.styles import getSampleStyleSheet
@@ -42,10 +43,10 @@ def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, D
               FROM jobs
              WHERE site_id=%s
                AND status='done'
-               AND type = ANY(%s::text[])
+               AND type = ANY(%s)
              ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
             """,
-            (site_id, types),
+            (site_id, adapt_array(types)),
         )
         out = {}
         for row in cur.fetchall():
