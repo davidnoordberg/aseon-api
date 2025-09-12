@@ -35,6 +35,8 @@ def _safe_get(d: Dict[str, Any], path: List[str], default=None):
 
 
 def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, Dict[str, Any]]:
+    # Forceer dat we altijd een echte lijst strings hebben
+    types = list(types)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -42,7 +44,7 @@ def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, D
               FROM jobs
              WHERE site_id=%s
                AND status='done'
-               AND type = ANY(%s)
+               AND type = ANY(%s::text[])
              ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
             """,
             (site_id, types),
