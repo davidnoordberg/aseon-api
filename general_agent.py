@@ -9,14 +9,16 @@ from psycopg.types.json import Json
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
 from schema_agent import generate_schema
-from ingest_agent import ingest_crawl_output  # <-- ingest na crawl (optioneel)
+from ingest_agent import ingest_crawl_output
+from faq_agent import generate_faqs  # <<< NIEUW: echte FAQ agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_ERROR_LEN = 500
-INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() in ("1","true","yes")
+INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 
 DSN = os.environ["DATABASE_URL"]
+
 running = True
 
 def log(level, msg, **kwargs):
@@ -38,8 +40,10 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 def normalize_output(obj):
     def default(o):
-        if isinstance(o, datetime): return o.isoformat()
-        if isinstance(o, uuid.UUID): return str(o)
+        if isinstance(o, datetime):
+            return o.isoformat()
+        if isinstance(o, uuid.UUID):
+            return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
 
@@ -48,11 +52,11 @@ def claim_one_job(conn):
         cur.execute("""
             WITH j AS (
                 SELECT id
-                  FROM jobs
-                 WHERE status = 'queued'
-                 ORDER BY created_at
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED
+                FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs
                SET status = 'running', started_at = NOW()
@@ -71,38 +75,38 @@ def finish_job(conn, job_id, ok, output=None, err=None):
             if not safe_output:
                 safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
             safe_output = normalize_output(safe_output)
-            preview = "<unserializable>"
-            try: preview = json.dumps(safe_output)[:400]
-            except Exception: pass
-
+            try:
+                preview = json.dumps(safe_output)[:400]
+            except Exception:
+                preview = "<unserializable>"
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
             cur.execute("""
                 UPDATE jobs
-                   SET status='done', output=%s, finished_at=NOW(), error=NULL
+                   SET status='done',
+                       output=%s,
+                       finished_at=NOW(),
+                       error=NULL
                  WHERE id=%s
              RETURNING jsonb_typeof(output) AS out_type, output;
             """, (Json(safe_output), job_id))
-            wrote = cur.fetchone()
+            cur.fetchone()
             conn.commit()
-            log("info", "finish_job_post_write",
-                job_id=str(job_id),
-                out_type=(wrote["out_type"] if wrote and "out_type" in wrote else None),
-                wrote_preview=(json.dumps(wrote["output"])[:400] if wrote and wrote.get("output") is not None else None)
-            )
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
                 UPDATE jobs
-                   SET status='failed', finished_at=NOW(), error=%s
+                   SET status='failed',
+                       finished_at=NOW(),
+                       error=%s
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
             log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
 
-# ---------- DB helpers ----------
+# ---------- Helpers ----------
 
 def get_site_info(conn, site_id):
-    with conn.cursor() as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
             SELECT s.url, s.language, s.country, a.name AS account_name
               FROM sites s
@@ -112,106 +116,17 @@ def get_site_info(conn, site_id):
         row = cur.fetchone()
         if not row or not row["url"]:
             raise ValueError("Site not found")
-        return row["url"], row.get("account_name"), row.get("language"), row.get("country")
+        return row
 
-def latest_job_output(conn, site_id, jtype):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT output
-              FROM jobs
-             WHERE site_id = %s AND type = %s AND status = 'done'
-             ORDER BY created_at DESC
-             LIMIT 1
-        """, (site_id, jtype))
-        r = cur.fetchone()
-        return (r or {}).get("output") if r else None
-
-def documents_count(conn, site_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM documents WHERE site_id=%s", (site_id,))
-            r = cur.fetchone()
-            return int((r or {}).get("n") or 0)
-    except Exception:
-        return 0
-
-def fetch_document_snippets(conn, site_id, limit=12, max_chars=700):
-    rows = []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT url, content
-                  FROM documents
-                 WHERE site_id = %s
-                 ORDER BY LENGTH(content) DESC
-                 LIMIT %s
-            """, (site_id, limit))
-            for r in cur.fetchall() or []:
-                text = (r.get("content") or "")[:max_chars]
-                rows.append({"url": r.get("url"), "text": text})
-    except Exception as e:
-        log("warn", "documents_fetch_failed", error=str(e))
-    return rows
-
-# ---------- Context builders ----------
-
-def build_crawl_context(crawl_out: dict, max_pages: int = 8) -> str | None:
-    if not crawl_out: return None
-    pages = (crawl_out or {}).get("pages") or []
-    items = []
-    for p in pages[:max_pages]:
-        frag = {
-            "url": p.get("final_url") or p.get("url"),
-            "title": p.get("title"),
-            "h1": p.get("h1"),
-            "h2": p.get("h2"),
-            "h3": p.get("h3"),
-            "meta_description": p.get("meta_description"),
-            "paragraphs": p.get("paragraphs")  # korte body-snippets van crawler
-        }
-        items.append(frag)
-    ctx = {"source": "crawl", "pages": items}
-    return json.dumps(ctx, ensure_ascii=False)
-
-def build_documents_context(conn, site_id, limit=12) -> str | None:
-    snippets = fetch_document_snippets(conn, site_id, limit=limit, max_chars=700)
-    if not snippets: return None
-    ctx = {"source": "documents", "snippets": snippets}
-    return json.dumps(ctx, ensure_ascii=False)
-
-def pick_context(conn, site_id, use_flag: str | None) -> tuple[str | None, str]:
-    """
-    Preference:
-      - "documents": use RAG snippets if available
-      - "crawl":     use latest crawl summary
-      - "auto"/None: prefer documents > crawl > none
-      - "none":      no context
-    """
-    use = (use_flag or "auto").lower()
-    if use not in ("documents","crawl","auto","none"):
-        use = "auto"
-
-    if use in ("documents","auto"):
-        if documents_count(conn, site_id) > 0:
-            ctx = build_documents_context(conn, site_id, limit=12)
-            if ctx: return ctx, "documents"
-
-    if use in ("crawl","auto"):
-        crawl = latest_job_output(conn, site_id, "crawl")
-        ctx = build_crawl_context(crawl)
-        if ctx: return ctx, "crawl"
-
-    return None, "none"
-
-# ---------- Job runners ----------
+# ---------- Crawl ----------
 
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
-    start_url, _, _, _ = get_site_info(conn, site_id)
-    result = crawl_site(start_url, max_pages=max_pages, ua=ua)
+    site = get_site_info(conn, site_id)
+    result = crawl_site(site["url"], max_pages=max_pages, ua=ua)
 
-    # Ingest (optioneel)
+    # Ingest (RAG) – titels/H1–H3 + korte meta
     if INGEST_ENABLED:
         try:
             inserted = ingest_crawl_output(conn, site_id, result)
@@ -220,6 +135,8 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
+# ---------- Keywords ----------
+
 def run_keywords(site_id, payload):
     seed = (payload or {}).get("seed", "home")
     market = (payload or {}).get("market", {})
@@ -227,82 +144,76 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
+# ---------- Schema ----------
+
 def run_schema(conn, site_id, payload):
-    site_url, account_name, language, country = get_site_info(conn, site_id)
+    site = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
     extras = (payload or {}).get("extras") or {}
+    use_context = (payload or {}).get("use_context", "auto")
     count = int((payload or {}).get("count", 3))
-    use_context = (payload or {}).get("use_context")  # documents|crawl|auto|none
-
-    # Kies context en bouw prompt-context
-    rag_context, context_used = pick_context(conn, site_id, use_context)
-
-    schema_obj = generate_schema(
+    data = generate_schema(
         biz_type=biz_type,
-        site_name=account_name,
-        site_url=site_url,
-        language=language,
-        extras=extras,
-        rag_context=rag_context,
-        faq_count=count,
-        max_faq_words=80
+        site_name=site.get("account_name"),
+        site_url=site.get("url"),
+        language=site.get("language"),
+        extras={**extras, "count": count, "use_context": use_context}
     )
-
-    # Extra guard voor FAQ: trim en tel
-    if isinstance(schema_obj, dict) and schema_obj.get("@type") == "FAQPage":
-        main = schema_obj.get("mainEntity") or []
-        main = main[:count]
-        cleaned = []
-        for item in main:
-            if not isinstance(item, dict): continue
-            q = item.get("name")
-            a = ((item.get("acceptedAnswer") or {}).get("text") or "").strip()
-            if not q or not a: continue
-            words = " ".join(a.split()).split()
-            if len(words) > 80: a = " ".join(words[:80])
-            cleaned.append({"@type":"Question","name":q,"acceptedAnswer":{"@type":"Answer","text":a}})
-        schema_obj["mainEntity"] = cleaned
-
     out = {
-        "schema": schema_obj,
+        "schema": data,
         "biz_type": biz_type,
-        "name": account_name,
-        "url": site_url,
-        "language": language,
-        "country": country,
-        "_context_used": context_used
+        "name": site.get("account_name"),
+        "url": site.get("url"),
+        "language": site.get("language"),
+        "country": site.get("country")
     }
-    log("info", "schema_generated_ai", preview=json.dumps(out)[:400])
     return out
 
-def run_faq(site_id, payload):
-    topic = (payload or {}).get("topic") or "general"
-    count = int((payload or {}).get("count", 6))
-    faqs = [{"q": f"What is {topic} ({i+1})?","a": f"{topic.capitalize()} explained (stub)."} for i in range(count)]
-    return {"topic": topic, "faqs": faqs}
+# ---------- FAQ (AI + RAG) ----------
+
+def run_faq(conn, site_id, payload):
+    site = get_site_info(conn, site_id)
+    out = generate_faqs(conn, site_id, payload or {})
+    # Include light site meta for frontend convenience
+    out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
+    return out
+
+# ---------- Report stub (blijft stub tot laatste stap) ----------
 
 def run_report(site_id, payload):
     fmt = (payload or {}).get("format", "markdown")
-    md = "# Aseon Report (MVP)\n\n- Crawl: OK\n- Keywords: OK\n- FAQ: OK\n- Schema: OK\n"
+    report_md = "# Aseon Report (MVP)\n\n- Crawl: OK\n- Keywords: OK\n- FAQ: OK\n- Schema: OK\n"
     if fmt == "html":
         html = "<h1>Aseon Report (MVP)</h1><ul><li>Crawl: OK</li><li>Keywords: OK</li><li>FAQ: OK</li><li>Schema: OK</li></ul>"
-        return {"format":"html","report":html}
-    return {"format":"markdown","report":md}
+        return {"format": "html", "report": html}
+    return {"format": "markdown", "report": report_md}
 
-DISPATCH = {"keywords": run_keywords, "faq": run_faq, "report": run_report}
+# ---------- Dispatcher ----------
 
 def process_job(conn, job):
-    jtype = job["type"]; site_id = job["site_id"]; payload = job.get("payload") or {}
+    jtype = job["type"]
+    site_id = job["site_id"]
+    payload = job.get("payload") or {}
+
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
+
     if jtype == "crawl":
         output = run_crawl(conn, site_id, payload)
     elif jtype == "schema":
         output = run_schema(conn, site_id, payload)
+    elif jtype == "keywords":
+        output = run_keywords(site_id, payload)
+    elif jtype == "faq":
+        output = run_faq(conn, site_id, payload)
+    elif jtype == "report":
+        output = run_report(site_id, payload)
     else:
-        if jtype not in DISPATCH: raise ValueError(f"Unknown job type: {jtype}")
-        output = DISPATCH[jtype](site_id, payload)
+        raise ValueError(f"Unknown job type: {jtype}")
+
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
+
+# ---------- Main loop ----------
 
 def main():
     global running
@@ -310,7 +221,7 @@ def main():
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V15_RAG_DOCS",
+        marker="AGENT_VERSION_FAQ_AI_ON",
         ingest_enabled=INGEST_ENABLED)
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
@@ -319,7 +230,8 @@ def main():
             with pool.connection() as conn:
                 job = claim_one_job(conn)
                 if not job:
-                    time.sleep(POLL_INTERVAL_SEC); continue
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 try:
                     output = process_job(conn, job)
                     finish_job(conn, job["id"], True, output, None)
@@ -329,6 +241,7 @@ def main():
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
             time.sleep(POLL_INTERVAL_SEC)
+
     log("info", "agent_exit")
 
 if __name__ == "__main__":
