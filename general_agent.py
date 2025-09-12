@@ -8,7 +8,7 @@ from psycopg.types.json import Json
 
 from crawl_light import crawl_site
 from keywords_agent import generate_keywords
-# schema_agent niet nodig voor deze isolatietest
+# schema_agent niet nodig voor dummy test
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -37,9 +37,9 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 def normalize_output(obj):
     def default(o):
-        if isinstance(o, (datetime,)):
+        if isinstance(o, datetime):
             return o.isoformat()
-        if isinstance(o, (uuid.UUID,)):
+        if isinstance(o, uuid.UUID):
             return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
@@ -70,11 +70,14 @@ def finish_job(conn, job_id, ok, output=None, err=None):
         if ok:
             safe_output = output if isinstance(output, dict) else {}
             if not safe_output:
-                # Forceer altijd niet-lege output zodat API nooit null toont
-                safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
+                safe_output = {
+                    "_aseon": {
+                        "note": "forced-nonempty-output",
+                        "at": datetime.now(timezone.utc).isoformat()
+                    }
+                }
             safe_output = normalize_output(safe_output)
 
-            # Log wat we gaan schrijven (preview)
             try:
                 preview = json.dumps(safe_output)[:400]
             except Exception:
@@ -82,7 +85,6 @@ def finish_job(conn, job_id, ok, output=None, err=None):
 
             log("info", "finish_job_pre_write", job_id=str(job_id), preview=preview)
 
-            # Schrijf en verifieer met RETURNING
             cur.execute("""
                 UPDATE jobs
                    SET status='done',
@@ -143,7 +145,7 @@ def run_keywords(site_id, payload):
     country = market.get("country", "US")
     return generate_keywords(seed, language=lang, country=country, n=30)
 
-# ---------- TEMP: Schema dummy die altijd niet-lege dict returnt ----------
+# ---------- Schema dummy ----------
 
 def run_schema(conn, site_id, payload):
     site_url, account_name = get_site_info(conn, site_id)
@@ -161,10 +163,18 @@ def run_schema(conn, site_id, payload):
         dummy_schema["mainEntity"] = [{
             "@type": "Question",
             "name": "Example question",
-            "acceptedAnswer": {"@type": "Answer", "text": "Example answer (dummy)."}
+            "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Example answer (dummy)."
+            }
         }]
 
-    out = {"schema": dummy_schema, "biz_type": biz_type, "name": name, "url": site_url}
+    out = {
+        "schema": dummy_schema,
+        "biz_type": biz_type,
+        "name": name,
+        "url": site_url
+    }
     log("info", "schema_generated_dummy", preview=json.dumps(out)[:400])
     return out
 
@@ -224,7 +234,7 @@ def main():
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V7_DUMMY_WITH_WRITE_VERIFY")
+        marker="AGENT_VERSION_V8_FORCE_JSONB")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
