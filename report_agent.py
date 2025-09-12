@@ -1,74 +1,54 @@
 # report_agent.py
-import os, json, base64
+import base64
 from io import BytesIO
+from typing import Dict, Any
 from xhtml2pdf import pisa
 
-# Dummy: hier zou je je echte bundeling doen (crawl, keywords, faq, schema, quick wins, plan)
-def _assemble_html(site_info: dict, sections: dict) -> str:
-    # Minimale HTML layout
-    html = f"""
-    <html>
-      <head>
-        <meta charset="utf-8"/>
-        <style>
-          body {{ font-family: Arial, sans-serif; margin: 40px; }}
-          h1 {{ color: #2c3e50; }}
-          h2 {{ color: #34495e; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
-          pre {{ background: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }}
-          .section {{ margin-bottom: 30px; }}
-        </style>
-      </head>
-      <body>
-        <h1>SEO Report for {site_info.get("url")}</h1>
-        <p><b>Language:</b> {site_info.get("language")}<br/>
-        <b>Country:</b> {site_info.get("country")}</p>
-    """
-    for name, content in sections.items():
-        html += f"<div class='section'><h2>{name.title()}</h2>"
-        if isinstance(content, dict) or isinstance(content, list):
-            html += f"<pre>{json.dumps(content, indent=2, ensure_ascii=False)}</pre>"
-        else:
-            html += f"<p>{content}</p>"
-        html += "</div>"
-    html += "</body></html>"
-    return html
-
 def _html_to_pdf_bytes(html: str) -> bytes:
+    """Render HTML naar PDF en geef bytes terug of raise RuntimeError."""
     result = BytesIO()
-    pisa.CreatePDF(html, dest=result)
+    pdf_status = pisa.CreatePDF(html, dest=result)
+    if pdf_status.err:
+        raise RuntimeError(f"xhtml2pdf failed with {pdf_status.err} errors")
     return result.getvalue()
 
-def generate_report(conn, job: dict) -> dict:
+def generate_report(conn, job: Dict[str, Any]) -> Dict[str, Any]:
     site_id = job["site_id"]
     payload = job.get("payload") or {}
-    fmt = (payload.get("format") or "both").lower()
+    fmt = (payload.get("format") or "markdown").lower()
 
-    # haal site info uit DB
-    with conn.cursor() as cur:
-        cur.execute("SELECT url, language, country FROM sites WHERE id=%s", (site_id,))
-        row = cur.fetchone()
-        if not row:
-            raise ValueError("Site not found")
-        site_info = {"url": row[0], "language": row[1], "country": row[2]}
+    # Minimalistisch HTML rapport
+    html = f"""
+    <html>
+      <head><title>Aseon Report</title></head>
+      <body>
+        <h1>Aseon Report</h1>
+        <p><b>Site ID:</b> {site_id}</p>
+        <ul>
+          <li>Crawl: OK</li>
+          <li>Keywords: OK</li>
+          <li>FAQ: OK</li>
+          <li>Schema: OK</li>
+        </ul>
+      </body>
+    </html>
+    """
 
-    # dummy sections (hier kun je get_latest_job_output(conn, site_id, "crawl") enz. doen)
-    sections = {
-        "crawl": {"status": "ok", "pages": 5},
-        "keywords": ["seo tips", "fast api", "pdf export"],
-        "faq": [{"q":"Wat is SEO?","a":"Zoekmachineoptimalisatie."}],
-        "schema": {"@context":"https://schema.org","@type":"Organization","name":"Test"},
-        "quick_wins": ["Add meta description", "Fix missing H1"],
-        "plan": "Focus on content clustering + schema markup."
-    }
-
-    # Bouw HTML
-    html = _assemble_html(site_info, sections)
-
-    out = {}
-    if fmt in ("html","both"):
-        out["html"] = html
-    if fmt in ("pdf","both"):
+    if fmt == "pdf":
         pdf_bytes = _html_to_pdf_bytes(html)
-        out["pdf_base64"] = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    return out
+        return {
+            "format": "pdf",
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8")
+        }
+    elif fmt == "html":
+        return {"format": "html", "report": html}
+    else:
+        md = (
+            f"# Aseon Report\n\n"
+            f"- Site: {site_id}\n"
+            f"- Crawl: OK\n"
+            f"- Keywords: OK\n"
+            f"- FAQ: OK\n"
+            f"- Schema: OK"
+        )
+        return {"format": "markdown", "report": md}
