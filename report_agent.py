@@ -6,6 +6,7 @@ import base64
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+from psycopg.rows import dict_row
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
 from reportlab.lib.styles import getSampleStyleSheet
@@ -36,7 +37,7 @@ def _safe_get(d: Dict[str, Any], path: List[str], default=None):
 
 def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, Dict[str, Any]]:
     types = list(types)
-    placeholders = ",".join(["%s"] * len(types))  # bv. %s,%s,%s,%s
+    placeholders = ",".join(["%s"] * len(types))  # bv. %s,%s,%s
     sql = f"""
         SELECT DISTINCT ON (type) id, type, output, finished_at
           FROM jobs
@@ -45,14 +46,14 @@ def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, D
            AND type IN ({placeholders})
          ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
     """
-    with conn.cursor() as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, (site_id, *types))
-        out = {}
+        out: Dict[str, Dict[str, Any]] = {}
         for row in cur.fetchall():
             out[row["type"]] = {
                 "id": row["id"],
                 "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
-                "output": row["output"] or {},
+                "output": row.get("output") or {},
             }
         return out
 
@@ -193,7 +194,7 @@ def generate_report(conn, job: Dict[str, Any]) -> Dict[str, Any]:
 
     latest = _latest_outputs_by_type(conn, site_id, ["crawl", "keywords", "faq", "schema"])
     site = {"url": "?", "language": "?", "country": "?"}
-    with conn.cursor() as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT url, language, country FROM sites WHERE id=%s", (site_id,))
         row = cur.fetchone()
         if row:
