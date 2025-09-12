@@ -1,5 +1,5 @@
 import os, json, traceback
-from typing import Optional, Literal, Any, Dict
+from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.3.2")
+app = FastAPI(title="Aseon API", version="0.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
   error TEXT,
-  output JSONB   -- <<< BELANGRIJK: output kolom
+  output JSONB
 );
 """
 
@@ -78,7 +78,7 @@ def job_json(r: dict) -> dict:
         "started_at": iso(r["started_at"]),
         "finished_at": iso(r["finished_at"]),
         "error": r["error"],
-        "output": r.get("output")   # <<< FIX: output meegeven
+        "output": r.get("output")
     }
 
 class AccountIn(BaseModel):
@@ -114,7 +114,7 @@ class JobOut(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
-    output: Optional[Dict[str, Any]] = None   # <<< FIX: output veld
+    output: Optional[Dict[str, Any]] = None
 
 @app.exception_handler(Exception)
 def unhandled(request: Request, exc: Exception):
@@ -189,3 +189,32 @@ def get_job(job_id: str):
         row = cur.fetchone()
         if not row: raise HTTPException(status_code=404, detail="Job not found")
         return job_json(row)
+
+# QoL: output direct endpoint
+@app.get("/jobs/{job_id}/output")
+def get_job_output(job_id: str):
+    with pool.connection() as c, c.cursor() as cur:
+        cur.execute("SELECT output FROM jobs WHERE id=%s",(job_id,))
+        row = cur.fetchone()
+        if not row: raise HTTPException(status_code=404, detail="Job not found")
+        return row["output"] or {}
+
+# QoL: latest results per site for a set of types
+@app.get("/sites/{site_id}/latest")
+def get_site_latest(site_id: str, types: str = Query(..., description="comma-separated list e.g. crawl,keywords,faq,schema")):
+    wanted = [t.strip() for t in types.split(",") if t.strip()]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="No types provided")
+    out: Dict[str, Any] = {}
+    with pool.connection() as c, c.cursor() as cur:
+        for t in wanted:
+            cur.execute("""
+                SELECT id, output, finished_at
+                  FROM jobs
+                 WHERE site_id=%s AND type=%s AND status='done'
+              ORDER BY COALESCE(finished_at, created_at) DESC
+                 LIMIT 1
+            """, (site_id, t))
+            row = cur.fetchone()
+            out[t] = row if row else None
+    return out
