@@ -1,6 +1,6 @@
 # general_agent.py
 import os, json, time, signal, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from psycopg_pool import ConnectionPool
@@ -16,6 +16,7 @@ from ingest_agent import ingest_crawl_output
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_ERROR_LEN = 500
+STALE_MINUTES = int(os.getenv("STALE_MINUTES", "10"))  # auto-requeue running jobs older than this
 DSN = os.environ["DATABASE_URL"]
 
 running = True
@@ -43,16 +44,28 @@ def normalize_output(obj: Any) -> Any:
         return str(o)
     return json.loads(json.dumps(obj, default=default))
 
+def requeue_stale(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE jobs
+               SET status='queued', started_at=NULL, error=NULL
+             WHERE status='running' AND started_at < NOW() - INTERVAL %s
+        """, (f"{STALE_MINUTES} minutes",))
+        n = cur.rowcount
+        conn.commit()
+    if n:
+        log("warn", "requeued_stale_running_jobs", count=n, older_than_min=STALE_MINUTES)
+
 def claim_one_job(conn):
     with conn.cursor() as cur:
         cur.execute("""
             WITH j AS (
                 SELECT id
-                FROM jobs
-                WHERE status='queued'
-                ORDER BY created_at
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                  FROM jobs
+                 WHERE status='queued'
+              ORDER BY created_at
+                 LIMIT 1
+                 FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs
                SET status='running', started_at=NOW()
@@ -76,7 +89,6 @@ def finish_job(conn, job_id, ok: bool, output: Optional[dict] = None, err: Optio
                 UPDATE jobs
                    SET status='done', output=%s, finished_at=NOW(), error=NULL
                  WHERE id=%s
-             RETURNING id;
             """, (Json(safe_output), job_id))
             conn.commit()
         else:
@@ -136,8 +148,11 @@ def build_crawl_context(crawl_output: dict, max_pages: int = 15, max_chars: int 
 
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 20))
+    # extra guardrails: cap via env of hard limit
+    max_pages = min(max_pages, int(os.getenv("CRAWL_MAX_PAGES_HARD", "40")))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.2 (+https://aseon.ai)"
     start_url, _, _, _ = get_site_info(conn, site_id)
+
     result = crawl_site(start_url, max_pages=max_pages, ua=ua)
 
     # AUTO: ingest naar documents (indien tabel bestaat)
@@ -226,14 +241,12 @@ DISPATCH_PURE = {
 def process_job(conn, job):
     jtype = job["type"]; site_id = job["site_id"]; payload = job.get("payload") or {}
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
-
     if jtype in DISPATCH_NEEDS_CONN:
         output = DISPATCH_NEEDS_CONN[jtype](conn, site_id, payload)
     elif jtype in DISPATCH_PURE:
         output = DISPATCH_PURE[jtype](site_id, payload)
     else:
         raise ValueError(f"Unknown job type: {jtype}")
-
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
@@ -243,15 +256,14 @@ def main():
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V11_CRAWL_INGEST_SCHEMA_FAQ")
+        marker="AGENT_VERSION_V12_MEMSAFE_CRAWL_STALE_RECOVERY")
     pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
 
     while running:
         try:
             with pool.connection() as conn:
-                # claim one
-                with conn.cursor() as cur:
-                    job = claim_one_job(conn)
+                requeue_stale(conn)  # auto-recover
+                job = claim_one_job(conn)
                 if not job:
                     time.sleep(POLL_INTERVAL_SEC)
                     continue
