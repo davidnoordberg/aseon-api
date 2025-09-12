@@ -1,5 +1,5 @@
 # general_agent.py
-# V13.1: fixed requeue SQL (make_interval), low-mem crawl flow, ingest toggle
+# V13.2: requeue fix + ingest rollback on failure + low-mem crawl flow compatible
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -49,7 +49,6 @@ def normalize_output(obj: Any) -> Any:
 def requeue_stale(conn):
     """Re-queue jobs that have been 'running' for longer than STALE_MINUTES."""
     with conn.cursor() as cur:
-        # NOTE: use make_interval(mins => %s) instead of "INTERVAL %s"
         cur.execute("""
             UPDATE jobs
                SET status='queued', started_at=NULL, error=NULL
@@ -166,6 +165,11 @@ def run_crawl(conn, site_id, payload):
             else:
                 log("info", "ingest_skipped", reason="documents_table_missing")
         except Exception as e:
+            # BELANGRIJK: rollback zodat de connectie bruikbaar blijft
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             log("error", "ingest_failed", error=str(e))
     else:
         log("info", "ingest_disabled_flag")
@@ -253,7 +257,7 @@ def main():
         poll_interval=POLL_INTERVAL_SEC,
         batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_V13_1_REQUEUE_FIX",
+        marker="AGENT_VERSION_V13_2_INGEST_ROLLBACK_FIX",
         ingest_enabled=INGEST_ENABLED)
     pool = ConnectionPool(DSN, min_size=1, max_size=3, kwargs={"row_factory": dict_row})
 
@@ -270,6 +274,10 @@ def main():
                     finish_job(conn, job["id"], True, out, None)
                 except Exception as e:
                     log("error", "job_failed", id=str(job["id"]), error=str(e))
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     finish_job(conn, job["id"], False, None, e)
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
