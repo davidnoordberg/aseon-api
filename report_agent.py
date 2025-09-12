@@ -40,7 +40,9 @@ def _latest_outputs_by_type(conn, site_id: str, types: List[str]) -> Dict[str, D
             """
             SELECT DISTINCT ON (type) id, type, output, finished_at
               FROM jobs
-             WHERE site_id=%s AND status='done' AND type = ANY(%s)
+             WHERE site_id=%s
+               AND status='done'
+               AND type = ANY(%s::text[])
              ORDER BY type, finished_at DESC NULLS LAST, created_at DESC
             """,
             (site_id, types),
