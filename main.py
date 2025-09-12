@@ -17,17 +17,14 @@ app = FastAPI(title="Aseon API", version="0.3.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
-# ---- Schema bootstrap (idempotent) ----
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
 CREATE TABLE IF NOT EXISTS accounts (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 CREATE TABLE IF NOT EXISTS sites (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -36,38 +33,18 @@ CREATE TABLE IF NOT EXISTS sites (
   country TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 CREATE TABLE IF NOT EXISTS jobs (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   payload JSONB,
   status TEXT NOT NULL DEFAULT 'queued',
-  input JSONB,
-  output JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
-  error TEXT
+  error TEXT,
+  output JSONB   -- <<< BELANGRIJK: output kolom
 );
-
--- Hardening / migrations (safe, idempotent)
-ALTER TABLE jobs
-  ADD COLUMN IF NOT EXISTS input JSONB,
-  ADD COLUMN IF NOT EXISTS output JSONB,
-  ADD COLUMN IF NOT EXISTS payload JSONB,
-  ADD COLUMN IF NOT EXISTS status TEXT,
-  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS error TEXT;
-
-UPDATE jobs SET status='queued' WHERE status IS NULL;
-UPDATE jobs SET created_at=NOW() WHERE created_at IS NULL;
-
-ALTER TABLE jobs
-  DROP CONSTRAINT IF EXISTS jobs_status_check,
-  ADD CONSTRAINT jobs_status_check CHECK (status IN ('queued','running','done','failed'));
 """
 
 def normalize_url(u: str) -> str:
@@ -85,11 +62,8 @@ def account_json(r: dict) -> dict:
 
 def site_json(r: dict) -> dict:
     return {
-        "id": str(r["id"]),
-        "account_id": str(r["account_id"]),
-        "url": r["url"],
-        "language": r["language"],
-        "country": r["country"],
+        "id": str(r["id"]), "account_id": str(r["account_id"]),
+        "url": r["url"], "language": r["language"], "country": r["country"],
         "created_at": iso(r["created_at"])
     }
 
@@ -98,13 +72,13 @@ def job_json(r: dict) -> dict:
         "id": str(r["id"]),
         "site_id": str(r["site_id"]),
         "type": r["type"],
-        "payload": r.get("payload"),
+        "payload": r["payload"],
         "status": r["status"],
         "created_at": iso(r["created_at"]),
         "started_at": iso(r["started_at"]),
         "finished_at": iso(r["finished_at"]),
         "error": r["error"],
-        "output": r.get("output"),   # <-- belangrijk: output meegeven
+        "output": r.get("output")   # <<< FIX: output meegeven
     }
 
 class AccountIn(BaseModel):
@@ -112,10 +86,7 @@ class AccountIn(BaseModel):
     email: EmailStr
 
 class AccountOut(BaseModel):
-    id: str
-    name: str
-    email: EmailStr
-    created_at: str
+    id: str; name: str; email: EmailStr; created_at: str
 
 class SiteIn(BaseModel):
     account_id: str
@@ -124,12 +95,7 @@ class SiteIn(BaseModel):
     country: str = Field(min_length=2, max_length=2)
 
 class SiteOut(BaseModel):
-    id: str
-    account_id: str
-    url: AnyHttpUrl
-    language: str
-    country: str
-    created_at: str
+    id: str; account_id: str; url: AnyHttpUrl; language: str; country: str; created_at: str
 
 JobType = Literal["crawl","keywords","faq","schema","report"]
 
@@ -148,25 +114,22 @@ class JobOut(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
-    output: Optional[Dict[str, Any]] = None  # <-- belangrijk: output in response model
+    output: Optional[Dict[str, Any]] = None   # <<< FIX: output veld
 
 @app.exception_handler(Exception)
 def unhandled(request: Request, exc: Exception):
-    print("UNHANDLED ERROR:", repr(exc))
-    traceback.print_exc()
+    print("UNHANDLED ERROR:", repr(exc)); traceback.print_exc()
     return JSONResponse(status_code=500, content={"detail":"Internal Server Error","error":str(exc)})
 
 @app.on_event("startup")
 def start():
     with pool.connection() as c:
-        c.execute(SQL)
-        c.commit()
+        c.execute(SQL); c.commit()
 
 @app.get("/healthz")
-def health():
+def health(): 
     try:
-        with pool.connection() as c:
-            c.execute("SELECT 1;")
+        with pool.connection() as c: c.execute("SELECT 1;")
         return {"ok": True, "db": True}
     except Exception:
         return {"ok": False, "db": False}
@@ -180,60 +143,49 @@ def create_account(body: AccountIn):
             ON CONFLICT (email) DO UPDATE SET name=EXCLUDED.name
             RETURNING id,name,email,created_at
         """, (body.name, body.email))
-        row = cur.fetchone()
-        c.commit()
-        return account_json(row)
+        row = cur.fetchone(); c.commit(); return account_json(row)
 
 @app.get("/accounts", response_model=AccountOut)
 def get_account_by_email(email: EmailStr = Query(...)):
     with pool.connection() as c, c.cursor() as cur:
-        cur.execute("SELECT id,name,email,created_at FROM accounts WHERE email=%s", (email,))
+        cur.execute("SELECT id,name,email,created_at FROM accounts WHERE email=%s",(email,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Account not found")
+        if not row: raise HTTPException(status_code=404, detail="Account not found")
         return account_json(row)
 
 @app.post("/sites", response_model=SiteOut)
 def create_site(body: SiteIn):
     with pool.connection() as c, c.cursor() as cur:
-        cur.execute("SELECT 1 FROM accounts WHERE id=%s", (body.account_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=400, detail="account_id does not exist")
+        cur.execute("SELECT 1 FROM accounts WHERE id=%s",(body.account_id,))
+        if not cur.fetchone(): raise HTTPException(status_code=400, detail="account_id does not exist")
         url_norm = normalize_url(body.url)
         cur.execute("""
             INSERT INTO sites (account_id,url,language,country)
             VALUES (%s,%s,%s,%s)
             RETURNING id,account_id,url,language,country,created_at
         """, (body.account_id, url_norm, body.language.lower(), body.country.upper()))
-        row = cur.fetchone()
-        c.commit()
-        return site_json(row)
+        row = cur.fetchone(); c.commit(); return site_json(row)
 
 @app.post("/jobs", response_model=JobOut)
 def create_job(body: JobIn):
     with pool.connection() as c, c.cursor() as cur:
-        cur.execute("SELECT 1 FROM sites WHERE id=%s", (body.site_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=400, detail="site_id does not exist")
+        cur.execute("SELECT 1 FROM sites WHERE id=%s",(body.site_id,))
+        if not cur.fetchone(): raise HTTPException(status_code=400, detail="site_id does not exist")
         pj = Json(body.payload) if body.payload is not None else None
         cur.execute("""
             INSERT INTO jobs (site_id,type,payload)
             VALUES (%s,%s,%s)
             RETURNING id,site_id,type,payload,status,created_at,started_at,finished_at,error,output
         """, (body.site_id, body.type, pj))
-        row = cur.fetchone()
-        c.commit()
-        return job_json(row)
+        row = cur.fetchone(); c.commit(); return job_json(row)
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str):
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("""
             SELECT id,site_id,type,payload,status,created_at,started_at,finished_at,error,output
-            FROM jobs
-            WHERE id=%s
+            FROM jobs WHERE id=%s
         """, (job_id,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Job not found")
+        if not row: raise HTTPException(status_code=404, detail="Job not found")
         return job_json(row)
