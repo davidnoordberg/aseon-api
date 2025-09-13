@@ -1,11 +1,9 @@
-# crawl_light.py (fixed)
-import re, time, gc
+# crawl_light.py
+import re, time, gc, os, requests
 from urllib.parse import urljoin, urlparse
-import requests
-import os
 
 DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))
 HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.1 (+https://aseon.ai)"}
 
 def _fetch(url: str, ua: str):
@@ -58,18 +56,24 @@ def _robots_meta(html: str):
     content = m.group(1).lower()
     return ("noindex" in content, "nofollow" in content)
 
-def _same_host(a: str, b: str):
+# --- FIX: host-normalisatie + zelfde-site check ---
+def _norm_host(u: str) -> str:
     try:
-        return urlparse(a).netloc.split(":")[0].lower() == urlparse(b).netloc.split(":")[0].lower()
+        host = urlparse(u).netloc.split(":")[0].lower()
+        if host.startswith("www."): host = host[4:]
+        return host
     except Exception:
-        return False
+        return ""
+
+def _same_site(a: str, b: str) -> bool:
+    return _norm_host(a) == _norm_host(b)
+# --------------------------------------------------
 
 def _extract_links(html: str, base_url: str):
-    # verbeterde regex: pakt href met of zonder quotes
     hrefs = re.findall(r'href\s*=\s*["\']?([^"\' >]+)', html, flags=re.I)
     links = []
     for h in hrefs:
-        if h.startswith("#"):  # skip anchors
+        if h.startswith("#") or h.startswith("mailto:") or h.startswith("tel:"):
             continue
         abs_url = urljoin(base_url, h)
         if abs_url.startswith("http"):
@@ -123,10 +127,9 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
-        # ✅ eerst links pakken, daarna pas geheugen vrijgeven
-        links = _extract_links(html, final_url)
-        for link in links:
-            if link not in seen and _same_host(start_url, link):
+        # --- FIX: vergelijk links met de *final_url* host en vul de queue aan ---
+        for link in _extract_links(html, final_url):
+            if link not in seen and _same_site(final_url, link):
                 queue.append(link)
 
         html = None
