@@ -2,6 +2,7 @@
 import re, time, gc
 from urllib.parse import urljoin, urlparse
 import requests
+import os
 
 DEFAULT_TIMEOUT = 10
 MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
