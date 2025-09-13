@@ -10,8 +10,8 @@ from crawl_light import crawl_site
 from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
-from faq_agent import generate_faqs
-import report_agent
+from faq_agent import generate_faqs  # echte FAQ agent
+import report_agent  # <<< voor echte report-generatie
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -41,27 +41,19 @@ def normalize_output(obj):
     return json.loads(json.dumps(obj, default=default))
 
 def claim_one_job(conn):
-    with conn.cursor(row_factory=dict_row) as cur:
-        # voorkom parallelle crawls per site (RAM spikes) en pak nieuwste job eerst
+    with conn.cursor() as cur:
         cur.execute("""
             WITH j AS (
                 SELECT id FROM jobs
                  WHERE status='queued'
-                   AND NOT EXISTS (
-                        SELECT 1 FROM jobs j2
-                         WHERE j2.site_id = jobs.site_id
-                           AND j2.type = 'crawl'
-                           AND j2.status = 'running'
-                   )
-                 ORDER BY created_at DESC
+                 ORDER BY created_at
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
             )
-            UPDATE jobs
-               SET status='running', started_at=NOW()
-              FROM j
-             WHERE jobs.id = j.id
-         RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
+            UPDATE jobs SET status='running', started_at=NOW()
+             FROM j
+            WHERE jobs.id=j.id
+        RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
         row = cur.fetchone()
         conn.commit()
@@ -138,14 +130,19 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
-# ---------- Keywords ----------
+# ---------- Keywords (AANGEPAST: voortaan met conn/RAG) ----------
 
-def run_keywords(site_id, payload):
-    seed = (payload or {}).get("seed", "home")
-    market = (payload or {}).get("market", {})
-    lang = market.get("language", "en")
-    country = market.get("country", "US")
-    return generate_keywords(seed, language=lang, country=country, n=30)
+def run_keywords(conn, site_id, payload):
+    # haal default taal/land uit site
+    site = get_site_info(conn, site_id)
+    market = (payload or {}).get("market", {}) or {}
+    market.setdefault("language", site.get("language") or "en")
+    market.setdefault("country",  site.get("country")  or "NL")
+
+    # laat de agent zelf RAG doen (documents -> vector search; fallback crawl)
+    payload = dict(payload or {})
+    payload["market"] = market
+    return generate_keywords(conn, site_id, payload)
 
 # ---------- Schema ----------
 
@@ -207,7 +204,7 @@ def process_job(conn, job):
     elif jtype == "schema":
         output = run_schema(conn, site_id, payload)
     elif jtype == "keywords":
-        output = run_keywords(site_id, payload)
+        output = run_keywords(conn, site_id, payload)  # <<<< gewijzigd
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
     elif jtype == "report":
