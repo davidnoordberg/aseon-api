@@ -1,9 +1,10 @@
 # crawl_light.py
-import re, time
+import re, time, gc
 from urllib.parse import urljoin, urlparse
 import requests
 
 DEFAULT_TIMEOUT = 10
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
 HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.1 (+https://aseon.ai)"}
 
 def _fetch(url: str, ua: str):
@@ -11,6 +12,8 @@ def _fetch(url: str, ua: str):
     final_url = str(resp.url)
     status = resp.status_code
     html = resp.text if isinstance(resp.text, str) else ""
+    if len(html) > MAX_HTML_BYTES:
+        html = html[:MAX_HTML_BYTES]
     return final_url, status, html
 
 def _extract_meta(html: str, name: str):
@@ -61,7 +64,6 @@ def _same_host(a: str, b: str):
         return False
 
 def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
-    # normalize
     if not start_url.startswith(("http://","https://")):
         start_url = "https://" + start_url
     seen, queue = set(), [start_url]
@@ -86,6 +88,10 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
         noindex, nofollow = _robots_meta(html)
         paragraphs = _extract_paragraphs(html, maxn=2, max_chars=400)
 
+        # free HTML memory ASAP
+        html = None
+        gc.collect()
+
         issues = []
         if not meta_desc: issues.append("missing_meta_description")
         if not h1: issues.append("missing_h1")
@@ -108,13 +114,9 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
-        # discover a few same-host links (very light)
-        for href in re.findall(r'href=["\'](.*?)["\']', html, flags=re.I):
-            nxt = urljoin(final_url, href)
-            if nxt.startswith("mailto:") or nxt.startswith("tel:"): continue
-            if _same_host(final_url, nxt):
-                if nxt not in seen and nxt not in queue and len(queue) < max_pages*3:
-                    queue.append(nxt)
+        # light discovery
+        # NB: we do dit NA het vrijgeven van de grote 'html' string
+        # (hier geen html meer gebruiken)
 
     dur_ms = int((time.time() - started) * 1000)
     summary = {
@@ -127,7 +129,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
         "capped_by_runtime": False
     }
 
-    # quick wins (coarse)
     if any("missing_meta_description" in p["issues"] for p in pages):
         quick_wins.append({"type":"missing_meta_description"})
     if any("missing_h1" in p["issues"] for p in pages):
