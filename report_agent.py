@@ -1,95 +1,144 @@
 # report_agent.py
-import io, base64, json
-from datetime import datetime
-from psycopg.rows import dict_row
+import io
+import json
+import base64
+import datetime as dt
+from collections import Counter, defaultdict
+
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem
+from reportlab.lib import colors
 
-# Helper: laatste job-output ophalen
-def get_latest_output(conn, site_id, jtype):
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""
-            SELECT output
-              FROM jobs
-             WHERE site_id=%s AND type=%s AND status='done'
-             ORDER BY finished_at DESC NULLS LAST, created_at DESC
-             LIMIT 1
-        """, (site_id, jtype))
-        row = cur.fetchone()
-        return row["output"] if row else None
+def _safe(s):
+    if s is None:
+        return ""
+    # heel simpele ontsmetting – paraparser veilig
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# Helper: pdf maken
-def build_pdf(site_id, crawl, keywords, faq, schema) -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4)
+def _top_issues(pages, top_n=10):
+    c = Counter()
+    for p in pages:
+        for i in (p.get("issues") or []):
+            c[i] += 1
+    return c.most_common(top_n)
+
+def _examples_by_issue(pages, issue, max_examples=6):
+    ex = []
+    for p in pages:
+        if issue in (p.get("issues") or []):
+            ex.append((p.get("final_url") or p.get("url") or "", _safe(p.get("title") or "")))
+        if len(ex) >= max_examples:
+            break
+    return ex
+
+def _kv_table(data, col1="Metric", col2="Value"):
+    rows = [[col1, col2]] + [[_safe(k), _safe(v)] for k,v in data]
+    t = Table(rows, colWidths=[70*mm, 90*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f2f5")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#d9dde3")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fbfbfc")]),
+    ]))
+    return t
+
+def _bullets(items):
     styles = getSampleStyleSheet()
-    elems = []
+    return ListFlowable(
+        [ListItem(Paragraph(_safe(x), styles["Normal"]), leftIndent=6) for x in items],
+        bulletType="bullet",
+        start=None
+    )
 
-    elems.append(Paragraph("<b>Aseon Report</b>", styles["Title"]))
-    elems.append(Spacer(1, 12))
-    elems.append(Paragraph(f"<b>Site ID:</b> {site_id}", styles["Normal"]))
-    elems.append(Spacer(1, 12))
+def build_report_pdf(site_id, crawl_output=None, keywords_output=None, faq_output=None, schema_output=None):
+    pages = (crawl_output or {}).get("pages") or []
+    summary = (crawl_output or {}).get("summary") or {}
+    quick_wins = (crawl_output or {}).get("quick_wins") or []
 
-    # Crawl
-    if crawl:
-        elems.append(Paragraph("<b>Crawl Summary</b>", styles["Heading2"]))
-        summ = crawl.get("summary", {})
-        elems.append(ListFlowable([
-            ListItem(Paragraph(f"Pages total: {summ.get('pages_total')}", styles["Normal"])),
-            ListItem(Paragraph(f"OK 200: {summ.get('ok_200')}", styles["Normal"])),
-            ListItem(Paragraph(f"Errors: {summ.get('errors_4xx_5xx')}", styles["Normal"]))
-        ]))
-        elems.append(Spacer(1, 12))
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=16*mm, bottomMargin=16*mm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="H1", parent=styles["Heading1"], fontSize=16, leading=20, spaceAfter=6))
+    styles.add(ParagraphStyle(name="H2", parent=styles["Heading2"], fontSize=12, leading=15, spaceAfter=4))
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=9, leading=12))
 
-    # Keywords
-    if keywords:
-        elems.append(Paragraph("<b>Keywords</b>", styles["Heading2"]))
-        kws = keywords.get("keywords", [])[:10]
-        for kw in kws:
-            elems.append(Paragraph(f"- {kw}", styles["Normal"]))
-        elems.append(Spacer(1, 12))
+    flow = []
+    flow.append(Paragraph(f"Aseon Site Report", styles["H1"]))
+    flow.append(Paragraph(f"Site ID: {_safe(site_id)} &nbsp;&nbsp;|&nbsp;&nbsp; Generated: {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", styles["Small"]))
+    flow.append(Spacer(1, 6))
 
-    # FAQ
-    if faq:
-        elems.append(Paragraph("<b>FAQs</b>", styles["Heading2"]))
-        faqs = faq.get("faqs", [])[:5]
-        for f in faqs:
-            elems.append(Paragraph(f"Q: {f.get('q')}", styles["Normal"]))
-            elems.append(Paragraph(f"A: {f.get('a')}", styles["Normal"]))
-            elems.append(Spacer(1, 6))
+    # Summary
+    srows = [
+        ("Pages crawled", str(summary.get("pages_total", 0))),
+        ("HTTP 200", str(summary.get("ok_200", 0))),
+        ("3xx redirects", str(summary.get("redirect_3xx", 0))),
+        ("4xx/5xx", str(summary.get("errors_4xx_5xx", 0))),
+        ("Duration (ms)", str(summary.get("duration_ms", 0))),
+        ("Capped by max_pages", "Yes" if summary.get("capped_by_runtime") else "No"),
+    ]
+    flow.append(Paragraph("Summary", styles["H2"]))
+    flow.append(_kv_table(srows))
+    flow.append(Spacer(1, 8))
 
-    # Schema
-    if schema:
-        elems.append(Paragraph("<b>Schema.org</b>", styles["Heading2"]))
-        schema_json = json.dumps(schema.get("schema", {}), indent=2)
-        elems.append(Paragraph(f"<font size=8><pre>{schema_json}</pre></font>", styles["Normal"]))
+    # Quick wins
+    if quick_wins:
+        flow.append(Paragraph("Quick wins", styles["H2"]))
+        flow.append(_bullets([qw.get("type","") for qw in quick_wins]))
+        flow.append(Spacer(1, 8))
 
-    doc.build(elems)
-    return buf.getvalue()
+    # Top issues
+    if pages:
+        ti = _top_issues(pages, top_n=10)
+        if ti:
+            flow.append(Paragraph("Top issues", styles["H2"]))
+            flow.append(_kv_table([(k, v) for k,v in ti], "Issue", "Count"))
+            flow.append(Spacer(1, 6))
 
-# Main entrypoint voor general_agent
-def generate_report(conn, job):
-    site_id = job["site_id"]
-    payload = job.get("payload") or {}
-    fmt = payload.get("format", "pdf")
+            # voorbeelden per top issue
+            for issue, _count in ti[:5]:
+                ex = _examples_by_issue(pages, issue, max_examples=6)
+                if not ex: 
+                    continue
+                flow.append(Paragraph(f"Examples – {_safe(issue)}", styles["Small"]))
+                flow.append(_kv_table(ex, "URL", "Title"))
+                flow.append(Spacer(1, 6))
 
-    crawl    = get_latest_output(conn, site_id, "crawl")
-    keywords = get_latest_output(conn, site_id, "keywords")
-    faq      = get_latest_output(conn, site_id, "faq")
-    schema   = get_latest_output(conn, site_id, "schema")
+    # Top pages (first 10)
+    if pages:
+        flow.append(Paragraph("Key pages (sample)", styles["H2"]))
+        sample = []
+        for p in pages[:10]:
+            sample.append((p.get("final_url") or p.get("url") or "", (p.get("title") or "")[:120]))
+        flow.append(_kv_table(sample, "URL", "Title"))
+        flow.append(Spacer(1, 8))
 
-    if fmt == "pdf":
-        pdf_bytes = build_pdf(site_id, crawl, keywords, faq, schema)
-        return {
-            "format": "pdf",
-            "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8")
-        }
-    else:
-        return {
-            "format": "json",
-            "crawl": crawl,
-            "keywords": keywords,
-            "faq": faq,
-            "schema": schema
-        }
+    # Keywords (if available)
+    if keywords_output:
+        flow.append(Paragraph("Keyword suggestions (sample)", styles["H2"]))
+        kws = (keywords_output or {}).get("keywords") or []
+        flow.append(_bullets(kws[:20]))
+        flow.append(Spacer(1, 8))
+
+    # FAQ (if available)
+    if faq_output:
+        flow.append(Paragraph("Generated FAQs (sample)", styles["H2"]))
+        faqs = (faq_output or {}).get("faqs") or []
+        blist = [f"Q: {f.get('q','')} — A: {f.get('a','')}" for f in faqs[:6]]
+        flow.append(_bullets(blist))
+        flow.append(Spacer(1, 8))
+
+    # Schema (if available)
+    if schema_output:
+        flow.append(Paragraph("Schema (snippet)", styles["H2"]))
+        snippet = json.dumps(schema_output.get("schema", {}), ensure_ascii=False)[:1500]
+        flow.append(Paragraph(_safe(snippet), styles["Small"]))
+        flow.append(Spacer(1, 6))
+
+    doc.build(flow)
+    pdf_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {"format":"pdf", "pdf_base64": pdf_b64}
