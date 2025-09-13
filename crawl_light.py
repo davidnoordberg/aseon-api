@@ -1,21 +1,39 @@
 # crawl_light.py
-import re, time, gc
+import re, time, gc, os, requests
 from urllib.parse import urljoin, urlparse
-import requests
-import os
 
 DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
-HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.1 (+https://aseon.ai)"}
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))
+HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.2 (+https://aseon.ai)"}
 
 def _fetch(url: str, ua: str):
     resp = requests.get(url, headers=HEADERS_TEMPLATE(ua), timeout=DEFAULT_TIMEOUT, allow_redirects=True)
-    final_url = str(resp.url)
-    status = resp.status_code
+    final_url, status = str(resp.url), resp.status_code
     html = resp.text if isinstance(resp.text, str) else ""
     if len(html) > MAX_HTML_BYTES:
         html = html[:MAX_HTML_BYTES]
     return final_url, status, html
+
+def _extract_links(html: str, base_url: str):
+    hrefs = re.findall(r'href=["\'](.*?)["\']', html, flags=re.I)
+    out = []
+    for h in hrefs:
+        u = urljoin(base_url, h.split("#")[0])
+        if u.startswith(("http://","https://")):
+            out.append(u)
+    return list(set(out))
+
+def _try_sitemap(base_url: str, ua: str):
+    sitemap_urls = [urljoin(base_url, path) for path in ["/sitemap.xml", "/sitemap_index.xml"]]
+    found = []
+    for su in sitemap_urls:
+        try:
+            resp = requests.get(su, headers=HEADERS_TEMPLATE(ua), timeout=DEFAULT_TIMEOUT)
+            if resp.status_code == 200 and "<urlset" in resp.text:
+                found += re.findall(r"<loc>(.*?)</loc>", resp.text)
+        except Exception:
+            continue
+    return list(set(found))
 
 def _extract_meta(html: str, name: str):
     m = re.search(rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
@@ -64,12 +82,17 @@ def _same_host(a: str, b: str):
     except Exception:
         return False
 
-def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
+def crawl_site(start_url: str, max_pages: int = 50, ua: str = None) -> dict:
     if not start_url.startswith(("http://","https://")):
         start_url = "https://" + start_url
-    seen, queue = set(), [start_url]
-    pages, quick_wins = [], []
+    seen, queue, pages, quick_wins = set(), [start_url], [], []
     started = time.time()
+
+    # eerst sitemap check
+    sitemap_links = _try_sitemap(start_url, ua)
+    for link in sitemap_links:
+        if _same_host(start_url, link):
+            queue.append(link)
 
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
@@ -88,10 +111,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
         canon = _canonical(html)
         noindex, nofollow = _robots_meta(html)
         paragraphs = _extract_paragraphs(html, maxn=2, max_chars=400)
-
-        # free HTML memory ASAP
-        html = None
-        gc.collect()
 
         issues = []
         if not meta_desc: issues.append("missing_meta_description")
@@ -115,9 +134,14 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
-        # light discovery
-        # NB: we do dit NA het vrijgeven van de grote 'html' string
-        # (hier geen html meer gebruiken)
+        # links toevoegen
+        for link in _extract_links(html, final_url):
+            if _same_host(start_url, link) and link not in seen and len(pages) + len(queue) < max_pages:
+                queue.append(link)
+
+        # free HTML mem
+        html = None
+        gc.collect()
 
     dur_ms = int((time.time() - started) * 1000)
     summary = {
@@ -127,7 +151,7 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
         "errors_4xx_5xx": sum(1 for p in pages if p["status"] >= 400),
         "fetch_errors": 0,
         "duration_ms": dur_ms,
-        "capped_by_runtime": False
+        "capped_by_runtime": len(pages) >= max_pages
     }
 
     if any("missing_meta_description" in p["issues"] for p in pages):
