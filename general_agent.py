@@ -10,8 +10,8 @@ from crawl_light import crawl_site
 from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
-from faq_agent import generate_faqs  # echte FAQ agent
-import report_agent  # <<< NIEUW: voor echte report-generatie
+from faq_agent import generate_faqs
+import report_agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -41,19 +41,27 @@ def normalize_output(obj):
     return json.loads(json.dumps(obj, default=default))
 
 def claim_one_job(conn):
-    with conn.cursor() as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
+        # voorkom parallelle crawls per site (RAM spikes) en pak nieuwste job eerst
         cur.execute("""
             WITH j AS (
                 SELECT id FROM jobs
                  WHERE status='queued'
-                 ORDER BY created_at
+                   AND NOT EXISTS (
+                        SELECT 1 FROM jobs j2
+                         WHERE j2.site_id = jobs.site_id
+                           AND j2.type = 'crawl'
+                           AND j2.status = 'running'
+                   )
+                 ORDER BY created_at DESC
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
             )
-            UPDATE jobs SET status='running', started_at=NOW()
-             FROM j
-            WHERE jobs.id=j.id
-        RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
+            UPDATE jobs
+               SET status='running', started_at=NOW()
+              FROM j
+             WHERE jobs.id = j.id
+         RETURNING jobs.id, jobs.site_id, jobs.type, jobs.payload;
         """)
         row = cur.fetchone()
         conn.commit()
@@ -182,10 +190,9 @@ def run_faq(conn, site_id, payload):
     out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
     return out
 
-# ---------- Report (nu echte bundeling via report_agent) ----------
+# ---------- Report ----------
 
 def run_report(conn, site_id, payload):
-    # Houd interface gelijk aan de rest van de dispatcher (conn, site_id, payload)
     job_stub = {"site_id": site_id, "payload": payload or {}}
     return report_agent.generate_report(conn, job_stub)
 
