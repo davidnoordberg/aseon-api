@@ -1,3 +1,4 @@
+# crawl_light.py (fixed)
 import re, time, gc
 from urllib.parse import urljoin, urlparse
 import requests
@@ -64,10 +65,11 @@ def _same_host(a: str, b: str):
         return False
 
 def _extract_links(html: str, base_url: str):
+    # verbeterde regex: pakt href met of zonder quotes
     hrefs = re.findall(r'href\s*=\s*["\']?([^"\' >]+)', html, flags=re.I)
     links = []
     for h in hrefs:
-        if h.startswith("#"):
+        if h.startswith("#"):  # skip anchors
             continue
         abs_url = urljoin(base_url, h)
         if abs_url.startswith("http"):
@@ -121,14 +123,12 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
-        # ✅ gebruik html ipv resp
+        # ✅ eerst links pakken, daarna pas geheugen vrijgeven
         links = _extract_links(html, final_url)
-        print(f"[crawl] {url} → gevonden {len(links)} links")
         for link in links:
             if link not in seen and _same_host(start_url, link):
                 queue.append(link)
 
-        # free memory
         html = None
         gc.collect()
 
