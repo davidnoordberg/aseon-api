@@ -1,3 +1,4 @@
+# general_agent.py
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
 import psycopg
@@ -20,24 +21,33 @@ INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 DSN = os.environ["DATABASE_URL"]
 running = True
 
+
+# ---------- Logging ----------
 def log(level, msg, **kwargs):
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
+    payload = {"ts": datetime.now(timezone.utc).isoformat(),
+               "level": level.upper(),
+               "msg": msg, **kwargs}
     print(json.dumps(payload), flush=True)
+
 
 def handle_sigterm(signum, frame):
     global running
     log("info", "received_shutdown")
     running = False
 
+
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
+
+# ---------- Helpers ----------
 def normalize_output(obj):
     def default(o):
         if isinstance(o, datetime): return o.isoformat()
         if isinstance(o, uuid.UUID): return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
+
 
 def claim_one_job(conn):
     with conn.cursor() as cur:
@@ -58,12 +68,14 @@ def claim_one_job(conn):
         conn.commit()
         return row
 
+
 def finish_job(conn, job_id, ok, output=None, err=None):
     with conn.cursor() as cur:
         if ok:
             safe_output = output if isinstance(output, dict) else {}
             if not safe_output:
-                safe_output = {"_aseon": {"note": "forced-nonempty-output", "at": datetime.now(timezone.utc).isoformat()}}
+                safe_output = {"_aseon": {"note": "forced-nonempty-output",
+                                          "at": datetime.now(timezone.utc).isoformat()}}
             safe_output = normalize_output(safe_output)
             try:
                 preview = json.dumps(safe_output)[:400]
@@ -76,7 +88,8 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                  WHERE id=%s
              RETURNING jsonb_typeof(output) AS out_type, output;
             """, (Json(safe_output), job_id))
-            cur.fetchone(); conn.commit()
+            cur.fetchone()
+            conn.commit()
         else:
             err_text = (str(err) if err else "Unknown error")[:MAX_ERROR_LEN]
             cur.execute("""
@@ -84,10 +97,11 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
-            log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
+            log("error", "finish_job_failed_write",
+                job_id=str(job_id), error=err_text)
 
-# ---------- Helpers ----------
 
+# ---------- Site Info ----------
 def get_site_info(conn, site_id):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
@@ -99,7 +113,17 @@ def get_site_info(conn, site_id):
         row = cur.fetchone()
         if not row or not row["url"]:
             raise ValueError("Site not found")
+
+        # <<< fix: normaliseer root URL zodat crawl altijd op www. host draait
+        url = row["url"].strip()
+        if url.startswith("https://aseon.io") or url.startswith("http://aseon.io"):
+            url = url.replace("aseon.io", "www.aseon.io")
+        if not url.endswith("/"):
+            url += "/"
+        row["url"] = url
+
         return row
+
 
 def get_latest_job_output(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
@@ -113,8 +137,8 @@ def get_latest_job_output(conn, site_id, jtype):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
-# ---------- Crawl ----------
 
+# ---------- Crawl ----------
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
@@ -129,26 +153,26 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
-# ---------- Keywords ----------
 
+# ---------- Keywords ----------
 def run_keywords(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     market = (payload or {}).get("market", {}) or {}
     market.setdefault("language", site.get("language") or "en")
-    market.setdefault("country",  site.get("country")  or "NL")
+    market.setdefault("country", site.get("country") or "NL")
 
     payload = dict(payload or {})
     payload["market"] = market
     return generate_keywords(conn, site_id, payload)
 
-# ---------- Schema ----------
 
+# ---------- Schema ----------
 def run_schema(conn, site_id, payload):
     site = get_site_info(conn, site_id)
-    biz_type   = (payload or {}).get("biz_type", "Organization")
-    extras     = (payload or {}).get("extras") or {}
-    use_ctx    = (payload or {}).get("use_context", "auto")
-    count      = int((payload or {}).get("count", 3))
+    biz_type = (payload or {}).get("biz_type", "Organization")
+    extras = (payload or {}).get("extras") or {}
+    use_ctx = (payload or {}).get("use_context", "auto")
+    count = int((payload or {}).get("count", 3))
 
     faqs_for_schema = None
     context_used = "none"
@@ -163,7 +187,8 @@ def run_schema(conn, site_id, payload):
         site_name=site.get("account_name"),
         site_url=site.get("url"),
         language=site.get("language"),
-        extras={**extras, "count": count, "faqs": faqs_for_schema, "use_context": use_ctx}
+        extras={**extras, "count": count, "faqs": faqs_for_schema,
+                "use_context": use_ctx}
     )
 
     return {
@@ -176,25 +201,30 @@ def run_schema(conn, site_id, payload):
         "_context_used": context_used if biz_type == "FAQPage" else None
     }
 
-# ---------- FAQ ----------
 
+# ---------- FAQ ----------
 def run_faq(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     out = generate_faqs(conn, site_id, payload or {})
-    out["site"] = {"url": site.get("url"), "language": site.get("language"), "country": site.get("country")}
+    out["site"] = {"url": site.get("url"),
+                   "language": site.get("language"),
+                   "country": site.get("country")}
     return out
 
-# ---------- Report ----------
 
+# ---------- Report ----------
 def run_report(conn, site_id, payload):
-    # alleen site_id doorgeven, report_agent doet zelf DB-queries
-    return report_agent.generate_report(site_id)
+    job_stub = {"site_id": site_id, "payload": payload or {}}
+    return report_agent.generate_report(conn, job_stub)
+
 
 # ---------- Dispatcher ----------
-
 def process_job(conn, job):
-    jtype = job["type"]; site_id = job["site_id"]; payload = job.get("payload") or {}
-    log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
+    jtype = job["type"]
+    site_id = job["site_id"]
+    payload = job.get("payload") or {}
+    log("info", "job_start", id=str(job["id"]), type=jtype,
+        site_id=str(site_id))
 
     if jtype == "crawl":
         output = run_crawl(conn, site_id, payload)
@@ -212,30 +242,37 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
+
+# ---------- Main loop ----------
 def main():
     global running
     log("info", "agent_boot",
         poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_FAQ_SCHEMA_TIED", ingest_enabled=INGEST_ENABLED)
-    pool = ConnectionPool(DSN, min_size=1, max_size=4, kwargs={"row_factory": dict_row})
+        marker="AGENT_VERSION_FAQ_SCHEMA_TIED",
+        ingest_enabled=INGEST_ENABLED)
+    pool = ConnectionPool(DSN, min_size=1, max_size=4,
+                          kwargs={"row_factory": dict_row})
 
     while running:
         try:
             with pool.connection() as conn:
                 job = claim_one_job(conn)
                 if not job:
-                    time.sleep(POLL_INTERVAL_SEC); continue
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 try:
                     output = process_job(conn, job)
                     finish_job(conn, job["id"], True, output, None)
                 except Exception as e:
-                    log("error", "job_failed", id=str(job["id"]), error=str(e))
+                    log("error", "job_failed", id=str(job["id"]),
+                        error=str(e))
                     finish_job(conn, job["id"], False, None, e)
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
             time.sleep(POLL_INTERVAL_SEC)
     log("info", "agent_exit")
+
 
 if __name__ == "__main__":
     main()
