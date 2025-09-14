@@ -1,4 +1,4 @@
-import os, json, traceback
+import os, json, hashlib, traceback
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -8,17 +8,27 @@ from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
+from openai import OpenAI
 
+# -----------------------------------------------------------------------------
+# Config / Clients
+# -----------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.5.0")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+app = FastAPI(title="Aseon API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
 # -----------------------------------------------------------------------------
-# DB bootstrap (idempotent). Vector-indexen via HNSW zijn optioneel (zie start()).
+# DB bootstrap (idempotent). Vector-indexen via HNSW optioneel (zie _maybe_build_vector_indexes).
 # -----------------------------------------------------------------------------
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -56,9 +66,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   output JSONB
 );
 
--- ---------------------------------------------------------------
 -- Site content chunks (RAG bron)
--- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS documents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -74,21 +82,63 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE UNIQUE INDEX IF NOT EXISTS doc_dedup ON documents(site_id, url, content_hash);
 CREATE INDEX IF NOT EXISTS doc_by_site ON documents(site_id);
 
--- ---------------------------------------------------------------
--- Curated knowledge base (normatieve docs voor AEO/GEO/SEO)
--- ---------------------------------------------------------------
+-- Curated knowledge base (normatieve docs)
 CREATE TABLE IF NOT EXISTS kb_documents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   source TEXT,
   url TEXT,
   title TEXT,
-  tags TEXT[],                -- bijv. {"AEO","Schema","Entities"}
+  tags TEXT[],
   content TEXT NOT NULL,
   embedding VECTOR(1536),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS kb_tags_idx ON kb_documents USING gin (tags);
+
+-- Dedupe op KB (kan ontbreken in oudere installs; daarom los als ALTER/INDEX)
 """
+
+SQL_ALTER = """
+ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS kb_dedup ON kb_documents(url, content_hash);
+"""
+
+def _maybe_build_vector_indexes(conn) -> None:
+    """
+    Bouw HNSW-indexen alleen als env 'BUILD_VECTOR_INDEXES' truthy is.
+    Dit voorkomt startup-crashes op beperkte DB's.
+    """
+    if str(os.getenv("BUILD_VECTOR_INDEXES", "0")).lower() not in ("1","true","yes","on"):
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS doc_vec_idx
+                  ON documents USING hnsw (embedding vector_cosine_ops)
+                  WITH (m = 8, ef_construction = 64);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS kb_vec_idx
+                  ON kb_documents USING hnsw (embedding vector_cosine_ops)
+                  WITH (m = 8, ef_construction = 64);
+            """)
+        conn.commit()
+        print(json.dumps({"level":"INFO","msg":"vector_indexes_ready","type":"hnsw"}), flush=True)
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        print(json.dumps({"level":"WARN","msg":"vector_index_build_failed","error":str(e)}), flush=True)
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _embed(text: str) -> List[float]:
+    text = (text or "").strip()
+    resp = openai_client.embeddings.create(model=EMBED_MODEL, input=[text])
+    return resp.data[0].embedding
+
+def _hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 def normalize_url(u: str) -> str:
     if not u: return u
@@ -124,6 +174,9 @@ def job_json(r: dict) -> dict:
         "output": r.get("output")
     }
 
+# -----------------------------------------------------------------------------
+# Pydantic models
+# -----------------------------------------------------------------------------
 class AccountIn(BaseModel):
     name: str = Field(min_length=1)
     email: EmailStr
@@ -159,45 +212,35 @@ class JobOut(BaseModel):
     error: Optional[str] = None
     output: Optional[Dict[str, Any]] = None
 
+# KB API models
+class KBDocIn(BaseModel):
+    source: Optional[str] = None
+    url: Optional[AnyHttpUrl] = None
+    title: str
+    tags: List[str] = []
+    content: str
+
+class KBBulkIn(BaseModel):
+    docs: List[KBDocIn]
+
+# -----------------------------------------------------------------------------
+# Error handler + startup
+# -----------------------------------------------------------------------------
 @app.exception_handler(Exception)
 def unhandled(request: Request, exc: Exception):
     print("UNHANDLED ERROR:", repr(exc)); traceback.print_exc()
     return JSONResponse(status_code=500, content={"detail":"Internal Server Error","error":str(exc)})
 
-def _maybe_build_vector_indexes(conn) -> None:
-    """
-    Bouw HNSW-indexen alleen als env 'BUILD_VECTOR_INDEXES' truthy is.
-    Dit voorkomt startup-crashes op beperkte DB's.
-    """
-    if str(os.getenv("BUILD_VECTOR_INDEXES", "0")).lower() not in ("1","true","yes","on"):
-        return
-    try:
-        with conn.cursor() as cur:
-            # HNSW (werkt goed op hosts met lage maintenance_work_mem)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS doc_vec_idx
-                  ON documents USING hnsw (embedding vector_cosine_ops)
-                  WITH (m = 8, ef_construction = 64);
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS kb_vec_idx
-                  ON kb_documents USING hnsw (embedding vector_cosine_ops)
-                  WITH (m = 8, ef_construction = 64);
-            """)
-        conn.commit()
-        print(json.dumps({"level":"INFO","msg":"vector_indexes_ready","type":"hnsw"}), flush=True)
-    except Exception as e:
-        try: conn.rollback()
-        except Exception: pass
-        print(json.dumps({"level":"WARN","msg":"vector_index_build_failed","error":str(e)}), flush=True)
-
 @app.on_event("startup")
 def start():
     with pool.connection() as c:
-        c.execute(SQL)
-        c.commit()
+        c.execute(SQL); c.commit()
+        c.execute(SQL_ALTER); c.commit()
         _maybe_build_vector_indexes(c)
 
+# -----------------------------------------------------------------------------
+# Core endpoints
+# -----------------------------------------------------------------------------
 @app.get("/healthz")
 def health():
     try:
@@ -263,7 +306,6 @@ def get_job(job_id: str):
         if not row: raise HTTPException(status_code=404, detail="Job not found")
         return job_json(row)
 
-# QoL: output direct endpoint
 @app.get("/jobs/{job_id}/output")
 def get_job_output(job_id: str):
     with pool.connection() as c, c.cursor() as cur:
@@ -272,12 +314,10 @@ def get_job_output(job_id: str):
         if not row: raise HTTPException(status_code=404, detail="Job not found")
         return row["output"] or {}
 
-# QoL: latest results per site for a set of types
 @app.get("/sites/{site_id}/latest")
-def get_site_latest(site_id: str, types: str = Query(..., description="comma-separated list e.g. crawl,keywords,faq,schema")):
+def get_site_latest(site_id: str, types: str = Query(..., description="comma-separated e.g. crawl,keywords,faq,schema")):
     wanted = [t.strip() for t in types.split(",") if t.strip()]
-    if not wanted:
-        raise HTTPException(status_code=400, detail="No types provided")
+    if not wanted: raise HTTPException(status_code=400, detail="No types provided")
     out: Dict[str, Any] = {}
     with pool.connection() as c, c.cursor() as cur:
         for t in wanted:
@@ -291,3 +331,83 @@ def get_site_latest(site_id: str, types: str = Query(..., description="comma-sep
             row = cur.fetchone()
             out[t] = row if row else None
     return out
+
+# -----------------------------------------------------------------------------
+# KB endpoints (bulk insert / search / list / delete)
+# -----------------------------------------------------------------------------
+@app.post("/kb/docs")
+def kb_bulk_insert(body: KBBulkIn):
+    if not body.docs:
+        raise HTTPException(status_code=400, detail="No docs provided")
+    inserted = 0; skipped = 0
+    with pool.connection() as c, c.cursor() as cur:
+        for d in body.docs:
+            content = (d.content or "").strip()
+            if not content: 
+                skipped += 1
+                continue
+            chash = _hash(content)
+            try:
+                vec = _embed(content)
+            except Exception as e:
+                print(json.dumps({"level":"ERROR","msg":"kb_embed_failed","error":str(e)[:200]}), flush=True)
+                skipped += 1
+                continue
+            try:
+                cur.execute("""
+                    INSERT INTO kb_documents (source,url,title,tags,content,embedding,content_hash)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (url, content_hash) DO NOTHING
+                """, (d.source, str(d.url) if d.url else None, d.title, d.tags, content, vec, chash))
+                if cur.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                print(json.dumps({"level":"ERROR","msg":"kb_insert_failed","error":str(e)[:200]}), flush=True)
+                c.rollback()
+                skipped += 1
+        c.commit()
+    return {"inserted": inserted, "skipped": skipped}
+
+@app.get("/kb/search")
+def kb_search(q: str = Query(..., min_length=2), k: int = 6, tags: Optional[str] = None):
+    tag_list: Optional[List[str]] = [t.strip() for t in tags.split(",")] if tags else None
+    try:
+        qvec = _embed(q)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+    sql = """
+        SELECT id, source, url, title, tags, LEFT(content, 800) AS snippet
+          FROM kb_documents
+    """
+    params: List[Any] = []
+    if tag_list:
+        sql += " WHERE tags && %s"
+        params.append(tag_list)
+    sql += " ORDER BY embedding <-> %s::vector LIMIT %s"
+    params.extend([qvec, k])
+    with pool.connection() as c, c.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    return {"q": q, "k": k, "tags": tag_list, "results": rows}
+
+@app.get("/kb")
+def kb_list(limit: int = 50, offset: int = 0):
+    with pool.connection() as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT id, source, url, title, tags, created_at
+              FROM kb_documents
+             ORDER BY created_at DESC
+             LIMIT %s OFFSET %s
+        """, (limit, offset))
+        return {"items": cur.fetchall(), "limit": limit, "offset": offset}
+
+@app.delete("/kb/{kb_id}")
+def kb_delete(kb_id: str):
+    with pool.connection() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM kb_documents WHERE id=%s", (kb_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="KB document not found")
+        c.commit()
+    return {"deleted": kb_id}
