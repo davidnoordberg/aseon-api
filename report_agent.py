@@ -1,6 +1,6 @@
 # report_agent.py
 import os, json, io, datetime
-import psycopg2
+import psycopg
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
