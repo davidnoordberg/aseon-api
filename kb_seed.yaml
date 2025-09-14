@@ -1,0 +1,76 @@
+docs:
+  - source: "Schema.org"
+    title: "FAQPage essentials"
+    url: "https://schema.org/FAQPage"
+    tags: ["Schema","AEO","FAQ"]
+    content: >
+      Use JSON-LD FAQPage. Each Question must have an acceptedAnswer with concise, factual text
+      that matches visible content. Avoid promotional statements.
+
+  - source: "Search Central"
+    title: "Structured data basics"
+    url: "https://developers.google.com/search/docs/appearance/structured-data"
+    tags: ["Schema","SEO"]
+    content: >
+      Structured data helps search engines understand content. Prefer JSON-LD. Ensure markup
+      is consistent with on-page content and stays up-to-date.
+
+  - source: "AEO Guidelines"
+    title: "Citation-readiness for LLMs"
+    url: "https://example.org/llm-citation-readiness"
+    tags: ["AEO","Citations"]
+    content: >
+      Provide short, self-contained answers (≤80 words) per topic with canonical URLs. Add primary sources
+      and stable entity references (sameAs) to improve citation likelihood in LLM answers.
+
+  - source: "Entities"
+    title: "Entity grounding with sameAs"
+    url: "https://example.org/entities"
+    tags: ["Entities","AEO"]
+    content: >
+      Link organizations, people, and products to authoritative IDs via sameAs (Wikipedia, Wikidata, LinkedIn).
+      Use about/mentions in Article to reinforce entity disambiguation.
+
+  - source: "Technical SEO"
+    title: "Crawl basics"
+    url: "https://example.org/crawl-basics"
+    tags: ["SEO"]
+    content: >
+      Ensure 200 responses for canonical pages, one H1 per page, unique titles/meta descriptions,
+      and correct rel=canonical. Avoid noindex on indexable pages.
+
+  - source: "Schema.org"
+    title: "Organization essentials"
+    url: "https://schema.org/Organization"
+    tags: ["Schema","Entities"]
+    content: >
+      Include name, url, logo, contact info, and sameAs links to authoritative profiles. Use LocalBusiness
+      subtype when applicable.
+
+  - source: "Schema.org"
+    title: "Article essentials"
+    url: "https://schema.org/Article"
+    tags: ["Schema"]
+    content: >
+      Headline, author, datePublished, mainEntityOfPage; add about/mentions for key entities. Markup must match the page.
+
+  - source: "Navigation"
+    title: "BreadcrumbList"
+    url: "https://schema.org/BreadcrumbList"
+    tags: ["Schema","SEO"]
+    content: >
+      Use BreadcrumbList with itemListElement ListItem entries (name + item URL) to clarify site hierarchy.
+
+  - source: "Answer Fragments"
+    title: "Creating high-utility FAQs"
+    url: "https://example.org/answer-fragments"
+    tags: ["AEO","FAQ"]
+    content: >
+      One question per FAQ, ≤80 words, and link to deeper content or anchors. Avoid generic marketing language.
+
+  - source: "Performance"
+    title: "Page speed and AEO"
+    url: "https://example.org/aeo-speed"
+    tags: ["AEO","SEO"]
+    content: >
+      Improve CLS/LCP/INP and keep HTML lightweight to increase crawl coverage and trust—beneficial for both search engines and LLM retrievers.
