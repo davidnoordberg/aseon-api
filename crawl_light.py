@@ -1,10 +1,11 @@
+# crawl_light.py
 import re, time, gc
 from urllib.parse import urljoin, urlparse
 import requests
 import os
 
 DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))
 HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.1 (+https://aseon.ai)"}
 
 def _fetch(url: str, ua: str):
@@ -57,12 +58,9 @@ def _robots_meta(html: str):
     content = m.group(1).lower()
     return ("noindex" in content, "nofollow" in content)
 
-def _host(url: str):
-    return urlparse(url).netloc.split(":")[0].lower()
-
 def _same_host(a: str, b: str):
     try:
-        return _host(a) == _host(b)
+        return urlparse(a).netloc.split(":")[0].lower() == urlparse(b).netloc.split(":")[0].lower()
     except Exception:
         return False
 
@@ -83,7 +81,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
     seen, queue = set(), [start_url]
     pages, quick_wins = [], []
     started = time.time()
-    root_host = None
 
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
@@ -93,9 +90,6 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             final_url, status, html = _fetch(url, ua)
         except Exception:
             continue
-
-        if root_host is None:
-            root_host = _host(final_url)  # <<< fix: gebruik echte host
 
         title = _extract_title(html)
         h1 = _extract_tag(html, "h1")
@@ -128,9 +122,10 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
+        # FIXED: gebruik html ipv resp
         links = _extract_links(html, final_url)
         for link in links:
-            if link not in seen and _same_host(root_host, link):
+            if link not in seen and _same_host(start_url, link):
                 queue.append(link)
 
         html = None
