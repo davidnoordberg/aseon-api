@@ -1,60 +1,134 @@
 # faq_agent.py
-import os, json, re
-from typing import Dict, Any, List
+import os, json, re, time
+from typing import Dict, Any, List, Tuple
 import psycopg
 from psycopg.rows import dict_row
 from openai import OpenAI
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
+
+# Context limieten (ruim, maar veilig)
+MAX_CTX_CHARS = int(os.getenv("FAQ_MAX_CTX_CHARS", "3500"))
+DOC_K = int(os.getenv("FAQ_DOC_TOPK", "5"))        # site documents
+KB_K  = int(os.getenv("FAQ_KB_TOPK", "4"))         # knowledge base
+
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 def _embed(text: str) -> List[float]:
+    text = (text or "").strip()
     return client.embeddings.create(model=EMBED_MODEL, input=[text]).data[0].embedding
 
-def _make_context_from_documents(conn, site_id: str, topic: str, k: int = 5) -> tuple[str, str]:
-    from psycopg.rows import dict_row
+def _rows_to_ctx(rows: List[dict], label: str) -> str:
+    bits: List[str] = []
+    for i, r in enumerate(rows):
+        url = (r.get("url") or "").strip()
+        title = (r.get("title") or "").strip()
+        content = (r.get("content") or "").strip()
+        pre = f"[{label.upper()} {i+1}] {url}"
+        if title: pre += f" • {title}"
+        snippet = (content[:1000] + "…") if len(content) > 1000 else content
+        if snippet:
+            bits.append(pre + "\n" + snippet)
+    return "\n\n".join(bits)
+
+def _query_site_documents(conn, site_id: str, topic: str, k: int) -> List[dict]:
     try:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
-            # CAST het parameter-argument expliciet naar vector
             cur.execute("""
-                SELECT url, content
+                SELECT url, title, content
                   FROM documents
                  WHERE site_id = %s
                  ORDER BY embedding <-> %s::vector
                  LIMIT %s
             """, (site_id, qvec, k))
-            rows = cur.fetchall()
-        if rows:
-            ctx = "\n\n".join([f"[{i+1}] {r['url']}\n{r['content']}" for i, r in enumerate(rows)])
-            return ctx, "documents"
+            return cur.fetchall() or []
     except Exception as e:
-        # heel belangrijk: abort terugdraaien, anders faalt de fallback ook
         try: conn.rollback()
         except Exception: pass
-        print(json.dumps({"level":"WARN","msg":"faq_vector_search_failed","error":str(e)}), flush=True)
+        print(json.dumps({"level":"WARN","msg":"faq_site_vector_failed","error":str(e)[:300]}), flush=True)
+        return []
 
-    # LIKE-fallback in een schone transactie
+def _query_kb(conn, topic: str, k: int) -> List[dict]:
+    """
+    Haal top-k KB documenten (globale kennis).
+    Vereist tabel: kb_documents(url,title,content,embedding,...)
+    """
+    try:
+        qvec = _embed(topic)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT url, title, content
+                  FROM kb_documents
+                 ORDER BY embedding <-> %s::vector
+                 LIMIT %s
+            """, (qvec, k))
+            return cur.fetchall() or []
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        print(json.dumps({"level":"WARN","msg":"faq_kb_vector_failed","error":str(e)[:300]}), flush=True)
+        return []
+
+def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
+    """ Pak laatste crawl-output als snapshot (fallback). """
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, content
-                  FROM documents
-                 WHERE site_id=%s AND (content ILIKE %s OR content ILIKE %s)
-                 LIMIT %s
-            """, (site_id, f"%{topic}%", "%SEO%", k))
-            rows = cur.fetchall()
-        if rows:
-            ctx = "\n\n".join([f"[{i+1}] {r['url']}\n{r['content']}" for i, r in enumerate(rows)])
-            return ctx, "like"
+                SELECT output
+                  FROM jobs
+                 WHERE site_id=%s AND type='crawl' AND status='done'
+              ORDER BY COALESCE(finished_at, created_at) DESC
+                 LIMIT 1
+            """, (site_id,))
+            r = cur.fetchone()
+        out = (r or {}).get("output") or {}
+        pages = out.get("pages") or []
+        bits: List[str] = []
+        for p in pages[:max_pages]:
+            url = p.get("final_url") or p.get("url") or ""
+            title = p.get("title") or ""
+            h1 = p.get("h1") or ""
+            meta = p.get("meta_description") or ""
+            paras = " ".join((p.get("paragraphs") or [])[:2])
+            snippet = "\n".join([x for x in [url, title, h1, meta, paras] if x])
+            if snippet.strip():
+                bits.append(snippet)
+        return "\n\n".join(bits).strip()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        print(json.dumps({"level":"ERROR","msg":"faq_like_search_failed","error":str(e)}), flush=True)
+        print(json.dumps({"level":"WARN","msg":"faq_crawl_ctx_failed","error":str(e)[:300]}), flush=True)
+        return ""
 
-    return "", "none"
-
+def _trim_ctx(*chunks: str) -> Tuple[str, List[str]]:
+    used: List[str] = []
+    buf: List[str] = []
+    total = 0
+    labels_map = {
+        "SITE": "documents",
+        "KB": "kb",
+        "CRAWL": "crawl"
+    }
+    for label, text in chunks:
+        if not text: continue
+        t = text.strip()
+        if not t: continue
+        add = len(t)
+        if total + add > MAX_CTX_CHARS:
+            t = t[: max(0, MAX_CTX_CHARS - total)]
+            add = len(t)
+        if add <= 0:
+            break
+        buf.append(t)
+        total += add
+        if label in labels_map and labels_map[label] not in used:
+            used.append(labels_map[label])
+        if total >= MAX_CTX_CHARS:
+            break
+    return ("\n\n".join(buf), used)
 
 def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     topic = (payload or {}).get("topic") or "general"
@@ -62,23 +136,50 @@ def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     max_words = int((payload or {}).get("max_words", 80))
     use_context = (payload or {}).get("use_context", "auto")
 
-    ctx_text, ctx_label = ("", "none")
-    if use_context in ("auto","documents","crawl"):
-        ctx_text, ctx_label = _make_context_from_documents(conn, site_id, topic, k=5)
+    site_rows: List[dict] = []
+    kb_rows: List[dict] = []
+    ctx_used: List[str] = []
 
-    sys = f"""You write concise, factual FAQs grounded in the given context.
+    if use_context in ("auto", "documents", "kb", "crawl"):
+        # 1) Site documents (hoogste prioriteit)
+        site_rows = _query_site_documents(conn, site_id, topic, DOC_K)
+        site_ctx = _rows_to_ctx(site_rows, label="site")
+
+        # 2) KB (GEO/AEO/SEO best practices + crawler-richtlijnen)
+        kb_rows = _query_kb(conn, topic, KB_K)
+        kb_ctx = _rows_to_ctx(kb_rows, label="kb")
+
+        # 3) Crawl fallback
+        crawl_ctx = _fallback_crawl_snapshot(conn, site_id, max_pages=6)
+
+        ctx_text, ctx_used = _trim_ctx(
+            ("SITE", site_ctx),
+            ("KB",   kb_ctx),
+            ("CRAWL", crawl_ctx),
+        )
+    else:
+        ctx_text, ctx_used = "(no context)", []
+
+    # SYSTEM PROMPT
+    sys = f"""You write **concise, factual FAQs** grounded ONLY in the provided context.
+Your job is AEO/GEO-first: produce answers that are **directly quotable** and **citable** by assistants (ChatGPT/Perplexity/Claude/Copilot).
 Rules:
-- {count} QA pairs, each answer ≤ {max_words} words.
-- If the context includes URLs in square brackets like [1] https://..., prefer citing one of those URLs as 'source'.
-- No marketing fluff; be specific.
-Return JSON: {{ "faqs": [{{"q": "...","a":"...","source":"<url or null>"}}...] }}"""
+- Exactly {count} QA pairs. Each answer ≤ {max_words} words.
+- Prefer facts that appear in the context. If not present, say you cannot answer.
+- If the context lines include URLs in square brackets like [SITE 1] https://..., include a "source" pointing to ONE best URL from those.
+- No marketing fluff; no hypotheticals. Be specific and verifiable.
+Return JSON ONLY:
+{{ "faqs": [{{"q":"...","a":"...","source":"<url or null>"}}...] }}
+"""
 
     user = f"Topic: {topic}\n\nContext:\n{ctx_text or '(no context)'}"
+
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role":"system","content":sys},{"role":"user","content":user}],
         response_format={"type":"json_object"},
         temperature=0.2,
+        timeout=OPENAI_TIMEOUT_SEC,
     )
 
     try:
@@ -88,20 +189,21 @@ Return JSON: {{ "faqs": [{{"q": "...","a":"...","source":"<url or null>"}}...] }
         faqs = []
 
     # sanitize + enforce word limit
-    out = []
+    out_faqs = []
     for f in faqs[:count]:
         q = (f.get("q") or "").strip()
         a = re.sub(r"\s+", " ", (f.get("a") or "").strip())
-        if not q or not a: continue
+        if not q or not a:
+            continue
         words = a.split(" ")
         if len(words) > max_words:
             a = " ".join(words[:max_words])
-        src = f.get("source") or None
-        out.append({"q": q, "a": a, "source": src})
+        src = (f.get("source") or None)
+        out_faqs.append({"q": q, "a": a, "source": src})
 
-    if not out:
-        # deterministic fallback (avoid empty output)
-        out = [{"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub).", "source": None} for i in range(count)]
+    if not out_faqs:
+        # deterministic fallback
+        out_faqs = [{"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub).", "source": None} for i in range(count)]
 
-    print(json.dumps({"level":"INFO","msg":"faq_generated","context":ctx_label,"n":len(out)}), flush=True)
-    return {"_context_used": (ctx_label if out and ctx_label!="none" else None), "faqs": out}
+    print(json.dumps({"level":"INFO","msg":"faq_generated","context_used":ctx_used,"n":len(out_faqs)}), flush=True)
+    return {"_context_used": (ctx_used or None), "faqs": out_faqs}
