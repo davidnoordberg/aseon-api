@@ -5,11 +5,17 @@ import requests
 import os
 
 DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "500000"))  # 500 KB cap
 HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.1 (+https://aseon.ai)"}
 
+
 def _fetch(url: str, ua: str):
-    resp = requests.get(url, headers=HEADERS_TEMPLATE(ua), timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+    resp = requests.get(
+        url,
+        headers=HEADERS_TEMPLATE(ua),
+        timeout=DEFAULT_TIMEOUT,
+        allow_redirects=True
+    )
     final_url = str(resp.url)
     status = resp.status_code
     html = resp.text if isinstance(resp.text, str) else ""
@@ -17,46 +23,74 @@ def _fetch(url: str, ua: str):
         html = html[:MAX_HTML_BYTES]
     return final_url, status, html
 
+
 def _extract_meta(html: str, name: str):
-    m = re.search(rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
+    m = re.search(
+        rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\'](.*?)["\']',
+        html,
+        flags=re.I | re.S
+    )
     return m.group(1).strip() if m else None
 
+
 def _extract_title(html: str):
-    m = re.search(r'<title[^>]*>(.*?)</title>', html, flags=re.I|re.S)
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, flags=re.I | re.S)
     return _clean_text(m.group(1)) if m else None
+
 
 def _extract_tag(html: str, tag: str):
-    m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S)
+    m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I | re.S)
     return _clean_text(m.group(1)) if m else None
 
+
 def _extract_multi(html: str, tag: str, maxn=8):
-    return [_clean_text(x) for x in re.findall(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S)[:maxn]]
+    return [
+        _clean_text(x)
+        for x in re.findall(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I | re.S)[:maxn]
+    ]
+
 
 def _extract_paragraphs(html: str, maxn=2, max_chars=400):
-    paras = re.findall(r'<p[^>]*>(.*?)</p>', html, flags=re.I|re.S)[:maxn]
+    paras = re.findall(r'<p[^>]*>(.*?)</p>', html, flags=re.I | re.S)[:maxn]
     cleaned = []
     for p in paras:
         t = _clean_text(p)
-        if not t: continue
-        if len(t) > max_chars: t = t[:max_chars]
+        if not t:
+            continue
+        if len(t) > max_chars:
+            t = t[:max_chars]
         cleaned.append(t)
     return cleaned
 
+
 def _clean_text(s: str):
-    if not s: return s
+    if not s:
+        return s
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
+
 def _canonical(html: str):
-    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\'](.*?)["\']', html, flags=re.I|re.S)
+    m = re.search(
+        r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\'](.*?)["\']',
+        html,
+        flags=re.I | re.S
+    )
     return m.group(1).strip() if m else None
 
+
 def _robots_meta(html: str):
-    m = re.search(r'<meta[^>]+name=["\']robots["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
-    if not m: return (False, False)
+    m = re.search(
+        r'<meta[^>]+name=["\']robots["\'][^>]*content=["\'](.*?)["\']',
+        html,
+        flags=re.I | re.S
+    )
+    if not m:
+        return (False, False)
     content = m.group(1).lower()
     return ("noindex" in content, "nofollow" in content)
+
 
 def _same_host(a: str, b: str):
     try:
@@ -64,28 +98,35 @@ def _same_host(a: str, b: str):
     except Exception:
         return False
 
+
 def _extract_links(html: str, base_url: str):
     hrefs = re.findall(r'href\s*=\s*["\']?([^"\' >]+)', html, flags=re.I)
     links = []
     for h in hrefs:
-        if h.startswith("#"):
+        if not h or h.startswith("#"):
             continue
+        if any(bad in h.lower() for bad in ["javascript:", "(", "=", "{", "}"]):
+            continue  # skip rommel
         abs_url = urljoin(base_url, h)
         if abs_url.startswith("http"):
             links.append(abs_url)
     return links
 
+
 def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
-    if not start_url.startswith(("http://","https://")):
+    if not start_url.startswith(("http://", "https://")):
         start_url = "https://" + start_url
+
     seen, queue = set(), [start_url]
     pages, quick_wins = [], []
     started = time.time()
 
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
-        if url in seen: continue
+        if url in seen:
+            continue
         seen.add(url)
+
         try:
             final_url, status, html = _fetch(url, ua)
         except Exception:
@@ -101,8 +142,10 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
         paragraphs = _extract_paragraphs(html, maxn=2, max_chars=400)
 
         issues = []
-        if not meta_desc: issues.append("missing_meta_description")
-        if not h1: issues.append("missing_h1")
+        if not meta_desc:
+            issues.append("missing_meta_description")
+        if not h1:
+            issues.append("missing_h1")
         if canon and canon.rstrip("/") != final_url.rstrip("/"):
             issues.append("canonical_differs")
 
@@ -122,12 +165,13 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
             "issues": issues
         })
 
-        # FIXED: gebruik html ipv resp
+        # ✅ eerst links extraheren
         links = _extract_links(html, final_url)
         for link in links:
             if link not in seen and _same_host(start_url, link):
                 queue.append(link)
 
+        # daarna pas geheugen vrijmaken
         html = None
         gc.collect()
 
@@ -143,10 +187,15 @@ def crawl_site(start_url: str, max_pages: int = 10, ua: str = None) -> dict:
     }
 
     if any("missing_meta_description" in p["issues"] for p in pages):
-        quick_wins.append({"type":"missing_meta_description"})
+        quick_wins.append({"type": "missing_meta_description"})
     if any("missing_h1" in p["issues"] for p in pages):
-        quick_wins.append({"type":"missing_h1"})
+        quick_wins.append({"type": "missing_h1"})
     if any("canonical_differs" in p["issues"] for p in pages):
-        quick_wins.append({"type":"canonical_differs"})
+        quick_wins.append({"type": "canonical_differs"})
 
-    return {"start_url": start_url, "pages": pages, "summary": summary, "quick_wins": quick_wins}
+    return {
+        "start_url": start_url,
+        "pages": pages,
+        "summary": summary,
+        "quick_wins": quick_wins
+    }
