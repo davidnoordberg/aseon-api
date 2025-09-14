@@ -13,18 +13,26 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-app = FastAPI(title="Aseon API", version="0.4.0")
+app = FastAPI(title="Aseon API", version="0.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
+# -----------------------------------------------------------------------------
+# DB bootstrap (idempotent). Vector-indexen via HNSW zijn optioneel (zie start()).
+# -----------------------------------------------------------------------------
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Accounts
 CREATE TABLE IF NOT EXISTS accounts (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Sites
 CREATE TABLE IF NOT EXISTS sites (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -33,6 +41,8 @@ CREATE TABLE IF NOT EXISTS sites (
   country TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Jobs
 CREATE TABLE IF NOT EXISTS jobs (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -45,6 +55,39 @@ CREATE TABLE IF NOT EXISTS jobs (
   error TEXT,
   output JSONB
 );
+
+-- ---------------------------------------------------------------
+-- Site content chunks (RAG bron)
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS documents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  language TEXT,
+  content TEXT NOT NULL,
+  metadata JSONB,
+  content_hash TEXT NOT NULL,
+  embedding VECTOR(1536),
+  last_seen TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS doc_dedup ON documents(site_id, url, content_hash);
+CREATE INDEX IF NOT EXISTS doc_by_site ON documents(site_id);
+
+-- ---------------------------------------------------------------
+-- Curated knowledge base (normatieve docs voor AEO/GEO/SEO)
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS kb_documents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  source TEXT,
+  url TEXT,
+  title TEXT,
+  tags TEXT[],                -- bijv. {"AEO","Schema","Entities"}
+  content TEXT NOT NULL,
+  embedding VECTOR(1536),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS kb_tags_idx ON kb_documents USING gin (tags);
 """
 
 def normalize_url(u: str) -> str:
@@ -121,15 +164,45 @@ def unhandled(request: Request, exc: Exception):
     print("UNHANDLED ERROR:", repr(exc)); traceback.print_exc()
     return JSONResponse(status_code=500, content={"detail":"Internal Server Error","error":str(exc)})
 
+def _maybe_build_vector_indexes(conn) -> None:
+    """
+    Bouw HNSW-indexen alleen als env 'BUILD_VECTOR_INDEXES' truthy is.
+    Dit voorkomt startup-crashes op beperkte DB's.
+    """
+    if str(os.getenv("BUILD_VECTOR_INDEXES", "0")).lower() not in ("1","true","yes","on"):
+        return
+    try:
+        with conn.cursor() as cur:
+            # HNSW (werkt goed op hosts met lage maintenance_work_mem)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS doc_vec_idx
+                  ON documents USING hnsw (embedding vector_cosine_ops)
+                  WITH (m = 8, ef_construction = 64);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS kb_vec_idx
+                  ON kb_documents USING hnsw (embedding vector_cosine_ops)
+                  WITH (m = 8, ef_construction = 64);
+            """)
+        conn.commit()
+        print(json.dumps({"level":"INFO","msg":"vector_indexes_ready","type":"hnsw"}), flush=True)
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        print(json.dumps({"level":"WARN","msg":"vector_index_build_failed","error":str(e)}), flush=True)
+
 @app.on_event("startup")
 def start():
     with pool.connection() as c:
-        c.execute(SQL); c.commit()
+        c.execute(SQL)
+        c.commit()
+        _maybe_build_vector_indexes(c)
 
 @app.get("/healthz")
-def health(): 
+def health():
     try:
-        with pool.connection() as c: c.execute("SELECT 1;")
+        with pool.connection() as c:
+            c.execute("SELECT 1;")
         return {"ok": True, "db": True}
     except Exception:
         return {"ok": False, "db": False}
