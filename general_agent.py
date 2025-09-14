@@ -1,4 +1,3 @@
-# general_agent.py
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
 import psycopg
@@ -10,8 +9,8 @@ from crawl_light import crawl_site
 from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
-from faq_agent import generate_faqs  # echte FAQ agent
-import report_agent  # <<< voor echte report-generatie
+from faq_agent import generate_faqs
+import report_agent  # voor echte report-generatie
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -130,16 +129,14 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
-# ---------- Keywords (AANGEPAST: voortaan met conn/RAG) ----------
+# ---------- Keywords ----------
 
 def run_keywords(conn, site_id, payload):
-    # haal default taal/land uit site
     site = get_site_info(conn, site_id)
     market = (payload or {}).get("market", {}) or {}
     market.setdefault("language", site.get("language") or "en")
     market.setdefault("country",  site.get("country")  or "NL")
 
-    # laat de agent zelf RAG doen (documents -> vector search; fallback crawl)
     payload = dict(payload or {})
     payload["market"] = market
     return generate_keywords(conn, site_id, payload)
@@ -190,8 +187,8 @@ def run_faq(conn, site_id, payload):
 # ---------- Report ----------
 
 def run_report(conn, site_id, payload):
-    job_stub = {"site_id": site_id, "payload": payload or {}}
-    return report_agent.generate_report(conn, job_stub)
+    # alleen site_id doorgeven, report_agent doet zelf DB-queries
+    return report_agent.generate_report(site_id)
 
 # ---------- Dispatcher ----------
 
@@ -204,7 +201,7 @@ def process_job(conn, job):
     elif jtype == "schema":
         output = run_schema(conn, site_id, payload)
     elif jtype == "keywords":
-        output = run_keywords(conn, site_id, payload)  # <<<< gewijzigd
+        output = run_keywords(conn, site_id, payload)
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
     elif jtype == "report":
