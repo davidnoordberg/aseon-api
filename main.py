@@ -10,6 +10,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from openai import OpenAI
 
+from routes.llm import router as llm_router  # ← dit is de enige nieuwe regel
+
+app.include_router(llm_router)  # ← dit is de enige call die erbij komt
+
 # -----------------------------------------------------------------------------
 # Config / Clients
 # -----------------------------------------------------------------------------
