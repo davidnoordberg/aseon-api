@@ -1,4 +1,3 @@
-# general_agent.py
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
 import psycopg
