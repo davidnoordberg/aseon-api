@@ -125,16 +125,15 @@ def _shorten(s: str, max_chars: int) -> str:
     return (s[: max_chars - 1] + "…") if len(s) > max_chars else s
 
 def _attr_escape(s: str) -> str:
-    """Escape voor attribuut-waarden (zoals content="...")."""
     return xml_escape(s or "").replace('"', "&quot;")
 
 # -----------------------------------------------------
-# Findings builders
+# Core helpers (unique pages, duplicates, proposals)
 # -----------------------------------------------------
 def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Reduceer naar unieke, genormaliseerde URL's. Kies per URL de 'beste' variant:
-    status=200 gaat voor, vervolgens hoogste word_count.
+    Unieke, genormaliseerde URL's. Kies per URL de beste variant:
+    status=200 > anders, daarna hoogste word_count.
     """
     bucket: Dict[str, Dict[str, Any]] = {}
     def _score(pp: Dict[str, Any]) -> tuple:
@@ -148,20 +147,6 @@ def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             bucket[u] = p
     return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
 
-def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
-    inlinks: Dict[str, int] = {}
-    url_index = {}
-    for p in pages:
-        u = _norm_url(p.get("final_url") or p.get("url") or "")
-        url_index[u] = True
-    for p in pages:
-        src = _norm_url(p.get("final_url") or p.get("url") or "")
-        for l in (p.get("links") or []):
-            tgt = _norm_url(l)
-            if tgt in url_index:
-                inlinks[tgt] = inlinks.get(tgt, 0) + 1
-    return inlinks
-
 def _dup_map(values: List[Optional[str]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for v in values:
@@ -170,6 +155,19 @@ def _dup_map(values: List[Optional[str]]) -> Dict[str, int]:
         if not k: continue
         counts[k] = counts.get(k, 0) + 1
     return counts
+
+def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
+    inlinks: Dict[str, int] = {}
+    url_index = {}
+    for p in pages:
+        u = _norm_url(p.get("final_url") or p.get("url") or "")
+        url_index[u] = True
+    for p in pages:
+        for l in (p.get("links") or []):
+            tgt = _norm_url(l)
+            if tgt in url_index:
+                inlinks[tgt] = inlinks.get(tgt, 0) + 1
+    return inlinks
 
 def _propose_copy(url: str,
                   title: Optional[str],
@@ -180,7 +178,7 @@ def _propose_copy(url: str,
                   paras: Optional[List[str]]) -> Dict[str, str]:
     """
     Genereer voorstellen voor title/meta/H1-intro.
-    Werkt met LLM als key aanwezig is; anders deterministische fallback.
+    LLM indien beschikbaar; deterministische fallback anders.
     """
     base = (h1 or title or "").strip()
     fallback = {
@@ -205,9 +203,8 @@ def _propose_copy(url: str,
 
     sys = (
         "Je schrijft compacte webkopie in het Nederlands. "
-        "Maak een <title> (≤60 tekens) en een meta description (140–155 tekens) "
-        "op basis van de context. Stel ook een H1-variant voor die niet identiek is aan de title "
-        "en een korte intro (1–2 zinnen) die antwoord-first is. "
+        "Maak een <title> (≤60 tekens) en een meta description (140–155 tekens), "
+        "stel een H1-variant voor die niet identiek is aan de title, en een korte intro (1–2 zinnen). "
         "Retourneer JSON: {\"title\":\"...\",\"meta\":\"...\",\"h1_alt\":\"...\",\"intro\":\"...\"}."
     )
     user = f"URL: {url}\nCONTEXT:\n" + "\n".join(ctx_bits)[:1200]
@@ -223,7 +220,6 @@ def _propose_copy(url: str,
         data = json.loads(resp.choices[0].message.content)
         title_out = (data.get("title") or fallback["title"]).strip()[:60]
         meta_out = re.sub(r"\s+", " ", (data.get("meta") or fallback["meta"]).strip())
-        # knip veilig af rond 155–160
         if len(meta_out) > 160:
             meta_out = meta_out[:160]
         return {
@@ -235,15 +231,18 @@ def _propose_copy(url: str,
     except Exception:
         return fallback
 
+# -----------------------------------------------------
+# Text issue builder (concrete current + proposal)
+# -----------------------------------------------------
 def _build_text_findings(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Per pagina: detecteer tekstuele issues (title/meta/H1/low-text) en geef huidige tekst + voorstel.
+    Per pagina: detecteer tekstuele issues (title/meta/H1/low-text) en geef
+    huidige tekst + voorstel + HTML-patch.
     """
     if not crawl:
         return []
     pages = _unique_pages(crawl.get("pages") or [])
 
-    # duplicaten op basis van unieke set
     title_counts = _dup_map([p.get("title") for p in pages if p.get("status") == 200])
     meta_counts  = _dup_map([p.get("meta_description") for p in pages if p.get("status") == 200])
 
@@ -259,7 +258,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
         wc = int(p.get("word_count") or 0)
 
         need_title = (not title) or len(title) < 30 or len(title) > 65 or title_counts.get(title.lower(), 0) > 1
-        need_meta  = (not meta) or len(meta)  < 70 or len(meta)  > 180 or meta_counts.get(meta.lower(), 0) > 1
+        need_meta  = (not meta)  or len(meta)  < 70 or len(meta)  > 180 or meta_counts.get(meta.lower(), 0) > 1
         h1_eq_title = bool(title and h1 and h1.strip().lower() == title.strip().lower())
         low_text = (wc and wc < 250)
 
@@ -284,7 +283,6 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
 
         if need_meta:
             reason = []
-            # let op: voor accept hanteren we 140–160, maar de detectie liet 70–180 toe om noise te vermijden
             if not meta: reason.append("ontbreekt")
             if meta and (len(meta) < 140 or len(meta) > 160): reason.append("lengte suboptimaal")
             if meta and meta_counts.get(meta.lower(), 0) > 1: reason.append("dubbel op site")
@@ -322,10 +320,18 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
 
     return rows
 
+# -----------------------------------------------------
+# Technical SEO findings (deduped pages)
+# -----------------------------------------------------
+_TEXT_FINDINGS_ALL = {
+    "Missing <title>", "Title length suboptimal", "Duplicate <title>",
+    "Missing meta description", "Meta description length suboptimal", "Duplicate meta description",
+    "H1 duplicates title", "Missing H1", "Low visible text"
+}
+
 def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not crawl:
         return []
-    # gebruik unieke pagina’s om ruis te verminderen
     pages = _unique_pages(crawl.get("pages") or [])
     inlinks = _build_link_graph(pages)
     title_counts = _dup_map([p.get("title") for p in pages if p.get("status") == 200])
@@ -333,8 +339,7 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
 
     out: List[Dict[str, Any]] = []
     for p in pages:
-        url = p.get("final_url") or p.get("url") or ""
-        u = _norm_url(url)
+        u = _norm_url(p.get("final_url") or p.get("url") or "")
         status = int(p.get("status") or 0)
         title = p.get("title")
         h1 = p.get("h1")
@@ -349,13 +354,13 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
         def add(find, sev, fix, accept):
             out.append({"url": u, "finding": find, "severity": sev, "fix": fix, "accept": accept})
 
-        # HTTP status
         if status >= 400:
             add("HTTP error " + str(status), "high",
                 "Fix the endpoint to return 200 or remove from internal linking.",
                 ["URL returns 200", "Internal links updated"])
 
-        # Title
+        # Text findings worden apart getoond in concrete sectie;
+        # we laten ze wel in out staan (voor totalen), maar filteren later.
         if not title:
             add("Missing <title>", "high",
                 "Add a descriptive, unique <title> (30–65 chars) that matches page intent.",
@@ -370,7 +375,6 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                     "Make the title unique per page; differentiate with intent or entities.",
                     ["Titles unique site-wide"])
 
-        # Meta description
         if not md:
             add("Missing meta description", "medium",
                 "Add unique <meta name='description'> (~140–160 chars) that summarizes the answer/value.",
@@ -385,7 +389,6 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                     "Rewrite to reflect page’s unique value; avoid reuse.",
                     ["Descriptions unique site-wide"])
 
-        # H1
         if not h1:
             add("Missing H1", "high",
                 "Add exactly one <h1> with the primary topic; keep 30–65 chars.",
@@ -395,13 +398,11 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                 "Differentiate H1 slightly to add context; keep user-first phrasing.",
                 ["H1 present", "Not identical to title"])
 
-        # Robots
         if noindex:
             add("noindex set", "high",
                 "Remove noindex for indexable pages; keep only on intentional pages (thank-you, internal tools).",
                 ["No 'noindex' on valuable pages"])
 
-        # Canonical
         if not canon:
             add("Missing canonical", "low",
                 "Add <link rel='canonical'> to the preferred URL to prevent duplicates.",
@@ -412,19 +413,16 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                     "Canonical should match the preferred URL; align host & path.",
                     ["Canonical equals preferred URL"])
 
-        # Word count
         if word_count and word_count < 250:
             add("Low visible text", "medium",
                 "Add concise, answer-first copy and supporting evidence; target ≥250–400 words for key pages.",
                 ["≥250 words visible", "Lead with answer"])
 
-        # Open Graph
         if not og_title or not og_desc:
             add("Missing Open Graph tags", "low",
                 "Add og:title and og:description for clean sharing/AI snippets.",
                 ["og:title present", "og:description present"])
 
-        # Internal links
         if inl == 0:
             add("Orphan/low internal links", "medium",
                 "Link to this page from at least 2 relevant pages using natural anchor text.",
@@ -432,9 +430,11 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
 
     return out
 
+# -----------------------------------------------------
+# AEO & GEO
+# -----------------------------------------------------
 def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    # FAQ job quality
     if faq:
         for item in (faq.get("faqs") or []):
             q = (item.get("q") or "").strip()
@@ -466,7 +466,6 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
                         ],
                     }
                 )
-    # Site FAQ schema presence (from crawl JSON-LD types)
     has_faq = False
     if crawl:
         for p in (crawl.get("pages") or []):
@@ -592,12 +591,16 @@ def generate_report(conn, job):
 
     # Findings
     text_rows = _build_text_findings(crawl)
-    seo_rows = _seo_findings_from_crawl(crawl)
+    seo_rows_all = _seo_findings_from_crawl(crawl)
+
+    # splits: concrete text fixes vs overige technische issues
+    technical_rows = [r for r in seo_rows_all if r["finding"] not in _TEXT_FINDINGS_ALL]
+
     aeo_rows = _aeo_findings_from_faq(faq, crawl)
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
 
     # Executive summary
-    exec_summary = _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows) or (
+    exec_summary = _try_llm_summary(site_meta, seo_rows_all, geo_rows, aeo_rows) or (
         "This report lists concrete issues and recommendations across SEO (technical), "
         "GEO (entity/schema), and AEO (answer readiness). Each item includes acceptance criteria "
         "so your team can implement and verify fixes."
@@ -625,8 +628,8 @@ def generate_report(conn, job):
     elems.append(Paragraph(exec_summary, S["Small"]))
     elems.append(PageBreak())
 
-    # --- TEXT ISSUES & FIXES ---
-    elems.append(Paragraph("Tekstfouten & fixes (per pagina)", S["Heading2"]))
+    # --- SEO — Concrete text fixes (ready-to-paste) ---
+    elems.append(Paragraph("SEO — Concrete text fixes (ready-to-paste)", S["Heading2"]))
     if not text_rows:
         elems.append(Paragraph("Geen tekstuele problemen gevonden in titels/meta/H1/intro.", S["Normal"]))
     else:
@@ -643,8 +646,8 @@ def generate_report(conn, job):
             ])
         elems.append(_make_table(data, colw))
         elems.append(Spacer(1, 6))
-        elems.append(Paragraph("HTML-patch (kopieer & plak):", S["Small"]))
-        for r in text_rows[:6]:  # toon de eerste 6 patches beknopt
+        elems.append(Paragraph("HTML-patches (kopieer & plak):", S["Small"]))
+        for r in text_rows[:8]:
             elems.append(KeepTogether([
                 P(f"{r['field']} — {r['url']}", "Tiny"),
                 Code(r["html_patch"]),
@@ -652,15 +655,15 @@ def generate_report(conn, job):
             ]))
     elems.append(PageBreak())
 
-    # --- SEO Findings ---
-    elems.append(Paragraph("SEO Findings (per page)", S["Heading2"]))
-    if not seo_rows:
-        elems.append(Paragraph("No findings from crawl.", S["Normal"]))
+    # --- SEO — Other technical issues ---
+    elems.append(Paragraph("SEO — Other technical issues", S["Heading2"]))
+    if not technical_rows:
+        elems.append(Paragraph("No other technical issues from crawl.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.10 * width, 0.20 * width, 0.20 * width]
+        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
-        for r in seo_rows:
+        for r in technical_rows:
             data.append(
                 [
                     P(_shorten(r["url"], 120)),
@@ -679,7 +682,7 @@ def generate_report(conn, job):
         elems.append(Paragraph("No schema/entity recommendations.", S["Normal"]))
     else:
         headers = ["Page URL", "Recommendation", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.10 * width, 0.20 * width, 0.20 * width]
+        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
         for r in geo_rows:
             data.append(
@@ -700,7 +703,7 @@ def generate_report(conn, job):
         elems.append(Paragraph("No AEO findings.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.10 * width, 0.20 * width, 0.20 * width]
+        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
         for r in aeo_rows:
             data.append(
@@ -753,7 +756,7 @@ def generate_report(conn, job):
             "generated_at": now,
             "sections": {
                 "text_fixes": bool(text_rows),
-                "seo_findings": bool(seo_rows),
+                "seo_other": bool(technical_rows),
                 "geo_recommendations": bool(geo_rows),
                 "aeo_findings": bool(aeo_rows),
             },
