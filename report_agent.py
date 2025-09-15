@@ -1,15 +1,24 @@
 # report_agent.py
 import base64
 import io
+import json
+import os
+import re
 from datetime import datetime, timezone
-
 from psycopg.rows import dict_row
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 
+from openai import OpenAI
+from rag_helper import get_rag_context
+
+OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_TIMEOUT_SEC = 30
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
 def _fetch_latest_job(conn, site_id, jtype):
-    """Haal de laatste succesvolle job-output op van een bepaald type."""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -24,23 +33,72 @@ def _fetch_latest_job(conn, site_id, jtype):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
+def _ai_summarize(site_id, crawl, keywords, faq, schema, conn):
+    ctx = get_rag_context(conn, site_id=site_id, query="site audit", kb_tags=["SEO","Schema","AEO","Quality"])
+    crawl_txt = json.dumps(crawl or {}, indent=2)
+    kw_txt = json.dumps(keywords or {}, indent=2)
+    faq_txt = json.dumps(faq or {}, indent=2)
+    schema_txt = json.dumps(schema or {}, indent=2)
+
+    sys = (
+        "You are an SEO + AEO auditor. Write a professional audit report. "
+        "Use crawl, keywords, FAQ, and schema data plus KB context. "
+        "Highlight strengths, weaknesses, and give prioritized recommendations. "
+        "Include an overall Executive Summary, a Scoring Matrix (1–10) for: "
+        "Crawl health, Content quality, Schema coverage, AEO readiness. "
+        "At the end, output an Overall Site Health Score (0–100) = average of the four subscores * 10. "
+        "Format clearly in Markdown."
+    )
+    user = f"""
+Crawl data:
+{crawl_txt}
+
+Keywords:
+{kw_txt}
+
+FAQs:
+{faq_txt}
+
+Schema:
+{schema_txt}
+
+--- SITE CONTEXT ---
+{ctx.get("site_ctx")}
+
+--- KB CONTEXT ---
+{ctx.get("kb_ctx")}
+"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        temperature=0.3,
+        timeout=OPENAI_TIMEOUT_SEC,
+    )
+    return resp.choices[0].message.content.strip()
+
+def _extract_overall_score(ai_text: str) -> int:
+    m = re.search(r"(\d{2,3})\s*/\s*100", ai_text)
+    if m:
+        try:
+            val = int(m.group(1))
+            return max(0, min(100, val))
+        except Exception:
+            return None
+    return None
 
 def generate_report(conn, job):
-    """
-    Bouw een PDF-rapport met crawl/faq/schema samenvatting.
-    return: dict {"pdf_base64": "...", "meta": {...}}
-    """
     site_id = job["site_id"]
-    payload = job.get("payload", {}) or {}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # haal laatste resultaten op
     crawl = _fetch_latest_job(conn, site_id, "crawl")
     faq = _fetch_latest_job(conn, site_id, "faq")
     schema = _fetch_latest_job(conn, site_id, "schema")
     keywords = _fetch_latest_job(conn, site_id, "keywords")
 
-    # PDF opbouwen
+    ai_text = _ai_summarize(site_id, crawl, keywords, faq, schema, conn)
+    overall_score = _extract_overall_score(ai_text)
+
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
@@ -48,63 +106,33 @@ def generate_report(conn, job):
 
     elems.append(Paragraph("ASEON Site Report", styles["Title"]))
     elems.append(Paragraph(f"Generated at: {now}", styles["Normal"]))
+    if overall_score is not None:
+        elems.append(Paragraph(f"Overall Site Health Score: {overall_score}/100", styles["Heading2"]))
     elems.append(Spacer(1, 20))
 
-    # --- Crawl summary ---
-    if crawl:
-        summary = crawl.get("summary", {})
-        elems.append(Paragraph("Crawl Summary", styles["Heading2"]))
-        elems.append(
-            Paragraph(
-                f"Pages crawled: {summary.get('pages_total', 0)} "
-                f"(200 OK: {summary.get('ok_200', 0)}, "
-                f"Errors: {summary.get('errors_4xx_5xx', 0)})",
-                styles["Normal"],
-            )
-        )
-        if crawl.get("quick_wins"):
-            elems.append(Paragraph("Quick Wins:", styles["Heading3"]))
-            for win in crawl["quick_wins"]:
-                elems.append(Paragraph(f"- {win['type']}", styles["Normal"]))
-        elems.append(Spacer(1, 15))
+    # Executive Summary + Scores
+    elems.append(Paragraph("Executive Summary & Scores", styles["Heading2"]))
+    for line in ai_text.split("\n"):
+        if not line.strip():
+            elems.append(Spacer(1, 10))
+            continue
+        elems.append(Paragraph(line, styles["Normal"]))
+    elems.append(PageBreak())
+
+    # Appendix
+    def add_json_section(title, data):
+        if not data: 
+            return
+        elems.append(Paragraph(title, styles["Heading2"]))
+        txt = json.dumps(data, indent=2)
+        for chunk in [txt[i:i+1000] for i in range(0, len(txt), 1000)]:
+            elems.append(Paragraph(f"<pre>{chunk}</pre>", styles["Code"]))
         elems.append(PageBreak())
 
-    # --- Keywords ---
-    if keywords:
-        elems.append(Paragraph("Keyword Suggestions", styles["Heading2"]))
-        kws = keywords.get("keywords", [])
-        for kw in kws[:30]:
-            elems.append(Paragraph(f"- {kw}", styles["Normal"]))
-        elems.append(PageBreak())
-
-    # --- FAQ ---
-    if faq and "faqs" in faq:
-        elems.append(Paragraph("Frequently Asked Questions", styles["Heading2"]))
-        for item in faq["faqs"]:
-            q = item.get("q")
-            a = item.get("a")
-            if q and a:
-                elems.append(Paragraph(f"Q: {q}", styles["Heading3"]))
-                elems.append(Paragraph(f"A: {a}", styles["Normal"]))
-                elems.append(Spacer(1, 10))
-        elems.append(PageBreak())
-
-    # --- Schema ---
-    if schema:
-        elems.append(Paragraph("Schema.org Snippet", styles["Heading2"]))
-        elems.append(Paragraph("Type: " + str(schema.get("biz_type")), styles["Normal"]))
-        sc = schema.get("schema")
-        if sc:
-            import json
-
-            json_str = json.dumps(sc, indent=2)
-            # toon max 1000 chars
-            elems.append(Paragraph(f"<pre>{json_str[:1000]}</pre>", styles["Code"]))
-        elems.append(PageBreak())
-
-    # fallback als leeg
-    if not elems:
-        elems.append(Paragraph("No data available for this site.", styles["Normal"]))
+    add_json_section("Crawl Data", crawl)
+    add_json_section("Keyword Data", keywords)
+    add_json_section("FAQ Data", faq)
+    add_json_section("Schema Data", schema)
 
     doc.build(elems)
     pdf_bytes = buffer.getvalue()
@@ -121,6 +149,9 @@ def generate_report(conn, job):
                 "keywords": bool(keywords),
                 "faq": bool(faq),
                 "schema": bool(schema),
+                "ai_summary": True,
+                "scoring_matrix": True,
+                "overall_score": overall_score,
             },
         },
     }
