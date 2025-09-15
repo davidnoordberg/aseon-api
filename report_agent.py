@@ -2,6 +2,7 @@ import base64
 import io
 import json
 from datetime import datetime, timezone
+import os
 
 from psycopg.rows import dict_row
 from reportlab.lib.pagesizes import A4
