@@ -2,22 +2,32 @@
 import base64
 import io
 import json
-import os
-import re
 from datetime import datetime, timezone
+
 from psycopg.rows import dict_row
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    PageBreak,
+    Table,
+    TableStyle,
+)
+from reportlab.lib import colors
 
 from openai import OpenAI
 from rag_helper import get_rag_context
 
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_TIMEOUT_SEC = 30
-
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+
+# -----------------------------------------------------
+# DB helpers
+# -----------------------------------------------------
 def _fetch_latest_job(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -33,106 +43,206 @@ def _fetch_latest_job(conn, site_id, jtype):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
-def _ai_summarize(site_id, crawl, keywords, faq, schema, conn):
-    ctx = get_rag_context(conn, site_id=site_id, query="site audit", kb_tags=["SEO","Schema","AEO","Quality"])
-    crawl_txt = json.dumps(crawl or {}, indent=2)
-    kw_txt = json.dumps(keywords or {}, indent=2)
-    faq_txt = json.dumps(faq or {}, indent=2)
-    schema_txt = json.dumps(schema or {}, indent=2)
 
+def _fetch_site_meta(conn, site_id):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT s.url, s.language, s.country, a.name AS account_name
+              FROM sites s
+              JOIN accounts a ON a.id = s.account_id
+             WHERE s.id = %s
+            """,
+            (site_id,),
+        )
+        return cur.fetchone() or {}
+
+
+# -----------------------------------------------------
+# LLM synthesis
+# -----------------------------------------------------
+def _safe(obj, maxlen=4000):
+    try:
+        s = json.dumps(obj) if not isinstance(obj, str) else obj
+        return s[:maxlen]
+    except Exception:
+        return str(obj)[:maxlen]
+
+
+def _llm_synthesis(site_meta, crawl, keywords, faq, schema, rag):
     sys = (
-        "You are an SEO + AEO auditor. Write a professional audit report. "
-        "Use crawl, keywords, FAQ, and schema data plus KB context. "
-        "Highlight strengths, weaknesses, and give prioritized recommendations. "
-        "Include an overall Executive Summary, a Scoring Matrix (1–10) for: "
-        "Crawl health, Content quality, Schema coverage, AEO readiness. "
-        "At the end, output an Overall Site Health Score (0–100) = average of the four subscores * 10. "
-        "Format clearly in Markdown."
+        "You are an expert SEO/GEO/AEO auditor. "
+        "Synthesize findings into crisp, actionable recommendations. "
+        "Score each pillar on 1–10. Be specific, verifiable, no fluff."
     )
+
     user = f"""
-Crawl data:
-{crawl_txt}
+SITE:
+- name: {site_meta.get('account_name') or 'Site'}
+- url: {site_meta.get('url') or ''} ({site_meta.get('language') or ''}-{site_meta.get('country') or ''})
 
-Keywords:
-{kw_txt}
+INPUTS (summaries; truncate applied):
+- CRAWL: { _safe(crawl, 4000) if crawl else "null" }
+- KEYWORDS: { _safe(keywords, 4000) if keywords else "null" }
+- FAQ: { _safe(faq, 4000) if faq else "null" }
+- SCHEMA: { _safe(schema, 4000) if schema else "null" }
 
-FAQs:
-{faq_txt}
+KB CONTEXT (for policy/best-practice grounding):
+{ rag.get('kb_ctx') or '' }
 
-Schema:
-{schema_txt}
-
---- SITE CONTEXT ---
-{ctx.get("site_ctx")}
-
---- KB CONTEXT ---
-{ctx.get("kb_ctx")}
+Return STRICT JSON with:
+{{
+  "summary": {{
+    "title": "SEO • GEO • AEO Audit for <site>",
+    "executive": "2–4 paragraphs big picture",
+    "scores": {{
+      "seo": {{
+        "technical_health": 0,
+        "content_quality": 0,
+        "crawl_indexability": 0
+      }},
+      "geo": {{
+        "entity_schema_coverage": 0,
+        "eeat_authority": 0
+      }},
+      "aeo": {{
+        "answer_readiness": 0,
+        "citation_readiness": 0
+      }},
+      "overall_score": 0
+    }}
+  }},
+  "prioritized_actions": [
+    {{
+      "title": "...",
+      "why_it_matters": "...",
+      "impact": "high|medium|low",
+      "effort": "low|medium|high",
+      "owner_hint": "content|dev|seo",
+      "acceptance_criteria": ["measurable outcome 1","..."]
+    }}
+  ],
+  "key_risks": ["...", "..."]
+}}
+Rules:
+- Use ONLY info derivable from inputs/KB. If unknown, omit.
+- Max 10 actions. Keep why_it_matters short and concrete.
 """
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        temperature=0.3,
+        temperature=0.2,
         timeout=OPENAI_TIMEOUT_SEC,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
     )
-    return resp.choices[0].message.content.strip()
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        return data
+    except Exception:
+        return {
+            "summary": {
+                "title": "Audit",
+                "executive": "LLM synthesis failed",
+                "scores": {"seo": {}, "geo": {}, "aeo": {}, "overall_score": 0},
+            },
+            "prioritized_actions": [],
+            "key_risks": [],
+        }
 
-def _extract_overall_score(ai_text: str) -> int:
-    m = re.search(r"(\d{2,3})\s*/\s*100", ai_text)
-    if m:
-        try:
-            val = int(m.group(1))
-            return max(0, min(100, val))
-        except Exception:
-            return None
-    return None
 
+# -----------------------------------------------------
+# Report generation
+# -----------------------------------------------------
 def generate_report(conn, job):
     site_id = job["site_id"]
+    payload = job.get("payload", {}) or {}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     crawl = _fetch_latest_job(conn, site_id, "crawl")
     faq = _fetch_latest_job(conn, site_id, "faq")
     schema = _fetch_latest_job(conn, site_id, "schema")
     keywords = _fetch_latest_job(conn, site_id, "keywords")
+    site_meta = _fetch_site_meta(conn, site_id)
 
-    ai_text = _ai_summarize(site_id, crawl, keywords, faq, schema, conn)
-    overall_score = _extract_overall_score(ai_text)
+    rag = get_rag_context(conn, site_id=site_id, query="site audit baseline")
 
+    synth = _llm_synthesis(site_meta, crawl, keywords, faq, schema, rag)
+
+    # PDF
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Code", fontName="Courier", fontSize=8))
     elems = []
 
-    elems.append(Paragraph("ASEON Site Report", styles["Title"]))
+    elems.append(Paragraph(synth["summary"]["title"], styles["Title"]))
     elems.append(Paragraph(f"Generated at: {now}", styles["Normal"]))
-    if overall_score is not None:
-        elems.append(Paragraph(f"Overall Site Health Score: {overall_score}/100", styles["Heading2"]))
-    elems.append(Spacer(1, 20))
-
-    # Executive Summary + Scores
-    elems.append(Paragraph("Executive Summary & Scores", styles["Heading2"]))
-    for line in ai_text.split("\n"):
-        if not line.strip():
-            elems.append(Spacer(1, 10))
-            continue
-        elems.append(Paragraph(line, styles["Normal"]))
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph(synth["summary"]["executive"], styles["Normal"]))
     elems.append(PageBreak())
 
-    # Appendix
-    def add_json_section(title, data):
-        if not data: 
-            return
-        elems.append(Paragraph(title, styles["Heading2"]))
-        txt = json.dumps(data, indent=2)
-        for chunk in [txt[i:i+1000] for i in range(0, len(txt), 1000)]:
-            elems.append(Paragraph(f"<pre>{chunk}</pre>", styles["Code"]))
+    # Score table
+    scores = synth["summary"]["scores"]
+    seo = scores.get("seo", {}) or {}
+    geo = scores.get("geo", {}) or {}
+    aeo = scores.get("aeo", {}) or {}
+
+    data = [
+        ["Pillar / Metric", "Score (1–10)"],
+        ["SEO — Technical Health", seo.get("technical_health", 0)],
+        ["SEO — Content Quality", seo.get("content_quality", 0)],
+        ["SEO — Crawl & Indexability", seo.get("crawl_indexability", 0)],
+        ["GEO — Entity/Schema Coverage", geo.get("entity_schema_coverage", 0)],
+        ["GEO — E-E-A-T / Authority", geo.get("eeat_authority", 0)],
+        ["AEO — Answer Readiness", aeo.get("answer_readiness", 0)],
+        ["AEO — Citation Readiness", aeo.get("citation_readiness", 0)],
+        ["Overall", scores.get("overall_score", 0)],
+    ]
+    table = Table(data, colWidths=[300, 80])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+            ]
+        )
+    )
+    elems.append(Paragraph("Scores", styles["Heading2"]))
+    elems.append(table)
+    elems.append(PageBreak())
+
+    # Actions
+    elems.append(Paragraph("Prioritized Actions", styles["Heading2"]))
+    for act in synth.get("prioritized_actions", []):
+        elems.append(Paragraph(f"- {act['title']} ({act['impact']}/{act['effort']})", styles["Heading3"]))
+        elems.append(Paragraph(act.get("why_it_matters", ""), styles["Normal"]))
+        ac = act.get("acceptance_criteria") or []
+        if ac:
+            elems.append(Paragraph("Acceptance Criteria:", styles["Italic"]))
+            for c in ac:
+                elems.append(Paragraph(f"• {c}", styles["Normal"]))
+        elems.append(Spacer(1, 8))
+    elems.append(PageBreak())
+
+    # Risks
+    risks = synth.get("key_risks") or []
+    if risks:
+        elems.append(Paragraph("Key Risks", styles["Heading2"]))
+        for r in risks:
+            elems.append(Paragraph(f"- {r}", styles["Normal"]))
         elems.append(PageBreak())
 
-    add_json_section("Crawl Data", crawl)
-    add_json_section("Keyword Data", keywords)
-    add_json_section("FAQ Data", faq)
-    add_json_section("Schema Data", schema)
+    # Crawl quick wins (appendix)
+    if crawl:
+        elems.append(Paragraph("Crawl Quick Wins", styles["Heading2"]))
+        for win in crawl.get("quick_wins", []):
+            elems.append(Paragraph(f"- {win['type']}", styles["Normal"]))
+        elems.append(PageBreak())
 
     doc.build(elems)
     pdf_bytes = buffer.getvalue()
@@ -149,9 +259,7 @@ def generate_report(conn, job):
                 "keywords": bool(keywords),
                 "faq": bool(faq),
                 "schema": bool(schema),
-                "ai_summary": True,
-                "scoring_matrix": True,
-                "overall_score": overall_score,
+                "synthesis": bool(synth),
             },
         },
     }
