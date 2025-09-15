@@ -1,4 +1,3 @@
-# report_agent.py
 import base64
 import io
 import json
