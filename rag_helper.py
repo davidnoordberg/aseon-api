@@ -1,14 +1,15 @@
 # rag_helper.py
-import os, json, re, time, math
-from typing import List, Dict, Any, Optional, Tuple
+import os, json, re, time
+from typing import List, Dict, Any, Optional
 from psycopg.rows import dict_row
 from openai import OpenAI
 from random import random
+from urllib.parse import urlsplit, urlunsplit
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-CONTEXT_CHAR_BUDGET = int(os.getenv("RAG_CHAR_BUDGET", "9000"))  # totale contextlimiet
+CONTEXT_CHAR_BUDGET = int(os.getenv("RAG_CHAR_BUDGET", "9000"))
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -17,11 +18,9 @@ def _trim(s: str, max_chars: int = 1200) -> str:
     return s[:max_chars]
 
 def _retry_sleep(attempt: int) -> float:
-    # jittered backoff
     return min(2 ** attempt + random(), 8.0)
 
 def embed(text: str) -> List[float]:
-    """1-shot embed met retries; geeft zero-vector terug als alles faalt."""
     last_err = None
     for attempt in range(OPENAI_MAX_RETRIES):
         try:
@@ -34,7 +33,6 @@ def embed(text: str) -> List[float]:
         except Exception as e:
             last_err = e
             time.sleep(_retry_sleep(attempt))
-    # fallback: zero-vector met correcte dimensie (1536 voor text-embedding-3-small)
     dim = 1536 if "small" in EMBED_MODEL else (3072 if "large" in EMBED_MODEL else 1536)
     print(json.dumps({"level":"ERROR","msg":"embed_failed","error":str(last_err)[:300]}), flush=True)
     return [0.0]*dim
@@ -42,6 +40,24 @@ def embed(text: str) -> List[float]:
 def _parse_tags(tags: Optional[List[str]]) -> Optional[List[str]]:
     if not tags: return None
     return [t.strip() for t in tags if t and t.strip()]
+
+def _norm_url(u: str) -> str:
+    if not u: return ""
+    p = urlsplit(u.strip())
+    host = (p.hostname or "").lower()
+    path = (p.path or "/").rstrip("/") or "/"
+    return urlunsplit((p.scheme or "https", host, path, "", ""))
+
+def _collapse_by_url(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for r in rows:
+        u = _norm_url(r.get("url") or "")
+        if u and u not in seen:
+            seen.add(u)
+            r["url"] = u
+            out.append(r)
+    return out
 
 def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -51,8 +67,13 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
             cur.execute("""
                 SELECT url, content, metadata, (embedding <-> %s::vector) AS dist
                   FROM documents
-                 WHERE site_id=%s AND embedding IS NOT NULL
-              ORDER BY dist ASC
+                 WHERE site_id=%s
+                   AND embedding IS NOT NULL
+                   AND COALESCE((metadata->>'status')::int, 0) = 200
+                   AND length(content) > 200
+                   AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
+                   AND url NOT ILIKE '%RESULTS_URL%'
+                 ORDER BY dist ASC
                  LIMIT %s
             """, (qvec, site_id, k))
             rows = cur.fetchall()
@@ -62,13 +83,17 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
         print(json.dumps({"level":"WARN","msg":"site_vec_failed","error":str(e)[:200]}), flush=True)
 
     if not rows:
-        # tekstuele fallback
         try:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT url, content, metadata
                       FROM documents
-                     WHERE site_id=%s AND (content ILIKE %s OR url ILIKE %s)
+                     WHERE site_id=%s
+                       AND (content ILIKE %s OR url ILIKE %s)
+                       AND COALESCE((metadata->>'status')::int, 0) = 200
+                       AND length(content) > 200
+                       AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
+                       AND url NOT ILIKE '%RESULTS_URL%'
                      LIMIT %s
                 """, (site_id, f"%{query}%", f"%{query}%", k))
                 rows = cur.fetchall()
@@ -76,7 +101,7 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
             try: conn.rollback()
             except Exception: pass
             print(json.dumps({"level":"ERROR","msg":"site_like_failed","error":str(e)[:200]}), flush=True)
-    return rows or []
+    return _collapse_by_url(rows or [])
 
 def search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -93,7 +118,7 @@ def search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) ->
                 SELECT title, url, source, tags, content, (embedding <-> %s::vector) AS dist
                   FROM kb_documents
                   {where if where else ""}
-              ORDER BY dist ASC
+                 ORDER BY dist ASC
                  LIMIT %s
             """, (qvec, *params, k) if tags else (qvec, k))
             rows = cur.fetchall()
@@ -116,27 +141,16 @@ def search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) ->
             try: conn.rollback()
             except Exception: pass
             print(json.dumps({"level":"ERROR","msg":"kb_like_failed","error":str(e)[:200]}), flush=True)
-    return rows or []
-
-def _collapse_by_url(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for r in rows:
-        u = (r.get("url") or "").strip()
-        if u and u not in seen:
-            seen.add(u)
-            out.append(r)
-    return out
+    return _collapse_by_url(rows or [])
 
 def build_context(site_rows, kb_rows, budget_chars: int = CONTEXT_CHAR_BUDGET) -> Dict[str, Any]:
-    site_rows = _collapse_by_url(site_rows)[:8]
-    kb_rows = _collapse_by_url(kb_rows)[:6]
+    site_rows = site_rows[:8]
+    kb_rows = kb_rows[:6]
 
     site_bits, kb_bits = [], []
     site_cites, kb_cites = [], []
     used = 0
 
-    # eerst site, dan kb — binnen totaalbudget
     for i, r in enumerate(site_rows):
         sid = f"S{i+1}"
         chunk = f"[{sid}] {r.get('url')}\n{_trim(r.get('content') or '')}\n"
