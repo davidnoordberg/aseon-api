@@ -8,6 +8,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 
+# Context limieten
 MAX_CTX_CHARS = int(os.getenv("FAQ_MAX_CTX_CHARS", "3500"))
 DOC_K = int(os.getenv("FAQ_DOC_TOPK", "5"))
 KB_K  = int(os.getenv("FAQ_KB_TOPK", "4"))
@@ -22,24 +23,32 @@ def _rows_to_ctx(rows: List[dict], label: str) -> str:
     bits: List[str] = []
     for i, r in enumerate(rows):
         url = (r.get("url") or "").strip()
+        title = (r.get("title") or "").strip()
         content = (r.get("content") or "").strip()
-        pre = f"[{label.upper()} {i+1}] {url}" if url else f"[{label.upper()} {i+1}]"
+        pre = f"[{label.upper()} {i+1}] {url}"
+        if title: pre += f" • {title}"
         snippet = (content[:1000] + "…") if len(content) > 1000 else content
         if snippet:
             bits.append(pre + "\n" + snippet)
     return "\n\n".join(bits)
 
 def _query_site_documents(conn, site_id: str, topic: str, k: int) -> List[dict]:
+    """
+    Let op: 'documents' tabel heeft geen 'title' kolom. We halen waar mogelijk de titel
+    uit metadata->>'title' en bouwen een snippet op basis van 'content'.
+    """
     try:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, content
-                  FROM documents
-                 WHERE site_id = %s
-                   AND embedding IS NOT NULL
-                 ORDER BY embedding <-> %s::vector
-                 LIMIT %s
+                SELECT
+                    url,
+                    COALESCE(metadata->>'title','') AS title,
+                    content
+                FROM documents
+                WHERE site_id = %s
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s
             """, (site_id, qvec, k))
             return cur.fetchall() or []
     except Exception as e:
@@ -53,10 +62,10 @@ def _query_kb(conn, topic: str, k: int) -> List[dict]:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, content, title
-                  FROM kb_documents
-                 ORDER BY embedding <-> %s::vector
-                 LIMIT %s
+                SELECT url, title, content
+                FROM kb_documents
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s
             """, (qvec, k))
             return cur.fetchall() or []
     except Exception as e:
@@ -70,10 +79,10 @@ def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
                 SELECT output
-                  FROM jobs
-                 WHERE site_id=%s AND type='crawl' AND status='done'
-              ORDER BY COALESCE(finished_at, created_at) DESC
-                 LIMIT 1
+                FROM jobs
+                WHERE site_id=%s AND type='crawl' AND status='done'
+                ORDER BY COALESCE(finished_at, created_at) DESC
+                LIMIT 1
             """, (site_id,))
             r = cur.fetchone()
         out = (r or {}).get("output") or {}
@@ -81,13 +90,14 @@ def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
         bits: List[str] = []
         for p in pages[:max_pages]:
             url = p.get("final_url") or p.get("url") or ""
-            meta = p.get("meta_description") or ""
-            h1 = p.get("h1") or ""
-            paras = " ".join((p.get("paragraphs") or [])[:2])
-            snippet = "\n".join([x for x in [url, h1, meta, paras] if x])
+            title = (p.get("title") or "")[:200]
+            h1 = (p.get("h1") or "")[:200]
+            meta = (p.get("meta_description") or "")[:300]
+            paras = " ".join((p.get("paragraphs") or [])[:2])[:600]
+            snippet = "\n".join([x for x in [url, title, h1, meta, paras] if x])
             if snippet.strip():
                 bits.append(snippet)
-        return "\n\n".join(bits).strip()
+        return "\n".join(bits).strip()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
@@ -140,13 +150,9 @@ def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         ctx_text, ctx_used = "(no context)", []
 
     sys = f"""You write concise, factual FAQs grounded ONLY in the provided context.
-AEO/GEO-first: answers must be directly quotable and citable.
-- Exactly {count} QA pairs. Each answer ≤ {max_words} words.
-- Cite ONE best source URL when available from [SITE n] lines.
-- If info is missing, say you cannot answer.
-Return JSON ONLY:
-{{ "faqs": [{{"q":"...","a":"...","source":"<url or null>"}}...] }}"""
-
+Return EXACTLY {count} Q/A pairs. Each answer ≤ {max_words} words, cite one best source URL when available.
+If info is missing, say you cannot answer from context. JSON ONLY:
+{{ "faqs": [{{"q":"...","a":"...","source":"<url|null>"}}] }}"""
     user = f"Topic: {topic}\n\nContext:\n{ctx_text or '(no context)'}"
 
     resp = client.chat.completions.create(
@@ -167,8 +173,7 @@ Return JSON ONLY:
     for f in faqs[:count]:
         q = (f.get("q") or "").strip()
         a = re.sub(r"\s+", " ", (f.get("a") or "").strip())
-        if not q or not a:
-            continue
+        if not q or not a: continue
         words = a.split(" ")
         if len(words) > max_words:
             a = " ".join(words[:max_words])
