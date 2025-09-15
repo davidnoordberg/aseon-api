@@ -24,7 +24,6 @@ OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-
 def _fetch_latest_job(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -40,7 +39,6 @@ def _fetch_latest_job(conn, site_id, jtype):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
-
 def _fetch_site_meta(conn, site_id):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -54,41 +52,37 @@ def _fetch_site_meta(conn, site_id):
         )
         return cur.fetchone() or {}
 
-
 def _safe(obj, maxlen=4000):
     try:
-        s = json.dumps(obj, ensure_ascii=False) if not isinstance(obj, str) else obj
+        s = json.dumps(obj) if not isinstance(obj, str) else obj
         return s[:maxlen]
     except Exception:
         return str(obj)[:maxlen]
 
-
 def _llm_synthesis(site_meta, crawl, keywords, faq, schema, rag):
     sys = (
-        "You are an expert SEO/GEO/AEO auditor. "
-        "Synthesize findings into crisp, actionable recommendations. "
-        "Score each pillar on 1–10. Be specific, verifiable, no fluff."
+        "You are a senior SEO/GEO/AEO auditor. Be concrete, professional, and actionable. "
+        "Ground advice in inputs/KB only; no hallucinations. Use crisp language."
     )
-
     user = f"""
 SITE:
 - name: {site_meta.get('account_name') or 'Site'}
 - url: {site_meta.get('url') or ''} ({site_meta.get('language') or ''}-{site_meta.get('country') or ''})
 
-INPUTS (summaries; truncate applied):
-- CRAWL: {_safe(crawl, 4000) if crawl else "null"}
-- KEYWORDS: {_safe(keywords, 4000) if keywords else "null"}
-- FAQ: {_safe(faq, 4000) if faq else "null"}
-- SCHEMA: {_safe(schema, 4000) if schema else "null"}
+INPUTS (summaries; truncated):
+- CRAWL: { _safe(crawl, 3500) if crawl else "null" }
+- KEYWORDS: { _safe(keywords, 3500) if keywords else "null" }
+- FAQ: { _safe(faq, 3500) if faq else "null" }
+- SCHEMA: { _safe(schema, 3500) if schema else "null" }
 
-KB CONTEXT (for policy/best-practice grounding):
-{rag.get('kb_ctx') or ''}
+KB CONTEXT (policies/best practices):
+{ rag.get('kb_ctx') or '' }
 
-Return STRICT JSON with:
+Return STRICT JSON:
 {{
   "summary": {{
-    "title": "SEO • GEO • AEO Audit for <site>",
-    "executive": "2–4 paragraphs big picture",
+    "title": "SEO • GEO • AEO Audit for {site_meta.get('account_name') or 'Site'}",
+    "executive": "2–3 tight paragraphs. No fluff.",
     "scores": {{
       "seo": {{
         "technical_health": 0,
@@ -108,30 +102,30 @@ Return STRICT JSON with:
   }},
   "prioritized_actions": [
     {{
-      "title": "...",
-      "why_it_matters": "...",
+      "title": "Verb with object (max 8 words)",
+      "why_it_matters": "One sentence, measurable rationale",
       "impact": "high|medium|low",
       "effort": "low|medium|high",
       "owner_hint": "content|dev|seo",
-      "acceptance_criteria": ["measurable outcome 1","..."]
+      "acceptance_criteria": [
+        "Observable metric 1",
+        "Observable metric 2"
+      ]
     }}
   ],
-  "key_risks": ["...", "..."]
+  "key_risks": ["Short risk 1","Short risk 2"]
 }}
 Rules:
-- Use ONLY info derivable from inputs/KB. If unknown, omit.
-- Max 10 actions. Keep why_it_matters short and concrete.
-""".strip()
-
+- Scores are integers 0–10 only.
+- Max 8 actions. Prefer high-impact, low/medium-effort first.
+- Acceptance criteria must be verifiable (metrics, thresholds, tools).
+"""
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         temperature=0.2,
         timeout=OPENAI_TIMEOUT_SEC,
         response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
     )
     try:
         data = json.loads(resp.choices[0].message.content)
@@ -147,10 +141,8 @@ Rules:
             "key_risks": [],
         }
 
-
 def generate_report(conn, job):
     site_id = job["site_id"]
-    payload = job.get("payload", {}) or {}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     crawl = _fetch_latest_job(conn, site_id, "crawl")
@@ -160,36 +152,28 @@ def generate_report(conn, job):
     site_meta = _fetch_site_meta(conn, site_id)
 
     rag = get_rag_context(conn, site_id=site_id, query="site audit baseline")
-
     synth = _llm_synthesis(site_meta, crawl, keywords, faq, schema, rag)
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
-    mono_name = "Mono"
-    if mono_name not in styles.byName:
-        styles.add(ParagraphStyle(name=mono_name, fontName="Courier", fontSize=8, leading=10))
+    if "Code" not in styles.byName:
+        styles.add(ParagraphStyle(name="Code", fontName="Courier", fontSize=8))
 
     elems = []
-
-    title = synth.get("summary", {}).get("title") or "SEO • GEO • AEO Audit"
-    exec_sum = synth.get("summary", {}).get("executive") or ""
-    scores = synth.get("summary", {}).get("scores", {}) or {}
-
-    elems.append(Paragraph(title, styles["Title"]))
+    elems.append(Paragraph(synth["summary"]["title"], styles["Title"]))
     elems.append(Paragraph(f"Generated at: {now}", styles["Normal"]))
     elems.append(Spacer(1, 12))
-    if exec_sum:
-        elems.append(Paragraph(exec_sum, styles["Normal"]))
+    elems.append(Paragraph(synth["summary"]["executive"], styles["Normal"]))
     elems.append(PageBreak())
 
+    scores = synth["summary"]["scores"]
     seo = scores.get("seo", {}) or {}
     geo = scores.get("geo", {}) or {}
     aeo = scores.get("aeo", {}) or {}
-    overall = scores.get("overall_score", 0)
 
-    table_data = [
-        ["Pillar / Metric", "Score (1–10)"],
+    data = [
+        ["Pillar / Metric", "Score (0–10)"],
         ["SEO — Technical Health", seo.get("technical_health", 0)],
         ["SEO — Content Quality", seo.get("content_quality", 0)],
         ["SEO — Crawl & Indexability", seo.get("crawl_indexability", 0)],
@@ -197,45 +181,29 @@ def generate_report(conn, job):
         ["GEO — E-E-A-T / Authority", geo.get("eeat_authority", 0)],
         ["AEO — Answer Readiness", aeo.get("answer_readiness", 0)],
         ["AEO — Citation Readiness", aeo.get("citation_readiness", 0)],
-        ["Overall", overall],
+        ["Overall", scores.get("overall_score", 0)],
     ]
-    table = Table(table_data, colWidths=[300, 80])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
-    )
+    table = Table(data, colWidths=[300, 80])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+    ]))
     elems.append(Paragraph("Scores", styles["Heading2"]))
     elems.append(table)
     elems.append(PageBreak())
 
-    actions = synth.get("prioritized_actions", []) or []
     elems.append(Paragraph("Prioritized Actions", styles["Heading2"]))
-    if actions:
-        for act in actions[:10]:
-            elems.append(Paragraph(f"- {act.get('title','')}", styles["Heading3"]))
-            why = act.get("why_it_matters") or ""
-            impact = act.get("impact") or ""
-            effort = act.get("effort") or ""
-            owner = act.get("owner_hint") or ""
-            meta_line = " • ".join([x for x in [impact, effort, owner] if x])
-            if meta_line:
-                elems.append(Paragraph(meta_line, styles["Italic"]))
-            if why:
-                elems.append(Paragraph(why, styles["Normal"]))
-            ac = act.get("acceptance_criteria") or []
-            if ac:
-                elems.append(Paragraph("Acceptance Criteria:", styles["Italic"]))
-                for c in ac:
-                    elems.append(Paragraph(f"• {c}", styles["Normal"]))
-            elems.append(Spacer(1, 8))
-    else:
-        elems.append(Paragraph("No prioritized actions available.", styles["Normal"]))
+    for act in (synth.get("prioritized_actions") or [])[:8]:
+        elems.append(Paragraph(f"- {act.get('title','') } ({act.get('impact','')}/{act.get('effort','')})", styles["Heading3"]))
+        if act.get("why_it_matters"):
+            elems.append(Paragraph(act["why_it_matters"], styles["Normal"]))
+        ac = act.get("acceptance_criteria") or []
+        if ac:
+            elems.append(Paragraph("Acceptance Criteria:", styles["Italic"]))
+            for c in ac:
+                elems.append(Paragraph(f"• {c}", styles["Normal"]))
+        elems.append(Spacer(1, 8))
     elems.append(PageBreak())
 
     risks = synth.get("key_risks") or []
@@ -247,8 +215,8 @@ def generate_report(conn, job):
 
     if crawl and crawl.get("quick_wins"):
         elems.append(Paragraph("Crawl Quick Wins", styles["Heading2"]))
-        for win in crawl["quick_wins"]:
-            elems.append(Paragraph(f"- {win.get('type','')}", styles["Normal"]))
+        for win in crawl.get("quick_wins", []):
+            elems.append(Paragraph(f"- {win['type']}", styles["Normal"]))
         elems.append(PageBreak())
 
     doc.build(elems)
@@ -266,7 +234,7 @@ def generate_report(conn, job):
                 "keywords": bool(keywords),
                 "faq": bool(faq),
                 "schema": bool(schema),
-                "synthesis": True,
+                "synthesis": bool(synth),
             },
         },
     }
