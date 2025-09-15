@@ -1,11 +1,10 @@
-# routes/llm.py
-import os, json
+import os
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request, Body
 from pydantic import BaseModel
 from openai import OpenAI
 
-from rag_helper import get_rag_context  # bestaat al in je repo
+from rag_helper import get_rag_context  # jij hebt dit bestand al
 
 router = APIRouter()
 
@@ -13,20 +12,17 @@ OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
 
 def _to_list(v) -> Optional[List[str]]:
-    if v is None:
-        return None
-    if isinstance(v, list):
-        return [str(x).strip() for x in v if str(x).strip()]
-    if isinstance(v, str):
-        return [x.strip() for x in v.split(",") if x.strip()]
+    if v is None: return None
+    if isinstance(v, list): return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):  return [x.strip() for x in v.split(",") if x.strip()]
     return None
 
 class LLMAnswerRequest(BaseModel):
     query: str
     site_id: Optional[str] = None
     kb_tags: Optional[List[str]] = None
-    context: Optional[Dict[str, Any]] = None   # direct het resultaat van /rag/context
-    format: Optional[str] = "markdown"         # "markdown" of "text"
+    context: Optional[Dict[str, Any]] = None
+    format: Optional[str] = "markdown"
 
 class LLMAnswerResponse(BaseModel):
     answer: str
@@ -36,22 +32,16 @@ class LLMAnswerResponse(BaseModel):
 def build_prompt(ctx: Dict[str, Any], query: str, out_format: str = "markdown") -> List[Dict[str, str]]:
     site_ctx = ctx.get("site_ctx") or ""
     kb_ctx = ctx.get("kb_ctx") or ""
-    site_cites = ctx.get("site_citations") or []
-    kb_cites = ctx.get("kb_citations") or []
 
     system = (
         "You are a precise SEO/AEO assistant. Answer ONLY using the facts from the provided context. "
         "If something is not in the context, say you don’t have enough information. "
         "Cite sources inline as [S1]..[S8] and [K1]..[K6]. "
-        "Keep answers crisp, practical, and free of fluff."
+        "Keep answers crisp and practical."
     )
+    style_note = "Write in Markdown." if (out_format or "").lower() == "markdown" else "Write in plain text (no Markdown)."
 
-    style_note = (
-        "Write in Markdown." if out_format.lower() == "markdown" else "Write in plain text (no Markdown)."
-    )
-
-    user = f"""
-Query:
+    user = f"""Query:
 {query}
 
 --- SITE CONTEXT ---
@@ -61,17 +51,15 @@ Query:
 {kb_ctx}
 
 Instructions:
-- Answer succinctly.
-- Use inline citations where relevant, e.g., “[S2]”, “[K1]”.
-- End with a short “Sources” list (unique items), each as “ID — URL”.
-- If info is missing in context, state what’s missing briefly.
+- Be succinct.
+- Use inline citations like [S2] or [K1].
+- Finish with a short Sources list (unique), format: "ID — URL".
+- If info is missing, say what’s missing briefly.
 - {style_note}
 """.strip()
 
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user}
-    ]
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": user}]
 
 def _openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -80,17 +68,14 @@ def _openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 def _get_db_conn(request: Request):
-    # Verwacht dat je app een connection pool op app.state.pool heeft staan (psycopg)
     pool = getattr(request.app.state, "pool", None)
     if not pool:
+        # in main.py gebruiken we ConnectionPool; expose die op app.state
         raise RuntimeError("Database pool not available as app.state.pool")
     return pool.connection()
 
 @router.post("/llm/answer", response_model=LLMAnswerResponse)
-def llm_answer(
-    request: Request,
-    body: LLMAnswerRequest = Body(...)
-):
+def llm_answer(request: Request, body: LLMAnswerRequest = Body(...)):
     try:
         kb_tags = _to_list(body.kb_tags)
 
@@ -111,14 +96,11 @@ def llm_answer(
             messages=messages,
             timeout=OPENAI_TIMEOUT_SEC,
         )
-        answer = resp.choices[0].message.content.strip()
+        answer = (resp.choices[0].message.content or "").strip()
 
         return LLMAnswerResponse(
             answer=answer,
-            citations={
-                "site": ctx.get("site_citations", []),
-                "kb": ctx.get("kb_citations", []),
-            },
+            citations={"site": ctx.get("site_citations", []), "kb": ctx.get("kb_citations", [])},
             used={
                 "model": OPENAI_MODEL,
                 "query": body.query,
@@ -127,7 +109,6 @@ def llm_answer(
                 "char_used": ctx.get("char_used"),
             }
         )
-
     except HTTPException:
         raise
     except Exception as e:
