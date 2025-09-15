@@ -1,4 +1,3 @@
-# keywords_agent.py
 import os, json, re
 from typing import Dict, Any, List, Tuple
 import psycopg
@@ -23,10 +22,8 @@ def _rows_to_ctx(rows: List[dict], label: str) -> str:
     bits: List[str] = []
     for i, r in enumerate(rows):
         url = (r.get("url") or "").strip()
-        title = (r.get("title") or "").strip()
         content = (r.get("content") or "").strip()
-        pre = f"[{label.upper()} {i+1}] {url}"
-        if title: pre += f" • {title}"
+        pre = f"[{label.upper()} {i+1}] {url}" if url else f"[{label.upper()} {i+1}]"
         snippet = (content[:1200] + "…") if len(content) > 1200 else content
         if snippet:
             bits.append(pre + "\n" + snippet)
@@ -37,9 +34,10 @@ def _query_site_documents(conn, site_id: str, seed: str, k: int) -> List[dict]:
         qvec = _embed(seed)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, title, content
+                SELECT url, content
                   FROM documents
                  WHERE site_id = %s
+                   AND embedding IS NOT NULL
                  ORDER BY embedding <-> %s::vector
                  LIMIT %s
             """, (site_id, qvec, k))
@@ -55,7 +53,7 @@ def _query_kb(conn, seed: str, k: int) -> List[dict]:
         qvec = _embed(seed)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, title, content
+                SELECT url, content, title
                   FROM kb_documents
                  ORDER BY embedding <-> %s::vector
                  LIMIT %s
@@ -83,16 +81,15 @@ def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 8) -> str:
         bits: List[str] = []
         for p in pages[:max_pages]:
             url = p.get("final_url") or p.get("url") or ""
-            title = p.get("title") or ""
             h1 = p.get("h1") or ""
             h2 = " | ".join(p.get("h2") or [])
             h3 = " | ".join(p.get("h3") or [])
             meta = p.get("meta_description") or ""
             paras = " ".join((p.get("paragraphs") or [])[:2])
-            snippet = "\n".join([x for x in [url, title, h1, h2, h3, meta, paras] if x])
+            snippet = "\n".join([x for x in [url, h1, h2, h3, meta, paras] if x])
             if snippet.strip():
                 bits.append(snippet)
-        return "\n\n".join(bits).strip()
+        return "\n".join(bits).strip()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
@@ -127,7 +124,6 @@ def generate_keywords(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, 
     language = market.get("language") or "en"
     country  = market.get("country")  or "NL"
 
-    # Context ophalen
     site_rows = _query_site_documents(conn, site_id, seed, DOC_K)
     kb_rows   = _query_kb(conn, seed, KB_K)
     site_ctx  = _rows_to_ctx(site_rows, "site")
@@ -140,15 +136,14 @@ def generate_keywords(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, 
         ("CRAWL", crawl_ctx),
     )
 
-    # SYSTEM PROMPT (GEO + AEO bewust)
     sys = f"""
 You are an SEO+GEO strategist. Use ONLY the provided site context and KB excerpts.
 Target market: {country} ({language}).
 Goals:
-- Propose realistic queries people would use (web search + assistant prompts).
+- Propose realistic queries (web search + assistant prompts).
 - Favor topics/entities present in the context.
-- Include queries that lead to **citable, answer-first sections** (GEO/AEO).
-Output JSON only:
+- Include topics that lead to citable, answer-first sections (AEO).
+Output strict JSON:
 {{
   "keywords": [ "...", ... ],
   "clusters": {{
@@ -160,10 +155,7 @@ Output JSON only:
     {{ "page_title": "...", "grouped_keywords": ["...","..."], "notes": "what to answer first and what to prove" }}
   ]
 }}
-Constraints:
-- 20–50 total keywords.
-- Keep on-topic; no generic filler.
-- Prefer language/terms seen in context.
+Constraints: 20–50 total keywords, on-topic, terminology from context.
 """.strip()
 
     user = f"Seed/topic: {seed}\n\nContext:\n{ctx_text or '(no context)'}"
@@ -181,7 +173,6 @@ Constraints:
     except Exception:
         data = {"keywords": [], "clusters": {"informational":[],"transactional":[],"navigational":[]}, "suggestions": []}
 
-    # ban off-topic classes
     ban = re.compile(r"\b(home improvement|furniture|appliance|garden|decor|warranty|loan|sell a house|real estate)\b", re.I)
     def filt(xs: List[str]) -> List[str]:
         out = []
@@ -200,7 +191,6 @@ Constraints:
         "navigational": filt(clusters.get("navigational") or []),
     }
 
-    # Trim window 20–50
     if len(kws) < 20:
         extra = (clusters["informational"] + clusters["transactional"] + clusters["navigational"])
         for k in extra:
@@ -215,7 +205,7 @@ Constraints:
         "seed": seed,
         "language": language,
         "country": country,
-        "source_context": (ctx_used[0] if ctx_used else None),  # for backward compat
+        "source_context": (ctx_used[0] if ctx_used else None),
         "_context_used": (ctx_used or None),
         "keywords": kws,
         "clusters": clusters,
