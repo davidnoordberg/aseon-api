@@ -1,4 +1,3 @@
-# faq_agent.py
 import os, json, re, time
 from typing import Dict, Any, List, Tuple
 import psycopg
@@ -9,10 +8,9 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 
-# Context limieten (ruim, maar veilig)
 MAX_CTX_CHARS = int(os.getenv("FAQ_MAX_CTX_CHARS", "3500"))
-DOC_K = int(os.getenv("FAQ_DOC_TOPK", "5"))        # site documents
-KB_K  = int(os.getenv("FAQ_KB_TOPK", "4"))         # knowledge base
+DOC_K = int(os.getenv("FAQ_DOC_TOPK", "5"))
+KB_K  = int(os.getenv("FAQ_KB_TOPK", "4"))
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -24,10 +22,8 @@ def _rows_to_ctx(rows: List[dict], label: str) -> str:
     bits: List[str] = []
     for i, r in enumerate(rows):
         url = (r.get("url") or "").strip()
-        title = (r.get("title") or "").strip()
         content = (r.get("content") or "").strip()
-        pre = f"[{label.upper()} {i+1}] {url}"
-        if title: pre += f" • {title}"
+        pre = f"[{label.upper()} {i+1}] {url}" if url else f"[{label.upper()} {i+1}]"
         snippet = (content[:1000] + "…") if len(content) > 1000 else content
         if snippet:
             bits.append(pre + "\n" + snippet)
@@ -38,9 +34,10 @@ def _query_site_documents(conn, site_id: str, topic: str, k: int) -> List[dict]:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, title, content
+                SELECT url, content
                   FROM documents
                  WHERE site_id = %s
+                   AND embedding IS NOT NULL
                  ORDER BY embedding <-> %s::vector
                  LIMIT %s
             """, (site_id, qvec, k))
@@ -52,15 +49,11 @@ def _query_site_documents(conn, site_id: str, topic: str, k: int) -> List[dict]:
         return []
 
 def _query_kb(conn, topic: str, k: int) -> List[dict]:
-    """
-    Haal top-k KB documenten (globale kennis).
-    Vereist tabel: kb_documents(url,title,content,embedding,...)
-    """
     try:
         qvec = _embed(topic)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT url, title, content
+                SELECT url, content, title
                   FROM kb_documents
                  ORDER BY embedding <-> %s::vector
                  LIMIT %s
@@ -73,7 +66,6 @@ def _query_kb(conn, topic: str, k: int) -> List[dict]:
         return []
 
 def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
-    """ Pak laatste crawl-output als snapshot (fallback). """
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
@@ -89,11 +81,10 @@ def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
         bits: List[str] = []
         for p in pages[:max_pages]:
             url = p.get("final_url") or p.get("url") or ""
-            title = p.get("title") or ""
-            h1 = p.get("h1") or ""
             meta = p.get("meta_description") or ""
+            h1 = p.get("h1") or ""
             paras = " ".join((p.get("paragraphs") or [])[:2])
-            snippet = "\n".join([x for x in [url, title, h1, meta, paras] if x])
+            snippet = "\n".join([x for x in [url, h1, meta, paras] if x])
             if snippet.strip():
                 bits.append(snippet)
         return "\n\n".join(bits).strip()
@@ -103,15 +94,11 @@ def _fallback_crawl_snapshot(conn, site_id: str, max_pages: int = 6) -> str:
         print(json.dumps({"level":"WARN","msg":"faq_crawl_ctx_failed","error":str(e)[:300]}), flush=True)
         return ""
 
-def _trim_ctx(*chunks: str) -> Tuple[str, List[str]]:
+def _trim_ctx(*chunks: Tuple[str, str]) -> Tuple[str, List[str]]:
     used: List[str] = []
     buf: List[str] = []
     total = 0
-    labels_map = {
-        "SITE": "documents",
-        "KB": "kb",
-        "CRAWL": "crawl"
-    }
+    labels_map = {"SITE":"documents","KB":"kb","CRAWL":"crawl"}
     for label, text in chunks:
         if not text: continue
         t = text.strip()
@@ -120,14 +107,12 @@ def _trim_ctx(*chunks: str) -> Tuple[str, List[str]]:
         if total + add > MAX_CTX_CHARS:
             t = t[: max(0, MAX_CTX_CHARS - total)]
             add = len(t)
-        if add <= 0:
-            break
+        if add <= 0: break
         buf.append(t)
         total += add
         if label in labels_map and labels_map[label] not in used:
             used.append(labels_map[label])
-        if total >= MAX_CTX_CHARS:
-            break
+        if total >= MAX_CTX_CHARS: break
     return ("\n\n".join(buf), used)
 
 def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -141,17 +126,11 @@ def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     ctx_used: List[str] = []
 
     if use_context in ("auto", "documents", "kb", "crawl"):
-        # 1) Site documents (hoogste prioriteit)
         site_rows = _query_site_documents(conn, site_id, topic, DOC_K)
         site_ctx = _rows_to_ctx(site_rows, label="site")
-
-        # 2) KB (GEO/AEO/SEO best practices + crawler-richtlijnen)
         kb_rows = _query_kb(conn, topic, KB_K)
         kb_ctx = _rows_to_ctx(kb_rows, label="kb")
-
-        # 3) Crawl fallback
         crawl_ctx = _fallback_crawl_snapshot(conn, site_id, max_pages=6)
-
         ctx_text, ctx_used = _trim_ctx(
             ("SITE", site_ctx),
             ("KB",   kb_ctx),
@@ -160,17 +139,13 @@ def generate_faqs(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         ctx_text, ctx_used = "(no context)", []
 
-    # SYSTEM PROMPT
-    sys = f"""You write **concise, factual FAQs** grounded ONLY in the provided context.
-Your job is AEO/GEO-first: produce answers that are **directly quotable** and **citable** by assistants (ChatGPT/Perplexity/Claude/Copilot).
-Rules:
+    sys = f"""You write concise, factual FAQs grounded ONLY in the provided context.
+AEO/GEO-first: answers must be directly quotable and citable.
 - Exactly {count} QA pairs. Each answer ≤ {max_words} words.
-- Prefer facts that appear in the context. If not present, say you cannot answer.
-- If the context lines include URLs in square brackets like [SITE 1] https://..., include a "source" pointing to ONE best URL from those.
-- No marketing fluff; no hypotheticals. Be specific and verifiable.
+- Cite ONE best source URL when available from [SITE n] lines.
+- If info is missing, say you cannot answer.
 Return JSON ONLY:
-{{ "faqs": [{{"q":"...","a":"...","source":"<url or null>"}}...] }}
-"""
+{{ "faqs": [{{"q":"...","a":"...","source":"<url or null>"}}...] }}"""
 
     user = f"Topic: {topic}\n\nContext:\n{ctx_text or '(no context)'}"
 
@@ -188,7 +163,6 @@ Return JSON ONLY:
     except Exception:
         faqs = []
 
-    # sanitize + enforce word limit
     out_faqs = []
     for f in faqs[:count]:
         q = (f.get("q") or "").strip()
@@ -202,7 +176,6 @@ Return JSON ONLY:
         out_faqs.append({"q": q, "a": a, "source": src})
 
     if not out_faqs:
-        # deterministic fallback
         out_faqs = [{"q": f"What is {topic} ({i+1})?", "a": f"{topic.capitalize()} explained (stub).", "source": None} for i in range(count)]
 
     print(json.dumps({"level":"INFO","msg":"faq_generated","context_used":ctx_used,"n":len(out_faqs)}), flush=True)
