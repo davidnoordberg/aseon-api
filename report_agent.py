@@ -19,12 +19,11 @@ from reportlab.platypus import (
     Table,
     TableStyle,
     XPreformatted,
-    KeepTogether,
+    KeepInFrame,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from xml.sax.saxutils import escape as xml_escape
 
-# Optional LLM synthesis (safe fallback if it fails)
 from openai import OpenAI
 
 OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -71,13 +70,19 @@ def _fetch_site_meta(conn, site_id: str) -> Dict[str, Any]:
 # ---------------------------
 def _styles():
     styles = getSampleStyleSheet()
-    # Add custom styles with unique names to avoid collisions
+    # Custom, unique names to avoid "already defined" errors
     if "Small" not in styles.byName:
-        styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12))
+        styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, wordWrap="CJK"))
+    else:
+        styles["Small"].wordWrap = "CJK"
     if "Tiny" not in styles.byName:
-        styles.add(ParagraphStyle(name="Tiny", fontSize=8, leading=10))
-    if "MonoSmall" not in styles.byName:
-        styles.add(ParagraphStyle(name="MonoSmall", fontName="Courier", fontSize=8, leading=10))
+        styles.add(ParagraphStyle(name="Tiny", fontSize=8, leading=10, wordWrap="CJK"))
+    else:
+        styles["Tiny"].wordWrap = "CJK"
+    if "Mono" not in styles.byName:
+        styles.add(ParagraphStyle(name="Mono", fontName="Courier", fontSize=8, leading=10, wordWrap="CJK"))
+    else:
+        styles["Mono"].wordWrap = "CJK"
     if "H3tight" not in styles.byName:
         styles.add(ParagraphStyle(name="H3tight", parent=styles["Heading3"], spaceBefore=6, spaceAfter=4))
     return styles
@@ -89,9 +94,11 @@ def P(text: str, style_name: str = "Small") -> Paragraph:
     return Paragraph(safe, s[style_name])
 
 
-def Code(text: str) -> XPreformatted:
+def CodeBlock(text: str, max_width: float, max_height: float) -> KeepInFrame:
     s = _styles()
-    return XPreformatted(text or "", s["MonoSmall"])
+    pre = XPreformatted(text or "", s["Mono"])
+    # KeepInFrame will shrink-to-fit if needed
+    return KeepInFrame(max_width, max_height, content=[pre], mode="shrink")
 
 
 def _make_table(data: List[List[Any]], col_widths: List[float]) -> Table:
@@ -103,9 +110,10 @@ def _make_table(data: List[List[Any]], col_widths: List[float]) -> Table:
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#C8C8C8")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ALIGN", (-1, 1), (-1, -1), "LEFT"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 4),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("WORDWRAP", (0, 0), (-1, -1), "CJK"),
             ]
         )
     )
@@ -182,7 +190,6 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
         q = (item.get("q") or "").strip()
         a = (item.get("a") or "").strip()
         src = item.get("source")
-        # Check source presence
         if not src:
             out.append(
                 {
@@ -196,7 +203,6 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
                     ],
                 }
             )
-        # Check length (should be <= ~80 words by design)
         if len(a.split()) > 90:
             out.append(
                 {
@@ -216,11 +222,8 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
 def _geo_recommendations(site_meta: Dict[str, Any], schema_job: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     home = (site_meta.get("url") or "").strip() or "https://example.com/"
     present_type = (schema_job or {}).get("biz_type")
-    # We cannot safely verify on-page JSON-LD from the light crawler,
-    # so we frame these as **Recommendations** (not unverifiable “Findings”).
     recs: List[Dict[str, Any]] = []
 
-    # Organization + Logo + sameAs
     recs.append(
         {
             "url": home,
@@ -235,7 +238,6 @@ def _geo_recommendations(site_meta: Dict[str, Any], schema_job: Optional[Dict[st
         }
     )
 
-    # WebSite with site name consistency
     recs.append(
         {
             "url": home,
@@ -249,7 +251,6 @@ def _geo_recommendations(site_meta: Dict[str, Any], schema_job: Optional[Dict[st
         }
     )
 
-    # Breadcrumbs for sections / FAQ
     recs.append(
         {
             "url": home.rstrip("/") + "/faq",
@@ -264,8 +265,7 @@ def _geo_recommendations(site_meta: Dict[str, Any], schema_job: Optional[Dict[st
         }
     )
 
-    # If only FAQPage schema was generated earlier, note broader coverage
-    if present_type and present_type.lower() == "faqpage":
+    if present_type and str(present_type).lower() == "faqpage":
         recs.append(
             {
                 "url": home,
@@ -283,7 +283,6 @@ def _geo_recommendations(site_meta: Dict[str, Any], schema_job: Optional[Dict[st
 
 
 def _code_snippets(site_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Pre-baked JSON-LD blocks for Appendix."""
     home = (site_meta.get("url") or "").strip().rstrip("/") or "https://example.com"
     brand = site_meta.get("account_name") or "YourBrand"
 
@@ -311,7 +310,6 @@ def _code_snippets(site_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         "@type": "BreadcrumbList",
         "itemListElement": [
             {"@type": "ListItem", "position": 1, "name": "Home", "item": f"{home}/"},
-            # Extend per section pages
         ],
     }
 
@@ -370,26 +368,22 @@ def generate_report(conn, job):
     site_id = job["site_id"]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Inputs
     site_meta = _fetch_site_meta(conn, site_id)
     crawl = _fetch_latest_job(conn, site_id, "crawl")
     keywords = _fetch_latest_job(conn, site_id, "keywords")
     faq = _fetch_latest_job(conn, site_id, "faq")
     schema_job = _fetch_latest_job(conn, site_id, "schema")
 
-    # Build findings
     seo_rows = _seo_findings_from_crawl(crawl)
     aeo_rows = _aeo_findings_from_faq(faq)
     geo_rows = _geo_recommendations(site_meta, schema_job)
 
-    # Optional executive summary
     exec_summary = _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows) or (
         "This report lists concrete issues and recommendations across SEO (technical), "
         "GEO (entity/schema), and AEO (answer readiness). Items are prioritised with clear "
         "acceptance criteria so your team can ship fixes confidently."
     )
 
-    # --------- PDF ----------
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -417,6 +411,7 @@ def generate_report(conn, job):
         elems.append(Paragraph("No findings.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
+        # Fixed widths tuned to A4 minus margins (sum ~= width)
         colw = [0.26 * width, 0.24 * width, 0.10 * width, 0.20 * width, 0.20 * width]
         data = [headers]
         for r in seo_rows:
@@ -432,7 +427,7 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- GEO Recommendations (entity/schema) ---
+    # --- GEO Recommendations ---
     elems.append(Paragraph("GEO Recommendations", S["Heading2"]))
     headers = ["Page URL", "Recommendation", "Severity", "Fix (summary)", "Acceptance Criteria"]
     colw = [0.26 * width, 0.24 * width, 0.10 * width, 0.20 * width, 0.20 * width]
@@ -471,33 +466,32 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- Appendix: Code snippets to paste ---
+    # --- Appendix: JSON-LD snippets ---
     elems.append(Paragraph("Appendix — JSON-LD Snippets (paste & adapt)", S["Heading2"]))
+    max_code_height = 80 * mm
     for block in _code_snippets(site_meta):
         elems.append(Paragraph(block["title"], S["H3tight"]))
         pretty = json.dumps(block["json"], indent=2, ensure_ascii=False)
-        elems.append(KeepTogether([Code(pretty), Spacer(1, 6)]))
+        elems.append(CodeBlock(pretty, max_width=width, max_height=max_code_height))
+        elems.append(Spacer(1, 6))
 
-    # If schema job exists, include generated snippet truncated
     if schema_job and schema_job.get("schema"):
         elems.append(Paragraph("Generated (from jobs.schema)", S["H3tight"]))
         pretty = json.dumps(schema_job["schema"], indent=2, ensure_ascii=False)
-        elems.append(KeepTogether([Code(pretty[:4000]), Spacer(1, 6)]))
+        elems.append(CodeBlock(pretty[:8000], max_width=width, max_height=120 * mm))
+        elems.append(Spacer(1, 6))
 
-    doc.build(elems)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
+    # Optional Keywords appendix (brief)
+    if keywords and (keywords.get("keywords") or keywords.get("clusters")):
+        elems.append(PageBreak())
+        elems.append(Paragraph("Appendix — Keyword Suggestions (summary)", S["Heading2"]))
+        if keywords.get("keywords"):
+            elems.append(Paragraph(", ".join(keywords["keywords"][:40]), S["Small"]))
+        clusters = keywords.get("clusters") or {}
+        for k in ("informational", "transactional", "navigational"):
+            vals = clusters.get(k) or []
+            if vals:
+                elems.append(Paragraph(k.title(), S["H3tight"]))
+                elems.append(Paragraph(", ".join(vals[:30]), S["Small"]))
 
-    pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    return {
-        "pdf_base64": pdf_base64,
-        "meta": {
-            "site_id": str(site_id),
-            "generated_at": now,
-            "sections": {
-                "seo_findings": bool(seo_rows),
-                "geo_recommendations": bool(geo_rows),
-                "aeo_findings": bool(aeo_rows),
-            },
-        },
-    }
+    doc.build
