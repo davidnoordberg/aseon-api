@@ -35,7 +35,7 @@ def embed(text: str) -> List[float]:
             time.sleep(_retry_sleep(attempt))
     dim = 1536 if "small" in EMBED_MODEL else (3072 if "large" in EMBED_MODEL else 1536)
     print(json.dumps({"level":"ERROR","msg":"embed_failed","error":str(last_err)[:300]}), flush=True)
-    return [0.0]*dim
+    return [0.0] * dim
 
 def _parse_tags(tags: Optional[List[str]]) -> Optional[List[str]]:
     if not tags: return None
@@ -72,7 +72,7 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
                    AND COALESCE((metadata->>'status')::int, 0) = 200
                    AND length(content) > 200
                    AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
-                   AND url NOT ILIKE '%RESULTS_URL%'
+                   AND url NOT ILIKE '%%RESULTS_URL%%'
                  ORDER BY dist ASC
                  LIMIT %s
             """, (qvec, site_id, k))
@@ -93,7 +93,7 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
                        AND COALESCE((metadata->>'status')::int, 0) = 200
                        AND length(content) > 200
                        AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
-                       AND url NOT ILIKE '%RESULTS_URL%'
+                       AND url NOT ILIKE '%%RESULTS_URL%%'
                      LIMIT %s
                 """, (site_id, f"%{query}%", f"%{query}%", k))
                 rows = cur.fetchall()
