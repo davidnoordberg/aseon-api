@@ -1,10 +1,10 @@
+# llm.py
 import os
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request, Body
 from pydantic import BaseModel
 from openai import OpenAI
-
-from rag_helper import get_rag_context  # jij hebt dit bestand al
+from rag_helper import get_rag_context  # bestaat al
 
 router = APIRouter()
 
@@ -22,24 +22,22 @@ class LLMAnswerRequest(BaseModel):
     site_id: Optional[str] = None
     kb_tags: Optional[List[str]] = None
     context: Optional[Dict[str, Any]] = None
-    format: Optional[str] = "markdown"
+    format: Optional[str] = "markdown"  # "markdown" | "text"
 
 class LLMAnswerResponse(BaseModel):
     answer: str
     citations: Dict[str, Any]
     used: Dict[str, Any]
 
-def build_prompt(ctx: Dict[str, Any], query: str, out_format: str = "markdown") -> List[Dict[str, str]]:
+def build_prompt(ctx: Dict[str, Any], query: str, out_format: str = "markdown"):
     site_ctx = ctx.get("site_ctx") or ""
-    kb_ctx = ctx.get("kb_ctx") or ""
+    kb_ctx   = ctx.get("kb_ctx") or ""
 
     system = (
-        "You are a precise SEO/AEO assistant. Answer ONLY using the facts from the provided context. "
-        "If something is not in the context, say you don’t have enough information. "
-        "Cite sources inline as [S1]..[S8] and [K1]..[K6]. "
-        "Keep answers crisp and practical."
+        "You are a precise SEO/AEO assistant. Answer ONLY from the provided context. "
+        "Cite inline as [S1]..[S8] and [K1]..[K6]. If info is missing, say so."
     )
-    style_note = "Write in Markdown." if (out_format or "").lower() == "markdown" else "Write in plain text (no Markdown)."
+    style = "Write in Markdown." if (out_format or "").lower()=="markdown" else "Write in plain text."
 
     user = f"""Query:
 {query}
@@ -51,27 +49,22 @@ def build_prompt(ctx: Dict[str, Any], query: str, out_format: str = "markdown") 
 {kb_ctx}
 
 Instructions:
-- Be succinct.
-- Use inline citations like [S2] or [K1].
-- Finish with a short Sources list (unique), format: "ID — URL".
-- If info is missing, say what’s missing briefly.
-- {style_note}
-""".strip()
+- Be concise and practical.
+- Use inline citations like [S2], [K1].
+- End with a short 'Sources' list (unique IDs with URLs).
+- {style}
+"""
+    return [{"role":"system","content":system},{"role":"user","content":user}]
 
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": user}]
+def _client() -> OpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key: raise RuntimeError("OPENAI_API_KEY is not set")
+    return OpenAI(api_key=key)
 
-def _openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
-
-def _get_db_conn(request: Request):
+def _conn_from(request: Request):
     pool = getattr(request.app.state, "pool", None)
     if not pool:
-        # in main.py gebruiken we ConnectionPool; expose die op app.state
-        raise RuntimeError("Database pool not available as app.state.pool")
+        raise RuntimeError("app.state.pool missing")
     return pool.connection()
 
 @router.post("/llm/answer", response_model=LLMAnswerResponse)
@@ -84,30 +77,25 @@ def llm_answer(request: Request, body: LLMAnswerRequest = Body(...)):
         else:
             if not body.site_id:
                 raise HTTPException(status_code=400, detail="site_id required when no context is provided")
-            with _get_db_conn(request) as conn:
+            with _conn_from(request) as conn:
                 ctx = get_rag_context(conn, site_id=body.site_id, query=body.query, kb_tags=kb_tags)
 
         messages = build_prompt(ctx, body.query, body.format or "markdown")
 
-        client = _openai_client()
+        client = _client()
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
             messages=messages,
             timeout=OPENAI_TIMEOUT_SEC,
         )
-        answer = (resp.choices[0].message.content or "").strip()
+        answer = resp.choices[0].message.content.strip()
 
         return LLMAnswerResponse(
             answer=answer,
             citations={"site": ctx.get("site_citations", []), "kb": ctx.get("kb_citations", [])},
-            used={
-                "model": OPENAI_MODEL,
-                "query": body.query,
-                "kb_tags": kb_tags,
-                "char_budget": ctx.get("char_budget"),
-                "char_used": ctx.get("char_used"),
-            }
+            used={"model": OPENAI_MODEL, "query": body.query, "kb_tags": kb_tags,
+                  "char_budget": ctx.get("char_budget"), "char_used": ctx.get("char_used")}
         )
     except HTTPException:
         raise
