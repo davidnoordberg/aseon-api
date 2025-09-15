@@ -1,4 +1,3 @@
-# main.py
 import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
@@ -192,7 +191,7 @@ class SiteIn(BaseModel):
 class SiteOut(BaseModel):
     id: str; account_id: str; url: AnyHttpUrl; language: str; country: str; created_at: str
 
-JobType = Literal["crawl","keywords","faq","schema","report"]
+JobType = Literal["crawl","keywords","faq","schema","report","insight"]
 
 class JobIn(BaseModel):
     site_id: str
