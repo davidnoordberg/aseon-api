@@ -1,5 +1,7 @@
 # keywords_agent.py
-import os, json, re
+import os
+import json
+import re
 from typing import Dict, Any, List
 from openai import OpenAI
 
@@ -11,20 +13,24 @@ MAX_CTX_CHARS = int(os.getenv("KW_MAX_CTX_CHARS", "4000"))
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+
 def _dedupe_keep_order(xs: List[str]) -> List[str]:
     seen, out = set(), []
     for x in xs:
         k = (x or "").strip().lower()
-        if not k or k in seen: continue
-        seen.add(k); out.append((x or "").strip())
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append((x or "").strip())
     return out
+
 
 def generate_keywords(conn, site_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     seed = (payload or {}).get("seed") or "site"
     n = int((payload or {}).get("n", 30))
     market = (payload or {}).get("market", {}) or {}
     language = (market.get("language") or "en").lower()
-    country  = (market.get("country") or "NL").upper()
+    country  = (market.get("country")  or "NL").upper()
 
     site_rows = search_site_docs(conn, site_id, seed, k=8)
     kb_rows   = search_kb(conn, seed, k=6, tags=["Schema","SEO","AEO","Content","Quality"])
@@ -79,7 +85,7 @@ Rules:
         out = []
         for x in xs or []:
             s = (x or "").strip()
-            if not s or ban.search(s): 
+            if not s or ban.search(s):
                 continue
             out.append(s)
         return _dedupe_keep_order(out)
@@ -94,7 +100,8 @@ Rules:
 
     pool = clusters["informational"] + clusters["transactional"] + clusters["navigational"]
     for k in pool:
-        if len(kws) >= max(20, n): break
+        if len(kws) >= max(20, n):
+            break
         if k not in kws:
             kws.append(k)
     if len(kws) > 50:
