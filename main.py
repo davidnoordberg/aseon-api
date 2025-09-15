@@ -588,3 +588,10 @@ def rag_context(site_id: str = Query(...),
         "kb_tags": tags_list,
         **ctx
     }
+
+@app.get("/rag/sample_prompt")
+def rag_sample_prompt(
+    role: str = "You are a helpful SEO assistant. Use the provided context and cite sources like [S1] or [K2].",
+    style: str = "Concise, factual, 1-2 paragraphs."
+):
+    return {"system": role, "style": style, "how_to_cite": "Cite inline like [S1] or [K2]."}
