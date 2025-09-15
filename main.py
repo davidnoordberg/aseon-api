@@ -3,7 +3,7 @@ import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, AnyHttpUrl, Field, EmailStr
@@ -11,9 +11,6 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from openai import OpenAI
-
-# << belangrijk: deze regel activeert /llm/answer >>
-from llm import router as llm_router
 
 # -----------------------------------------------------------------------------
 # Config
@@ -32,10 +29,23 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Aseon API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
-app.state.pool = pool  # <-- maak de pool beschikbaar voor llm.py
+app.state.pool = pool  # <-- maak de pool beschikbaar voor (fallback) llm endpoint
 
-# registreer de LLM router
-app.include_router(llm_router)
+# ----------------------- Probeer /llm/answer te includen ---------------------
+_llm_include_ok = False
+try:
+    # << belangrijk: deze import activeert /llm/answer via llm.py >>
+    from llm import router as llm_router
+    app.include_router(llm_router)
+    _llm_include_ok = True
+except Exception as _e:
+    print(json.dumps({"level":"ERROR","msg":"llm_router_import_failed","error":str(_e)[:300]}), flush=True)
+
+def _route_exists(path: str) -> bool:
+    try:
+        return any(getattr(r, "path", "") == path for r in app.routes)
+    except Exception:
+        return False
 
 # -----------------------------------------------------------------------------
 # DB bootstrap
@@ -239,6 +249,9 @@ def start():
         c.execute(SQL); c.commit()
         c.execute(SQL_ALTER); c.commit()
         _maybe_build_vector_indexes(c)
+    # Log alle routes en fail-fast als /llm/answer ontbreekt (zonder fallback)
+    paths = sorted([getattr(r, "path", "") for r in app.routes])
+    print(json.dumps({"level":"INFO","msg":"startup_routes","paths":paths}), flush=True)
 
 # -----------------------------------------------------------------------------
 # Core endpoints
@@ -248,9 +261,14 @@ def health():
     try:
         with pool.connection() as c:
             c.execute("SELECT 1;")
-        return {"ok": True, "db": True}
+        # Meld ook of /llm/answer aanwezig is
+        return {"ok": True, "db": True, "llm_answer": _route_exists("/llm/answer")}
     except Exception:
-        return {"ok": False, "db": False}
+        return {"ok": False, "db": False, "llm_answer": _route_exists("/llm/answer")}
+
+@app.get("/__routes")
+def __routes():
+    return sorted([getattr(r, "path", "") for r in app.routes])
 
 @app.post("/accounts", response_model=AccountOut)
 def create_account(body: AccountIn):
@@ -553,3 +571,75 @@ def rag_sample_prompt(
     style: str = "Concise, factual, 1-2 paragraphs."
 ):
     return {"system": role, "style": style, "how_to_cite": "Cite inline like [S1] or [K2]."}
+
+# -----------------------------------------------------------------------------
+# Fallback /llm/answer (alleen als router niet aanwezig is)
+# -----------------------------------------------------------------------------
+class _LLMAnswerRequest(BaseModel):
+    query: str
+    site_id: Optional[str] = None
+    kb_tags: Optional[List[str]] = None
+    context: Optional[Dict[str, Any]] = None
+    format: Optional[str] = "markdown"  # "markdown" | "text"
+
+class _LLMAnswerResponse(BaseModel):
+    answer: str
+    citations: Dict[str, Any]
+    used: Dict[str, Any]
+
+def _build_llm_messages(ctx: Dict[str, Any], query: str, out_format: str = "markdown"):
+    site_ctx = ctx.get("site_ctx") or ""
+    kb_ctx   = ctx.get("kb_ctx") or ""
+    system = (
+        "You are a precise SEO/AEO assistant. Answer ONLY from the provided context. "
+        "Cite inline as [S1]..[S8] and [K1]..[K6]. If info is missing, say so."
+    )
+    style = "Write in Markdown." if (out_format or "").lower()=="markdown" else "Write in plain text."
+    user = f"""Query:
+{query}
+
+--- SITE CONTEXT ---
+{site_ctx}
+
+--- KB CONTEXT ---
+{kb_ctx}
+
+Instructions:
+- Be concise and practical.
+- Use inline citations like [S2], [K1].
+- End with a short 'Sources' list (unique IDs with URLs).
+- {style}
+"""
+    return [{"role":"system","content":system},{"role":"user","content":user}]
+
+if not _route_exists("/llm/answer"):
+    @app.post("/llm/answer", response_model=_LLMAnswerResponse)
+    def llm_answer_fallback(request: Request, body: _LLMAnswerRequest = Body(...)):
+        try:
+            kb_tags = [x.strip() for x in (body.kb_tags or []) if x and x.strip()]
+            if body.context:
+                ctx = body.context
+            else:
+                if not body.site_id:
+                    raise HTTPException(status_code=400, detail="site_id required when no context is provided")
+                with request.app.state.pool.connection() as conn:
+                    ctx = _get_rag_context(conn, site_id=body.site_id, query=body.query, kb_tags=kb_tags)
+
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            resp = client.chat.completions.create(
+                model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                temperature=0.2,
+                messages=_build_llm_messages(ctx, body.query, body.format or "markdown"),
+                timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "30")),
+            )
+            answer = resp.choices[0].message.content.strip()
+            return _LLMAnswerResponse(
+                answer=answer,
+                citations={"site": ctx.get("site_citations", []), "kb": ctx.get("kb_citations", [])},
+                used={"model": os.getenv("LLM_MODEL","gpt-4o-mini"), "query": body.query, "kb_tags": kb_tags,
+                      "char_budget": ctx.get("char_budget"), "char_used": ctx.get("char_used")}
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"llm_answer_failed(fallback): {str(e)[:300]}")
