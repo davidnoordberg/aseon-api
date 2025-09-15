@@ -124,11 +124,32 @@ def _shorten(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     return (s[: max_chars - 1] + "…") if len(s) > max_chars else s
 
+def _attr_escape(s: str) -> str:
+    """Escape voor attribuut-waarden (zoals content="...")."""
+    return xml_escape(s or "").replace('"', "&quot;")
+
 # -----------------------------------------------------
 # Findings builders
 # -----------------------------------------------------
+def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reduceer naar unieke, genormaliseerde URL's. Kies per URL de 'beste' variant:
+    status=200 gaat voor, vervolgens hoogste word_count.
+    """
+    bucket: Dict[str, Dict[str, Any]] = {}
+    def _score(pp: Dict[str, Any]) -> tuple:
+        return (1 if (pp.get("status") == 200) else 0, int(pp.get("word_count") or 0))
+    for p in pages or []:
+        u = _norm_url(p.get("final_url") or p.get("url") or "")
+        if not u:
+            continue
+        cur = bucket.get(u)
+        if (cur is None) or (_score(p) > _score(cur)):
+            bucket[u] = p
+    return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
+
 def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
-    inlinks = {}
+    inlinks: Dict[str, int] = {}
     url_index = {}
     for p in pages:
         u = _norm_url(p.get("final_url") or p.get("url") or "")
@@ -150,10 +171,162 @@ def _dup_map(values: List[Optional[str]]) -> Dict[str, int]:
         counts[k] = counts.get(k, 0) + 1
     return counts
 
+def _propose_copy(url: str,
+                  title: Optional[str],
+                  h1: Optional[str],
+                  meta: Optional[str],
+                  h2_list: Optional[List[str]],
+                  h3_list: Optional[List[str]],
+                  paras: Optional[List[str]]) -> Dict[str, str]:
+    """
+    Genereer voorstellen voor title/meta/H1-intro.
+    Werkt met LLM als key aanwezig is; anders deterministische fallback.
+    """
+    base = (h1 or title or "").strip()
+    fallback = {
+        "title": (base[:60] if base else "Homepage"),
+        "meta":  ("Korte, duidelijke samenvatting van de pagina. Vertel de kern in één zin en nodig uit tot doorklikken.")[:155],
+        "h1_alt": (h1 or title or "Welkom"),
+        "intro": "Antwoord eerst in 1–2 zinnen wat de bezoeker hier kan doen en waarom dit relevant is."
+    }
+    if not _openai_client:
+        return fallback
+
+    ctx_bits: List[str] = []
+    if h1: ctx_bits.append(f"H1: {h1}")
+    if title: ctx_bits.append(f"Title: {title}")
+    if meta: ctx_bits.append(f"Meta: {meta}")
+    for h in (h2_list or [])[:3]:
+        ctx_bits.append(f"H2: {h}")
+    for h in (h3_list or [])[:2]:
+        ctx_bits.append(f"H3: {h}")
+    for p in (paras or [])[:2]:
+        ctx_bits.append(f"P: {p}")
+
+    sys = (
+        "Je schrijft compacte webkopie in het Nederlands. "
+        "Maak een <title> (≤60 tekens) en een meta description (140–155 tekens) "
+        "op basis van de context. Stel ook een H1-variant voor die niet identiek is aan de title "
+        "en een korte intro (1–2 zinnen) die antwoord-first is. "
+        "Retourneer JSON: {\"title\":\"...\",\"meta\":\"...\",\"h1_alt\":\"...\",\"intro\":\"...\"}."
+    )
+    user = f"URL: {url}\nCONTEXT:\n" + "\n".join(ctx_bits)[:1200]
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.2,
+            timeout=OPENAI_TIMEOUT_SEC,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        )
+        data = json.loads(resp.choices[0].message.content)
+        title_out = (data.get("title") or fallback["title"]).strip()[:60]
+        meta_out = re.sub(r"\s+", " ", (data.get("meta") or fallback["meta"]).strip())
+        # knip veilig af rond 155–160
+        if len(meta_out) > 160:
+            meta_out = meta_out[:160]
+        return {
+            "title": title_out,
+            "meta": meta_out,
+            "h1_alt": (data.get("h1_alt") or fallback["h1_alt"]).strip(),
+            "intro": (data.get("intro") or fallback["intro"]).strip(),
+        }
+    except Exception:
+        return fallback
+
+def _build_text_findings(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Per pagina: detecteer tekstuele issues (title/meta/H1/low-text) en geef huidige tekst + voorstel.
+    """
+    if not crawl:
+        return []
+    pages = _unique_pages(crawl.get("pages") or [])
+
+    # duplicaten op basis van unieke set
+    title_counts = _dup_map([p.get("title") for p in pages if p.get("status") == 200])
+    meta_counts  = _dup_map([p.get("meta_description") for p in pages if p.get("status") == 200])
+
+    rows: List[Dict[str, Any]] = []
+    for p in pages:
+        url = _norm_url(p.get("final_url") or p.get("url") or "")
+        title = (p.get("title") or "").strip()
+        h1 = (p.get("h1") or "").strip()
+        meta = (p.get("meta_description") or "").strip()
+        h2_list = p.get("h2") or []
+        h3_list = p.get("h3") or []
+        paras = p.get("paragraphs") or []
+        wc = int(p.get("word_count") or 0)
+
+        need_title = (not title) or len(title) < 30 or len(title) > 65 or title_counts.get(title.lower(), 0) > 1
+        need_meta  = (not meta) or len(meta)  < 70 or len(meta)  > 180 or meta_counts.get(meta.lower(), 0) > 1
+        h1_eq_title = bool(title and h1 and h1.strip().lower() == title.strip().lower())
+        low_text = (wc and wc < 250)
+
+        if not any([need_title, need_meta, h1_eq_title, low_text]):
+            continue
+
+        prop = _propose_copy(url, title, h1, meta, h2_list, h3_list, paras)
+
+        if need_title:
+            reason = []
+            if not title: reason.append("ontbreekt")
+            if title and (len(title) < 30 or len(title) > 65): reason.append("lengte suboptimaal")
+            if title and title_counts.get(title.lower(), 0) > 1: reason.append("dubbel op site")
+            rows.append({
+                "url": url,
+                "field": "title",
+                "problem": ", ".join(reason),
+                "current": title or "(leeg)",
+                "proposed": prop["title"],
+                "html_patch": f"<title>{xml_escape(prop['title'])}</title>"
+            })
+
+        if need_meta:
+            reason = []
+            # let op: voor accept hanteren we 140–160, maar de detectie liet 70–180 toe om noise te vermijden
+            if not meta: reason.append("ontbreekt")
+            if meta and (len(meta) < 140 or len(meta) > 160): reason.append("lengte suboptimaal")
+            if meta and meta_counts.get(meta.lower(), 0) > 1: reason.append("dubbel op site")
+            md = prop["meta"]
+            rows.append({
+                "url": url,
+                "field": "meta_description",
+                "problem": ", ".join(reason),
+                "current": meta or "(leeg)",
+                "proposed": md,
+                "html_patch": f"<meta name=\"description\" content=\"{_attr_escape(md)}\">"
+            })
+
+        if h1_eq_title:
+            h1_alt = prop["h1_alt"]
+            rows.append({
+                "url": url,
+                "field": "h1",
+                "problem": "H1 is identiek aan title",
+                "current": h1,
+                "proposed": h1_alt,
+                "html_patch": f"<h1>{xml_escape(h1_alt)}</h1>"
+            })
+
+        if low_text:
+            intro = prop["intro"]
+            rows.append({
+                "url": url,
+                "field": "intro_paragraph",
+                "problem": "weinig zichtbare tekst (<250 woorden)",
+                "current": (paras[0] if paras else "(geen zichtbare paragraaf)"),
+                "proposed": intro,
+                "html_patch": f"<p>{xml_escape(intro)}</p>"
+            })
+
+    return rows
+
 def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not crawl:
         return []
-    pages = crawl.get("pages") or []
+    # gebruik unieke pagina’s om ruis te verminderen
+    pages = _unique_pages(crawl.get("pages") or [])
     inlinks = _build_link_graph(pages)
     title_counts = _dup_map([p.get("title") for p in pages if p.get("status") == 200])
     meta_counts  = _dup_map([p.get("meta_description") for p in pages if p.get("status") == 200])
@@ -192,7 +365,7 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                 add("Title length suboptimal", "medium",
                     "Keep <title> between ~30–65 chars; lead with primary intent/entity.",
                     ["30–65 chars", "Primary intent first"])
-            if title_counts.get(title.strip().lower(), 0) > 1:
+            if title_counts.get((title or "").strip().lower(), 0) > 1:
                 add("Duplicate <title>", "high",
                     "Make the title unique per page; differentiate with intent or entities.",
                     ["Titles unique site-wide"])
@@ -207,7 +380,7 @@ def _seo_findings_from_crawl(crawl: Optional[Dict[str, Any]]) -> List[Dict[str, 
                 add("Meta description length suboptimal", "low",
                     "Aim for ~140–160 chars; avoid truncation and thin summaries.",
                     ["~140–160 chars"])
-            if meta_counts.get(md.strip().lower(), 0) > 1:
+            if meta_counts.get((md or "").strip().lower(), 0) > 1:
                 add("Duplicate meta description", "medium",
                     "Rewrite to reflect page’s unique value; avoid reuse.",
                     ["Descriptions unique site-wide"])
@@ -418,6 +591,7 @@ def generate_report(conn, job):
     schema_job = _fetch_latest_job(conn, site_id, "schema")
 
     # Findings
+    text_rows = _build_text_findings(crawl)
     seo_rows = _seo_findings_from_crawl(crawl)
     aeo_rows = _aeo_findings_from_faq(faq, crawl)
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
@@ -449,6 +623,33 @@ def generate_report(conn, job):
     elems.append(Paragraph(f"Generated: {now}", S["Normal"]))
     elems.append(Spacer(1, 8))
     elems.append(Paragraph(exec_summary, S["Small"]))
+    elems.append(PageBreak())
+
+    # --- TEXT ISSUES & FIXES ---
+    elems.append(Paragraph("Tekstfouten & fixes (per pagina)", S["Heading2"]))
+    if not text_rows:
+        elems.append(Paragraph("Geen tekstuele problemen gevonden in titels/meta/H1/intro.", S["Normal"]))
+    else:
+        headers = ["Page URL", "Veld", "Probleem", "Huidig", "Voorstel (ready-to-paste)"]
+        colw = [0.23 * width, 0.10 * width, 0.15 * width, 0.24 * width, 0.28 * width]
+        data = [headers]
+        for r in text_rows:
+            data.append([
+                P(_shorten(r["url"], 120)),
+                P(r["field"]),
+                P(r["problem"], "Tiny"),
+                P(_shorten(str(r.get("current","")), 300), "Tiny"),
+                P(_shorten(str(r.get("proposed","")), 300), "Tiny"),
+            ])
+        elems.append(_make_table(data, colw))
+        elems.append(Spacer(1, 6))
+        elems.append(Paragraph("HTML-patch (kopieer & plak):", S["Small"]))
+        for r in text_rows[:6]:  # toon de eerste 6 patches beknopt
+            elems.append(KeepTogether([
+                P(f"{r['field']} — {r['url']}", "Tiny"),
+                Code(r["html_patch"]),
+                Spacer(1, 4)
+            ]))
     elems.append(PageBreak())
 
     # --- SEO Findings ---
@@ -551,6 +752,7 @@ def generate_report(conn, job):
             "site_id": str(site_id),
             "generated_at": now,
             "sections": {
+                "text_fixes": bool(text_rows),
                 "seo_findings": bool(seo_rows),
                 "geo_recommendations": bool(geo_rows),
                 "aeo_findings": bool(aeo_rows),
