@@ -1,4 +1,4 @@
-import os, json, hashlib, traceback
+import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -94,8 +94,6 @@ CREATE TABLE IF NOT EXISTS kb_documents (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS kb_tags_idx ON kb_documents USING gin (tags);
-
--- Dedupe op KB (kan ontbreken in oudere installs; daarom los als ALTER/INDEX)
 """
 
 SQL_ALTER = """
@@ -106,7 +104,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS kb_dedup ON kb_documents(url, content_hash);
 def _maybe_build_vector_indexes(conn) -> None:
     """
     Bouw HNSW-indexen alleen als env 'BUILD_VECTOR_INDEXES' truthy is.
-    Dit voorkomt startup-crashes op beperkte DB's.
     """
     if str(os.getenv("BUILD_VECTOR_INDEXES", "0")).lower() not in ("1","true","yes","on"):
         return
@@ -139,6 +136,10 @@ def _embed(text: str) -> List[float]:
 
 def _hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+def _trim(s: str, max_chars: int = 1200) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    return s[:max_chars]
 
 def normalize_url(u: str) -> str:
     if not u: return u
@@ -343,7 +344,7 @@ def kb_bulk_insert(body: KBBulkIn):
     with pool.connection() as c, c.cursor() as cur:
         for d in body.docs:
             content = (d.content or "").strip()
-            if not content: 
+            if not content:
                 skipped += 1
                 continue
             chash = _hash(content)
@@ -411,3 +412,179 @@ def kb_delete(kb_id: str):
             raise HTTPException(status_code=404, detail="KB document not found")
         c.commit()
     return {"deleted": kb_id}
+
+# -----------------------------------------------------------------------------
+# SITE DOCS LIST + RAG CONTEXT
+# -----------------------------------------------------------------------------
+def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> List[Dict[str, Any]]:
+    """
+    Vector-zoek als er een query is; anders meest recente docs.
+    Fallback: ILIKE op content/url.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        if query and query.strip():
+            try:
+                qvec = _embed(query)
+                cur.execute("""
+                    SELECT url,
+                           LEFT(content, 1000) AS snippet,
+                           metadata,
+                           last_seen,
+                           created_at
+                      FROM documents
+                     WHERE site_id=%s AND embedding IS NOT NULL
+                  ORDER BY embedding <-> %s::vector
+                     LIMIT %s
+                """, (site_id, qvec, k))
+                rows = cur.fetchall()
+                if rows:
+                    return rows
+            except Exception as e:
+                try: conn.rollback()
+                except Exception: pass
+                print(json.dumps({"level":"WARN","msg":"site_vec_failed","error":str(e)[:200]}), flush=True)
+
+            # Fallback LIKE
+            try:
+                cur.execute("""
+                    SELECT url,
+                           LEFT(content, 1000) AS snippet,
+                           metadata,
+                           last_seen,
+                           created_at
+                      FROM documents
+                     WHERE site_id=%s AND (content ILIKE %s OR url ILIKE %s)
+                     LIMIT %s
+                """, (site_id, f"%{query}%", f"%{query}%", k))
+                return cur.fetchall()
+            except Exception as e:
+                try: conn.rollback()
+                except Exception: pass
+                print(json.dumps({"level":"ERROR","msg":"site_like_failed","error":str(e)[:200]}), flush=True)
+                return []
+        else:
+            # Geen query: toon recentste
+            cur.execute("""
+                SELECT url,
+                       LEFT(content, 1000) AS snippet,
+                       metadata,
+                       last_seen,
+                       created_at
+                  FROM documents
+                 WHERE site_id=%s
+              ORDER BY COALESCE(last_seen, created_at) DESC
+                 LIMIT %s
+            """, (site_id, k))
+            return cur.fetchall()
+
+def _search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Probeer vector
+        try:
+            qvec = _embed(query)
+            if tags:
+                cur.execute("""
+                    SELECT title, url, source, tags, content
+                      FROM kb_documents
+                     WHERE tags && %s
+                  ORDER BY embedding <-> %s::vector
+                     LIMIT %s
+                """, (tags, qvec, k))
+            else:
+                cur.execute("""
+                    SELECT title, url, source, tags, content
+                      FROM kb_documents
+                  ORDER BY embedding <-> %s::vector
+                     LIMIT %s
+                """, (qvec, k))
+            rows = cur.fetchall()
+            if rows:
+                return rows
+        except Exception as e:
+            try: conn.rollback()
+            except Exception: pass
+            print(json.dumps({"level":"WARN","msg":"kb_vec_failed","error":str(e)[:200]}), flush=True)
+
+        # Fallback LIKE
+        if tags:
+            cur.execute("""
+                SELECT title, url, source, tags, content
+                  FROM kb_documents
+                 WHERE tags && %s AND (content ILIKE %s OR title ILIKE %s)
+                 LIMIT %s
+            """, (tags, f"%{query}%", f"%{query}%", k))
+        else:
+            cur.execute("""
+                SELECT title, url, source, tags, content
+                  FROM kb_documents
+                 WHERE (content ILIKE %s OR title ILIKE %s)
+                 LIMIT %s
+            """, (f"%{query}%", f"%{query}%", k))
+        return cur.fetchall()
+
+def _build_context(site_rows: List[Dict[str, Any]], kb_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    site_bits, kb_bits = [], []
+    site_cites, kb_cites = [], []
+
+    for i, r in enumerate(site_rows[:8]):
+        sid = f"S{i+1}"
+        site_cites.append({"id": sid, "url": r.get("url")})
+        site_bits.append(f"[{sid}] {r.get('url')}\n{_trim(r.get('snippet') or '')}")
+
+    for i, r in enumerate(kb_rows[:6]):
+        kid = f"K{i+1}"
+        title = r.get("title") or (r.get("source") or "KB")
+        kb_cites.append({"id": kid, "url": r.get("url"), "title": title})
+        kb_bits.append(f"[{kid}] {title} — {r.get('url')}\n{_trim(r.get('content') or '')}")
+
+    return {
+        "site_ctx": "\n\n".join(site_bits),
+        "kb_ctx": "\n\n".join(kb_bits),
+        "site_citations": site_cites,
+        "kb_citations": kb_cites
+    }
+
+def _get_rag_context(conn, site_id: str, query: str,
+                     k_site: int = 8, k_kb: int = 6,
+                     kb_tags: Optional[List[str]] = None) -> Dict[str, Any]:
+    srows = _search_site_docs(conn, site_id, query, k=k_site)
+    krows = _search_kb(conn, query, k=k_kb, tags=kb_tags)
+    return _build_context(srows, krows)
+
+@app.get("/sites/{site_id}/docs")
+def list_site_docs(site_id: str,
+                   q: Optional[str] = Query(None, description="optional search query"),
+                   limit: int = 20):
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+    with pool.connection() as c:
+        rows = _search_site_docs(c, site_id, q, k=limit)
+    # Compact output
+    out = []
+    for r in rows:
+        out.append({
+            "url": r.get("url"),
+            "snippet": r.get("snippet"),
+            "last_seen": iso(r.get("last_seen")),
+            "created_at": iso(r.get("created_at")),
+            "issues": (r.get("metadata") or {}).get("issues")
+        })
+    return {"items": out, "count": len(out), "site_id": site_id, "q": q}
+
+@app.get("/rag/context")
+def rag_context(site_id: str = Query(...),
+                q: str = Query(..., min_length=2),
+                k_site: int = 8,
+                k_kb: int = 6,
+                kb_tags: Optional[str] = Query(None, description="comma-separated tag filter for KB, e.g. 'Schema,SEO'")):
+    if k_site < 1 or k_site > 20 or k_kb < 0 or k_kb > 20:
+        raise HTTPException(status_code=400, detail="k_site 1..20, k_kb 0..20")
+    tags_list = [t.strip() for t in kb_tags.split(",")] if kb_tags else None
+    with pool.connection() as c:
+        ctx = _get_rag_context(c, site_id, q, k_site=k_site, k_kb=k_kb, kb_tags=tags_list)
+    return {
+        "site_id": site_id,
+        "query": q,
+        "kb_tags": tags_list,
+        **ctx
+    }
