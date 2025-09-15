@@ -1,6 +1,7 @@
 import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,35 +11,37 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from openai import OpenAI
 
+# << belangrijk: deze regel activeert /llm/answer >>
 from llm import router as llm_router
 
-app.include_router(llm_router)  # ← dit is de enige call die erbij komt
-
 # -----------------------------------------------------------------------------
-# Config / Clients
+# Config
 # -----------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title="Aseon API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
 
+# registreer de LLM router
+app.include_router(llm_router)
+
 # -----------------------------------------------------------------------------
-# DB bootstrap (idempotent). Vector-indexen via HNSW optioneel (zie _maybe_build_vector_indexes).
+# DB bootstrap
 # -----------------------------------------------------------------------------
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Accounts
 CREATE TABLE IF NOT EXISTS accounts (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name TEXT NOT NULL,
@@ -46,7 +49,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Sites
 CREATE TABLE IF NOT EXISTS sites (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -56,7 +58,6 @@ CREATE TABLE IF NOT EXISTS sites (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Jobs
 CREATE TABLE IF NOT EXISTS jobs (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -70,7 +71,6 @@ CREATE TABLE IF NOT EXISTS jobs (
   output JSONB
 );
 
--- Site content chunks (RAG bron)
 CREATE TABLE IF NOT EXISTS documents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -86,7 +86,6 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE UNIQUE INDEX IF NOT EXISTS doc_dedup ON documents(site_id, url, content_hash);
 CREATE INDEX IF NOT EXISTS doc_by_site ON documents(site_id);
 
--- Curated knowledge base (normatieve docs)
 CREATE TABLE IF NOT EXISTS kb_documents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   source TEXT,
@@ -106,9 +105,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS kb_dedup ON kb_documents(url, content_hash);
 """
 
 def _maybe_build_vector_indexes(conn) -> None:
-    """
-    Bouw HNSW-indexen alleen als env 'BUILD_VECTOR_INDEXES' truthy is.
-    """
     if str(os.getenv("BUILD_VECTOR_INDEXES", "0")).lower() not in ("1","true","yes","on"):
         return
     try:
@@ -217,7 +213,6 @@ class JobOut(BaseModel):
     error: Optional[str] = None
     output: Optional[Dict[str, Any]] = None
 
-# KB API models
 class KBDocIn(BaseModel):
     source: Optional[str] = None
     url: Optional[AnyHttpUrl] = None
@@ -337,9 +332,7 @@ def get_site_latest(site_id: str, types: str = Query(..., description="comma-sep
             out[t] = row if row else None
     return out
 
-# -----------------------------------------------------------------------------
-# KB endpoints (bulk insert / search / list / delete)
-# -----------------------------------------------------------------------------
+# ----------------------------- KB endpoints ----------------------------------
 @app.post("/kb/docs")
 def kb_bulk_insert(body: KBBulkIn):
     if not body.docs:
@@ -364,14 +357,11 @@ def kb_bulk_insert(body: KBBulkIn):
                     VALUES (%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (url, content_hash) DO NOTHING
                 """, (d.source, str(d.url) if d.url else None, d.title, d.tags, content, vec, chash))
-                if cur.rowcount > 0:
-                    inserted += 1
-                else:
-                    skipped += 1
+                if cur.rowcount > 0: inserted += 1
+                else: skipped += 1
             except Exception as e:
                 print(json.dumps({"level":"ERROR","msg":"kb_insert_failed","error":str(e)[:200]}), flush=True)
-                c.rollback()
-                skipped += 1
+                c.rollback(); skipped += 1
         c.commit()
     return {"inserted": inserted, "skipped": skipped}
 
@@ -382,10 +372,7 @@ def kb_search(q: str = Query(..., min_length=2), k: int = 6, tags: Optional[str]
         qvec = _embed(q)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
-    sql = """
-        SELECT id, source, url, title, tags, LEFT(content, 800) AS snippet
-          FROM kb_documents
-    """
+    sql = "SELECT id, source, url, title, tags, LEFT(content, 800) AS snippet FROM kb_documents"
     params: List[Any] = []
     if tag_list:
         sql += " WHERE tags && %s"
@@ -417,45 +404,28 @@ def kb_delete(kb_id: str):
         c.commit()
     return {"deleted": kb_id}
 
-# -----------------------------------------------------------------------------
-# SITE DOCS LIST + RAG CONTEXT
-# -----------------------------------------------------------------------------
+# --------------------------- SITE DOCS + RAG ---------------------------------
 def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> List[Dict[str, Any]]:
-    """
-    Vector-zoek als er een query is; anders meest recente docs.
-    Fallback: ILIKE op content/url.
-    """
     with conn.cursor(row_factory=dict_row) as cur:
         if query and query.strip():
             try:
                 qvec = _embed(query)
                 cur.execute("""
-                    SELECT url,
-                           LEFT(content, 1000) AS snippet,
-                           metadata,
-                           last_seen,
-                           created_at
+                    SELECT url, LEFT(content, 1000) AS snippet, metadata, last_seen, created_at
                       FROM documents
                      WHERE site_id=%s AND embedding IS NOT NULL
                   ORDER BY embedding <-> %s::vector
                      LIMIT %s
                 """, (site_id, qvec, k))
                 rows = cur.fetchall()
-                if rows:
-                    return rows
+                if rows: return rows
             except Exception as e:
                 try: conn.rollback()
                 except Exception: pass
                 print(json.dumps({"level":"WARN","msg":"site_vec_failed","error":str(e)[:200]}), flush=True)
-
-            # Fallback LIKE
             try:
                 cur.execute("""
-                    SELECT url,
-                           LEFT(content, 1000) AS snippet,
-                           metadata,
-                           last_seen,
-                           created_at
+                    SELECT url, LEFT(content, 1000) AS snippet, metadata, last_seen, created_at
                       FROM documents
                      WHERE site_id=%s AND (content ILIKE %s OR url ILIKE %s)
                      LIMIT %s
@@ -467,13 +437,8 @@ def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> 
                 print(json.dumps({"level":"ERROR","msg":"site_like_failed","error":str(e)[:200]}), flush=True)
                 return []
         else:
-            # Geen query: toon recentste
             cur.execute("""
-                SELECT url,
-                       LEFT(content, 1000) AS snippet,
-                       metadata,
-                       last_seen,
-                       created_at
+                SELECT url, LEFT(content, 1000) AS snippet, metadata, last_seen, created_at
                   FROM documents
                  WHERE site_id=%s
               ORDER BY COALESCE(last_seen, created_at) DESC
@@ -483,7 +448,6 @@ def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> 
 
 def _search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     with conn.cursor(row_factory=dict_row) as cur:
-        # Probeer vector
         try:
             qvec = _embed(query)
             if tags:
@@ -502,14 +466,11 @@ def _search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -
                      LIMIT %s
                 """, (qvec, k))
             rows = cur.fetchall()
-            if rows:
-                return rows
+            if rows: return rows
         except Exception as e:
             try: conn.rollback()
             except Exception: pass
             print(json.dumps({"level":"WARN","msg":"kb_vec_failed","error":str(e)[:200]}), flush=True)
-
-        # Fallback LIKE
         if tags:
             cur.execute("""
                 SELECT title, url, source, tags, content
@@ -529,18 +490,15 @@ def _search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -
 def _build_context(site_rows: List[Dict[str, Any]], kb_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     site_bits, kb_bits = [], []
     site_cites, kb_cites = [], []
-
     for i, r in enumerate(site_rows[:8]):
         sid = f"S{i+1}"
         site_cites.append({"id": sid, "url": r.get("url")})
         site_bits.append(f"[{sid}] {r.get('url')}\n{_trim(r.get('snippet') or '')}")
-
     for i, r in enumerate(kb_rows[:6]):
         kid = f"K{i+1}"
         title = r.get("title") or (r.get("source") or "KB")
         kb_cites.append({"id": kid, "url": r.get("url"), "title": title})
         kb_bits.append(f"[{kid}] {title} — {r.get('url')}\n{_trim(r.get('content') or '')}")
-
     return {
         "site_ctx": "\n\n".join(site_bits),
         "kb_ctx": "\n\n".join(kb_bits),
@@ -563,7 +521,6 @@ def list_site_docs(site_id: str,
         raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
     with pool.connection() as c:
         rows = _search_site_docs(c, site_id, q, k=limit)
-    # Compact output
     out = []
     for r in rows:
         out.append({
@@ -580,18 +537,13 @@ def rag_context(site_id: str = Query(...),
                 q: str = Query(..., min_length=2),
                 k_site: int = 8,
                 k_kb: int = 6,
-                kb_tags: Optional[str] = Query(None, description="comma-separated tag filter for KB, e.g. 'Schema,SEO'")):
+                kb_tags: Optional[str] = Query(None, description="comma-separated like 'Schema,SEO'")):
     if k_site < 1 or k_site > 20 or k_kb < 0 or k_kb > 20:
         raise HTTPException(status_code=400, detail="k_site 1..20, k_kb 0..20")
     tags_list = [t.strip() for t in kb_tags.split(",")] if kb_tags else None
     with pool.connection() as c:
         ctx = _get_rag_context(c, site_id, q, k_site=k_site, k_kb=k_kb, kb_tags=tags_list)
-    return {
-        "site_id": site_id,
-        "query": q,
-        "kb_tags": tags_list,
-        **ctx
-    }
+    return {"site_id": site_id, "query": q, "kb_tags": tags_list, **ctx}
 
 @app.get("/rag/sample_prompt")
 def rag_sample_prompt(
