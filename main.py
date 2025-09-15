@@ -12,14 +12,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from openai import OpenAI
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set")
@@ -29,12 +26,10 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Aseon API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
-app.state.pool = pool  # <-- maak de pool beschikbaar voor (fallback) llm endpoint
+app.state.pool = pool
 
-# ----------------------- Probeer /llm/answer te includen ---------------------
 _llm_include_ok = False
 try:
-    # << belangrijk: deze import activeert /llm/answer via llm.py >>
     from llm import router as llm_router
     app.include_router(llm_router)
     _llm_include_ok = True
@@ -47,9 +42,6 @@ def _route_exists(path: str) -> bool:
     except Exception:
         return False
 
-# -----------------------------------------------------------------------------
-# DB bootstrap
-# -----------------------------------------------------------------------------
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -138,9 +130,6 @@ def _maybe_build_vector_indexes(conn) -> None:
         except Exception: pass
         print(json.dumps({"level":"WARN","msg":"vector_index_build_failed","error":str(e)}), flush=True)
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 def _embed(text: str) -> List[float]:
     text = (text or "").strip()
     resp = openai_client.embeddings.create(model=EMBED_MODEL, input=[text])
@@ -187,9 +176,6 @@ def job_json(r: dict) -> dict:
         "output": r.get("output")
     }
 
-# -----------------------------------------------------------------------------
-# Pydantic models
-# -----------------------------------------------------------------------------
 class AccountIn(BaseModel):
     name: str = Field(min_length=1)
     email: EmailStr
@@ -235,9 +221,6 @@ class KBDocIn(BaseModel):
 class KBBulkIn(BaseModel):
     docs: List[KBDocIn]
 
-# -----------------------------------------------------------------------------
-# Error handler + startup
-# -----------------------------------------------------------------------------
 @app.exception_handler(Exception)
 def unhandled(request: Request, exc: Exception):
     print("UNHANDLED ERROR:", repr(exc)); traceback.print_exc()
@@ -249,19 +232,14 @@ def start():
         c.execute(SQL); c.commit()
         c.execute(SQL_ALTER); c.commit()
         _maybe_build_vector_indexes(c)
-    # Log alle routes en fail-fast als /llm/answer ontbreekt (zonder fallback)
     paths = sorted([getattr(r, "path", "") for r in app.routes])
     print(json.dumps({"level":"INFO","msg":"startup_routes","paths":paths}), flush=True)
 
-# -----------------------------------------------------------------------------
-# Core endpoints
-# -----------------------------------------------------------------------------
 @app.get("/healthz")
 def health():
     try:
         with pool.connection() as c:
             c.execute("SELECT 1;")
-        # Meld ook of /llm/answer aanwezig is
         return {"ok": True, "db": True, "llm_answer": _route_exists("/llm/answer")}
     except Exception:
         return {"ok": False, "db": False, "llm_answer": _route_exists("/llm/answer")}
@@ -352,7 +330,6 @@ def get_site_latest(site_id: str, types: str = Query(..., description="comma-sep
             out[t] = row if row else None
     return out
 
-# ----------------------------- KB endpoints ----------------------------------
 @app.post("/kb/docs")
 def kb_bulk_insert(body: KBBulkIn):
     if not body.docs:
@@ -424,7 +401,6 @@ def kb_delete(kb_id: str):
         c.commit()
     return {"deleted": kb_id}
 
-# --------------------------- SITE DOCS + RAG ---------------------------------
 def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> List[Dict[str, Any]]:
     with conn.cursor(row_factory=dict_row) as cur:
         if query and query.strip():
@@ -438,18 +414,20 @@ def _search_site_docs(conn, site_id: str, query: Optional[str], k: int = 20) -> 
                      LIMIT %s
                 """, (site_id, qvec, k))
                 rows = cur.fetchall()
-                if rows: return rows
+                if rows:
+                    return rows
             except Exception as e:
                 try: conn.rollback()
                 except Exception: pass
                 print(json.dumps({"level":"WARN","msg":"site_vec_failed","error":str(e)[:200]}), flush=True)
             try:
+                like_pattern = f"%{query}%"
                 cur.execute("""
                     SELECT url, LEFT(content, 1000) AS snippet, metadata, last_seen, created_at
                       FROM documents
                      WHERE site_id=%s AND (content ILIKE %s OR url ILIKE %s)
                      LIMIT %s
-                """, (site_id, f"%{query}%", f"%{query}%", k))
+                """, (site_id, like_pattern, like_pattern, k))
                 return cur.fetchall()
             except Exception as e:
                 try: conn.rollback()
@@ -486,25 +464,27 @@ def _search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) -
                      LIMIT %s
                 """, (qvec, k))
             rows = cur.fetchall()
-            if rows: return rows
+            if rows:
+                return rows
         except Exception as e:
             try: conn.rollback()
             except Exception: pass
             print(json.dumps({"level":"WARN","msg":"kb_vec_failed","error":str(e)[:200]}), flush=True)
+        like_pattern = f"%{query}%"
         if tags:
             cur.execute("""
                 SELECT title, url, source, tags, content
                   FROM kb_documents
                  WHERE tags && %s AND (content ILIKE %s OR title ILIKE %s)
                  LIMIT %s
-            """, (tags, f"%{query}%", f"%{query}%", k))
+            """, (tags, like_pattern, like_pattern, k))
         else:
             cur.execute("""
                 SELECT title, url, source, tags, content
                   FROM kb_documents
                  WHERE (content ILIKE %s OR title ILIKE %s)
                  LIMIT %s
-            """, (f"%{query}%", f"%{query}%", k))
+            """, (like_pattern, like_pattern, k))
         return cur.fetchall()
 
 def _build_context(site_rows: List[Dict[str, Any]], kb_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -572,15 +552,12 @@ def rag_sample_prompt(
 ):
     return {"system": role, "style": style, "how_to_cite": "Cite inline like [S1] or [K2]."}
 
-# -----------------------------------------------------------------------------
-# Fallback /llm/answer (alleen als router niet aanwezig is)
-# -----------------------------------------------------------------------------
 class _LLMAnswerRequest(BaseModel):
     query: str
     site_id: Optional[str] = None
     kb_tags: Optional[List[str]] = None
     context: Optional[Dict[str, Any]] = None
-    format: Optional[str] = "markdown"  # "markdown" | "text"
+    format: Optional[str] = "markdown"
 
 class _LLMAnswerResponse(BaseModel):
     answer: str
