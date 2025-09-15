@@ -1,3 +1,4 @@
+# main.py
 import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
@@ -31,6 +32,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Aseon API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
+app.state.pool = pool  # <-- maak de pool beschikbaar voor llm.py
 
 # registreer de LLM router
 app.include_router(llm_router)
