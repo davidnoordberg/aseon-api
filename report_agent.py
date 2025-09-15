@@ -1,8 +1,8 @@
+import os
 import base64
 import io
 import json
 from datetime import datetime, timezone
-import os
 
 from psycopg.rows import dict_row
 from reportlab.lib.pagesizes import A4
@@ -20,14 +20,11 @@ from reportlab.lib import colors
 from openai import OpenAI
 from rag_helper import get_rag_context
 
-OPENAI_MODEL = "gpt-4o-mini"
-OPENAI_TIMEOUT_SEC = 30
+OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-# -----------------------------------------------------
-# DB helpers
-# -----------------------------------------------------
 def _fetch_latest_job(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -58,12 +55,9 @@ def _fetch_site_meta(conn, site_id):
         return cur.fetchone() or {}
 
 
-# -----------------------------------------------------
-# LLM synthesis
-# -----------------------------------------------------
 def _safe(obj, maxlen=4000):
     try:
-        s = json.dumps(obj) if not isinstance(obj, str) else obj
+        s = json.dumps(obj, ensure_ascii=False) if not isinstance(obj, str) else obj
         return s[:maxlen]
     except Exception:
         return str(obj)[:maxlen]
@@ -82,13 +76,13 @@ SITE:
 - url: {site_meta.get('url') or ''} ({site_meta.get('language') or ''}-{site_meta.get('country') or ''})
 
 INPUTS (summaries; truncate applied):
-- CRAWL: { _safe(crawl, 4000) if crawl else "null" }
-- KEYWORDS: { _safe(keywords, 4000) if keywords else "null" }
-- FAQ: { _safe(faq, 4000) if faq else "null" }
-- SCHEMA: { _safe(schema, 4000) if schema else "null" }
+- CRAWL: {_safe(crawl, 4000) if crawl else "null"}
+- KEYWORDS: {_safe(keywords, 4000) if keywords else "null"}
+- FAQ: {_safe(faq, 4000) if faq else "null"}
+- SCHEMA: {_safe(schema, 4000) if schema else "null"}
 
 KB CONTEXT (for policy/best-practice grounding):
-{ rag.get('kb_ctx') or '' }
+{rag.get('kb_ctx') or ''}
 
 Return STRICT JSON with:
 {{
@@ -127,7 +121,7 @@ Return STRICT JSON with:
 Rules:
 - Use ONLY info derivable from inputs/KB. If unknown, omit.
 - Max 10 actions. Keep why_it_matters short and concrete.
-"""
+""".strip()
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -154,9 +148,6 @@ Rules:
         }
 
 
-# -----------------------------------------------------
-# Report generation
-# -----------------------------------------------------
 def generate_report(conn, job):
     site_id = job["site_id"]
     payload = job.get("payload", {}) or {}
@@ -172,26 +163,32 @@ def generate_report(conn, job):
 
     synth = _llm_synthesis(site_meta, crawl, keywords, faq, schema, rag)
 
-    # PDF
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Code", fontName="Courier", fontSize=8))
+    mono_name = "Mono"
+    if mono_name not in styles.byName:
+        styles.add(ParagraphStyle(name=mono_name, fontName="Courier", fontSize=8, leading=10))
+
     elems = []
 
-    elems.append(Paragraph(synth["summary"]["title"], styles["Title"]))
+    title = synth.get("summary", {}).get("title") or "SEO • GEO • AEO Audit"
+    exec_sum = synth.get("summary", {}).get("executive") or ""
+    scores = synth.get("summary", {}).get("scores", {}) or {}
+
+    elems.append(Paragraph(title, styles["Title"]))
     elems.append(Paragraph(f"Generated at: {now}", styles["Normal"]))
     elems.append(Spacer(1, 12))
-    elems.append(Paragraph(synth["summary"]["executive"], styles["Normal"]))
+    if exec_sum:
+        elems.append(Paragraph(exec_sum, styles["Normal"]))
     elems.append(PageBreak())
 
-    # Score table
-    scores = synth["summary"]["scores"]
     seo = scores.get("seo", {}) or {}
     geo = scores.get("geo", {}) or {}
     aeo = scores.get("aeo", {}) or {}
+    overall = scores.get("overall_score", 0)
 
-    data = [
+    table_data = [
         ["Pillar / Metric", "Score (1–10)"],
         ["SEO — Technical Health", seo.get("technical_health", 0)],
         ["SEO — Content Quality", seo.get("content_quality", 0)],
@@ -200,15 +197,16 @@ def generate_report(conn, job):
         ["GEO — E-E-A-T / Authority", geo.get("eeat_authority", 0)],
         ["AEO — Answer Readiness", aeo.get("answer_readiness", 0)],
         ["AEO — Citation Readiness", aeo.get("citation_readiness", 0)],
-        ["Overall", scores.get("overall_score", 0)],
+        ["Overall", overall],
     ]
-    table = Table(data, colWidths=[300, 80])
+    table = Table(table_data, colWidths=[300, 80])
     table.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                 ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ]
         )
     )
@@ -216,20 +214,30 @@ def generate_report(conn, job):
     elems.append(table)
     elems.append(PageBreak())
 
-    # Actions
+    actions = synth.get("prioritized_actions", []) or []
     elems.append(Paragraph("Prioritized Actions", styles["Heading2"]))
-    for act in synth.get("prioritized_actions", []):
-        elems.append(Paragraph(f"- {act['title']} ({act['impact']}/{act['effort']})", styles["Heading3"]))
-        elems.append(Paragraph(act.get("why_it_matters", ""), styles["Normal"]))
-        ac = act.get("acceptance_criteria") or []
-        if ac:
-            elems.append(Paragraph("Acceptance Criteria:", styles["Italic"]))
-            for c in ac:
-                elems.append(Paragraph(f"• {c}", styles["Normal"]))
-        elems.append(Spacer(1, 8))
+    if actions:
+        for act in actions[:10]:
+            elems.append(Paragraph(f"- {act.get('title','')}", styles["Heading3"]))
+            why = act.get("why_it_matters") or ""
+            impact = act.get("impact") or ""
+            effort = act.get("effort") or ""
+            owner = act.get("owner_hint") or ""
+            meta_line = " • ".join([x for x in [impact, effort, owner] if x])
+            if meta_line:
+                elems.append(Paragraph(meta_line, styles["Italic"]))
+            if why:
+                elems.append(Paragraph(why, styles["Normal"]))
+            ac = act.get("acceptance_criteria") or []
+            if ac:
+                elems.append(Paragraph("Acceptance Criteria:", styles["Italic"]))
+                for c in ac:
+                    elems.append(Paragraph(f"• {c}", styles["Normal"]))
+            elems.append(Spacer(1, 8))
+    else:
+        elems.append(Paragraph("No prioritized actions available.", styles["Normal"]))
     elems.append(PageBreak())
 
-    # Risks
     risks = synth.get("key_risks") or []
     if risks:
         elems.append(Paragraph("Key Risks", styles["Heading2"]))
@@ -237,11 +245,10 @@ def generate_report(conn, job):
             elems.append(Paragraph(f"- {r}", styles["Normal"]))
         elems.append(PageBreak())
 
-    # Crawl quick wins (appendix)
-    if crawl:
+    if crawl and crawl.get("quick_wins"):
         elems.append(Paragraph("Crawl Quick Wins", styles["Heading2"]))
-        for win in crawl.get("quick_wins", []):
-            elems.append(Paragraph(f"- {win['type']}", styles["Normal"]))
+        for win in crawl["quick_wins"]:
+            elems.append(Paragraph(f"- {win.get('type','')}", styles["Normal"]))
         elems.append(PageBreak())
 
     doc.build(elems)
@@ -259,7 +266,7 @@ def generate_report(conn, job):
                 "keywords": bool(keywords),
                 "faq": bool(faq),
                 "schema": bool(schema),
-                "synthesis": bool(synth),
+                "synthesis": True,
             },
         },
     }
