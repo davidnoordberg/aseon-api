@@ -6,7 +6,7 @@ from openai import OpenAI
 from random import random
 from urllib.parse import urlsplit, urlunsplit
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 CONTEXT_CHAR_BUDGET = int(os.getenv("RAG_CHAR_BUDGET", "9000"))
@@ -61,6 +61,7 @@ def _collapse_by_url(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    exclude_like = "%RESULTS_URL%"
     try:
         qvec = embed(query)
         with conn.cursor(row_factory=dict_row) as cur:
@@ -69,13 +70,13 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
                   FROM documents
                  WHERE site_id=%s
                    AND embedding IS NOT NULL
-                   AND COALESCE((metadata->>'status')::int, 0) = 200
+                   AND COALESCE((metadata->>'status')::int, 200) = 200
                    AND length(content) > 200
                    AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
-                   AND url NOT ILIKE '%%RESULTS_URL%%'
+                   AND url NOT ILIKE %s
                  ORDER BY dist ASC
                  LIMIT %s
-            """, (qvec, site_id, k))
+            """, (qvec, site_id, exclude_like, k))
             rows = cur.fetchall()
     except Exception as e:
         try: conn.rollback()
@@ -84,18 +85,19 @@ def search_site_docs(conn, site_id: str, query: str, k: int = 8) -> List[Dict[st
 
     if not rows:
         try:
+            like_pattern = f"%{query}%"
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT url, content, metadata
                       FROM documents
                      WHERE site_id=%s
                        AND (content ILIKE %s OR url ILIKE %s)
-                       AND COALESCE((metadata->>'status')::int, 0) = 200
+                       AND COALESCE((metadata->>'status')::int, 200) = 200
                        AND length(content) > 200
                        AND url !~ '(?i)\\.(png|jpe?g|gif|svg|webp|ico)$'
-                       AND url NOT ILIKE '%%RESULTS_URL%%'
+                       AND url NOT ILIKE %s
                      LIMIT %s
-                """, (site_id, f"%{query}%", f"%{query}%", k))
+                """, (site_id, like_pattern, like_pattern, exclude_like, k))
                 rows = cur.fetchall()
         except Exception as e:
             try: conn.rollback()
@@ -129,13 +131,14 @@ def search_kb(conn, query: str, k: int = 6, tags: Optional[List[str]] = None) ->
 
     if not rows:
         try:
+            like = f"%{query}%"
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(f"""
                     SELECT title, url, source, tags, content
                       FROM kb_documents
                       {where + (' AND ' if where else ' WHERE ')} (content ILIKE %s OR title ILIKE %s)
                      LIMIT %s
-                """, (*params, f"%{query}%", f"%{query}%", k) if tags else (f"%{query}%", f"%{query}%", k))
+                """, (*params, like, like, k) if tags else (like, like, k))
                 rows = cur.fetchall()
         except Exception as e:
             try: conn.rollback()
