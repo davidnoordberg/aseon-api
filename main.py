@@ -1,4 +1,4 @@
-import os, json, hashlib, traceback, re, uuid
+import os, json, hashlib, traceback, re
 from typing import Optional, Literal, Any, Dict, List
 from datetime import datetime
 
@@ -40,12 +40,6 @@ def _route_exists(path: str) -> bool:
         return any(getattr(r, "path", "") == path for r in app.routes)
     except Exception:
         return False
-
-def _require_uuid(val: str, field: str):
-    try:
-        uuid.UUID(str(val))
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"{field} must be a UUID")
 
 SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -197,7 +191,7 @@ class SiteIn(BaseModel):
 class SiteOut(BaseModel):
     id: str; account_id: str; url: AnyHttpUrl; language: str; country: str; created_at: str
 
-JobType = Literal["crawl","keywords","faq","schema","report","aeo"]
+JobType = Literal["crawl","keywords","faq","schema","report","insight","aeo"]
 
 class JobIn(BaseModel):
     site_id: str
@@ -274,7 +268,6 @@ def get_account_by_email(email: EmailStr = Query(...)):
 
 @app.post("/sites", response_model=SiteOut)
 def create_site(body: SiteIn):
-    _require_uuid(body.account_id, "account_id")
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM accounts WHERE id=%s",(body.account_id,))
         if not cur.fetchone(): raise HTTPException(status_code=400, detail="account_id does not exist")
@@ -288,7 +281,6 @@ def create_site(body: SiteIn):
 
 @app.post("/jobs", response_model=JobOut)
 def create_job(body: JobIn):
-    _require_uuid(body.site_id, "site_id")
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM sites WHERE id=%s",(body.site_id,))
         if not cur.fetchone(): raise HTTPException(status_code=400, detail="site_id does not exist")
@@ -302,7 +294,6 @@ def create_job(body: JobIn):
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str):
-    _require_uuid(job_id, "job_id")
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("""
             SELECT id,site_id,type,payload,status,created_at,started_at,finished_at,error,output
@@ -314,7 +305,6 @@ def get_job(job_id: str):
 
 @app.get("/jobs/{job_id}/output")
 def get_job_output(job_id: str):
-    _require_uuid(job_id, "job_id")
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("SELECT output FROM jobs WHERE id=%s",(job_id,))
         row = cur.fetchone()
@@ -322,8 +312,7 @@ def get_job_output(job_id: str):
         return row["output"] or {}
 
 @app.get("/sites/{site_id}/latest")
-def get_site_latest(site_id: str, types: str = Query(..., description="comma-separated e.g. crawl,keywords,faq,schema,aeo,report")):
-    _require_uuid(site_id, "site_id")
+def get_site_latest(site_id: str, types: str = Query(..., description="comma-separated e.g. crawl,keywords,faq,schema")):
     wanted = [t.strip() for t in types.split(",") if t.strip()]
     if not wanted: raise HTTPException(status_code=400, detail="No types provided")
     out: Dict[str, Any] = {}
@@ -404,7 +393,6 @@ def kb_list(limit: int = 50, offset: int = 0):
 
 @app.delete("/kb/{kb_id}")
 def kb_delete(kb_id: str):
-    _require_uuid(kb_id, "kb_id")
     with pool.connection() as c, c.cursor() as cur:
         cur.execute("DELETE FROM kb_documents WHERE id=%s", (kb_id,))
         if cur.rowcount == 0:
@@ -526,9 +514,8 @@ def _get_rag_context(conn, site_id: str, query: str,
 
 @app.get("/sites/{site_id}/docs")
 def list_site_docs(site_id: str,
-                   q: Optional:str := Query(None, description="optional search query"),
+                   q: Optional[str] = Query(None, description="optional search query"),
                    limit: int = 20):
-    _require_uuid(site_id, "site_id")
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
     with pool.connection() as c:
@@ -550,7 +537,6 @@ def rag_context(site_id: str = Query(...),
                 k_site: int = 8,
                 k_kb: int = 6,
                 kb_tags: Optional[str] = Query(None, description="comma-separated like 'Schema,SEO'")):
-    _require_uuid(site_id, "site_id")
     if k_site < 1 or k_site > 20 or k_kb < 0 or k_kb > 20:
         raise HTTPException(status_code=400, detail="k_site 1..20, k_kb 0..20")
     tags_list = [t.strip() for t in kb_tags.split(",")] if kb_tags else None
@@ -612,7 +598,6 @@ if not _route_exists("/llm/answer"):
             else:
                 if not body.site_id:
                     raise HTTPException(status_code=400, detail="site_id required when no context is provided")
-                _require_uuid(body.site_id, "site_id")
                 with request.app.state.pool.connection() as conn:
                     ctx = _get_rag_context(conn, site_id=body.site_id, query=body.query, kb_tags=kb_tags)
 
