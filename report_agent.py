@@ -595,8 +595,8 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
                 "url": (crawl or {}).get("start_url") or "",
                 "finding": "No FAQPage schema detected",
                 "severity": "medium",
-                "fix": "Add compact FAQ blocks (3–6 Q/As) on relevant pages with FAQPage JSON-LD.",
-                "accept": ["Rich Results Test: valid FAQPage", "Answers ≤80 words", "Each item has source link"],
+                "fix": "Add a compact FAQ block on the dedicated FAQ page and include matching FAQPage JSON-LD.",
+                "accept": ["Rich Results Test: valid FAQPage", "Answers ≤80 words", "JSON-LD matches visible Q&A on the FAQ page"],
             }
         )
     return out
@@ -614,35 +614,40 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
         issues = page.get("issues") or []
         metrics = page.get("metrics") or {}
         qas = int(metrics.get("qas") or 0)
+        ptype = (page.get("type") or "other").lower()
 
         for iss in issues:
             s = (iss or "").lower()
             if "too few q&a" in s:
-                out.append({
-                    "url": url,
-                    "finding": "Too few Q&A on page",
-                    "severity": "medium" if qas > 0 else "high",
-                    "fix": "Add 3–6 concise Q&A with answers ≤80 words; cover the core intents of the page.",
-                    "accept": ["≥3 Q&A present", "Each answer ≤80 words", "Lead sentence contains the answer"],
-                })
+                # Alleen relevant wanneer het om een FAQ-pagina gaat
+                if ptype == "faq":
+                    out.append({
+                        "url": url,
+                        "finding": "Too few Q&A on page",
+                        "severity": "medium" if qas > 0 else "high",
+                        "fix": "Add 3–6 concise Q&A with answers ≤80 words; cover the core intents of the page.",
+                        "accept": ["≥3 Q&A present", "Each answer ≤80 words", "Lead sentence contains the answer"],
+                    })
             elif "no faqpage json-ld" in s:
-                out.append({
-                    "url": url,
-                    "finding": "No FAQPage JSON-LD",
-                    "severity": "medium",
-                    "fix": "Add valid FAQPage JSON-LD matching on-page Q&A.",
-                    "accept": ["Rich Results Test: valid FAQPage", "JSON-LD matches visible questions/answers"],
-                })
+                if ptype == "faq":
+                    out.append({
+                        "url": url,
+                        "finding": "No FAQPage JSON-LD",
+                        "severity": "medium",
+                        "fix": "Add valid FAQPage JSON-LD matching on-page Q&A.",
+                        "accept": ["Rich Results Test: valid FAQPage", "JSON-LD matches visible questions/answers"],
+                    })
             elif "some answers >80 words" in s:
-                out.append({
-                    "url": url,
-                    "finding": "Overlong FAQ answers",
-                    "severity": "low",
-                    "fix": "Trim answers to ≤80 words; lead with the answer and keep nouns/verbs concrete.",
-                    "accept": ["All answers ≤80 words", "Answer appears in sentence 1"],
-                })
+                if ptype == "faq":
+                    out.append({
+                        "url": url,
+                        "finding": "Overlong FAQ answers",
+                        "severity": "low",
+                        "fix": "Trim answers to ≤80 words; lead with the answer and keep nouns/verbs concrete.",
+                        "accept": ["All answers ≤80 words", "Answer appears in sentence 1"],
+                    })
 
-        if qas == 0:
+        if qas == 0 and ptype == "faq":
             out.append({
                 "url": url,
                 "finding": "No Q&A section on page",
@@ -656,6 +661,32 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
 # -----------------------------------------------------
 # AEO concrete (from aeo job) -> scorecards, Q&A rows, patches, plan_items
 # -----------------------------------------------------
+def _task_texts_for_content(field: str, lang: str) -> Tuple[str, str]:
+    nl = lang == "nl"
+    f = (field or "").lower()
+    mapping = {
+        "hero": ("Hero section", "Answer-first headline + subhead + primary CTA."),
+        "subhead": ("Subhead", "Clarify value in one sentence."),
+        "value_props": ("Value props", "3–4 concrete benefits in bullets."),
+        "steps": ("Process steps", "3–5 simple steps to success."),
+        "proof": ("Social proof", "Logos, quotes, stats to build trust."),
+        "ctas": ("Calls to action", "Primary/secondary next steps."),
+        "intro_paragraph": ("Intro paragraph", "Short, answer-first intro."),
+    }
+    if nl:
+        mapping = {
+            "hero": ("Hero-sectie", "Antwoord-first kop + subhead + primaire CTA."),
+            "subhead": ("Subhead", "Verduidelijk de waarde in één zin."),
+            "value_props": ("Value props", "3–4 concrete voordelen in bullets."),
+            "steps": ("Stappenplan", "3–5 eenvoudige stappen naar resultaat."),
+            "proof": ("Social proof", "Logo’s, quotes, stats voor vertrouwen."),
+            "ctas": ("CTA’s", "Primaire/secundaire vervolgstappen."),
+            "intro_paragraph": ("Intro-alinea", "Korte, antwoord-first intro."),
+        }
+    label, why = mapping.get(f, (("Content patch", "Improve clarity and conversion.") if not nl else ("Content patch", "Verbeter duidelijkheid en conversie.")))
+    return label, why
+
+
 def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     rows = []
     patches = []
@@ -668,18 +699,21 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for page in (aeo.get("pages") or []):
         url = page.get("url")
         lang = page.get("lang") or "en"
+        ptype = (page.get("type") or "other").lower()
         score = int(page.get("score") or 0)
         issues = page.get("issues") or []
         metrics = page.get("metrics") or {}
-        scorecards.append({"url": url, "score": score, "issues": issues, "metrics": metrics})
+        scorecards.append({"url": url, "type": ptype, "score": score, "issues": issues, "metrics": metrics})
 
-        for qa in (page.get("qas") or []):
-            rows.append({"url": url, "q": qa.get("q"), "a": qa.get("a"), "gaps": ", ".join(issues) or "OK"})
+        # Q&A alleen tonen voor FAQ-pagina’s
+        if ptype == "faq":
+            for qa in (page.get("qas") or []):
+                rows.append({"url": url, "q": qa.get("q"), "a": qa.get("a"), "gaps": ", ".join(issues) or "OK"})
 
+        # FAQ patches alleen als type == faq
         faq_html = page.get("faq_html") or ""
         faq_jsonld = page.get("faq_jsonld") or {}
-
-        if faq_html.strip():
+        if ptype == "faq" and faq_html.strip():
             patches.append({
                 "url": url, "field": "faq_html_block",
                 "problem": "Missing short, snippet-ready Q&A on page",
@@ -690,8 +724,8 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             })
             plan_items.append({
                 "url": url,
-                "task": "Add FAQ section (3–6 Q&A, ≤80 words)",
-                "why": "Improves answer/snippet eligibility in AE/LLM surfaces",
+                "task": "Add FAQ section (3–6 Q&A, ≤80 words)" if lang == "en" else "FAQ-blok toevoegen (3–6 Q&A, ≤80 woorden)",
+                "why": "Improves answer/snippet eligibility in AE/LLM surfaces" if lang == "en" else "Verbetert snippet-eligibility in AE/LLM-oppervlakken",
                 "category": "content",
                 "field": "faq_html_block",
                 "severity": 2, "impact": 5, "effort": 2, "effort_label": "M",
@@ -701,26 +735,71 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "lang": lang
             })
 
-        if faq_jsonld:
+        if ptype == "faq" and faq_jsonld:
             html = "<script type=\"application/ld+json\">" + json.dumps(faq_jsonld, ensure_ascii=False) + "</script>"
             patches.append({
                 "url": url, "field": "faq_jsonld",
                 "problem": "No/invalid FAQPage JSON-LD",
                 "current": "(none)",
-                "proposed": "Inject <script type='application/ld+json'>FAQPage…</script> in <head> of <body>",
+                "proposed": "Inject <script type='application/ld+json'>FAQPage…</script> in <head> or <body>",
                 "html_patch": html,
                 "category": "head", "severity": "medium", "impact": 4, "effort": 1, "priority": 6.0, "patchable": True
             })
             plan_items.append({
                 "url": url,
-                "task": "Add FAQPage JSON-LD",
-                "why": "Validates Q&A for rich results; clearer AE extraction",
+                "task": "Add FAQPage JSON-LD" if lang == "en" else "FAQPage JSON-LD toevoegen",
+                "why": "Validates Q&A for rich results; clearer AE extraction" if lang == "en" else "Valideert Q&A voor rich results; duidelijkere AE-extractie",
                 "category": "tag",
                 "field": "faq_jsonld",
                 "severity": 2, "impact": 4, "effort": 1, "effort_label": "S",
                 "priority": 6.0,
                 "patchable": True,
                 "html_patch": html,
+                "lang": lang
+            })
+
+        # Content patches voor niet-FAQ paginatypes (van AEO-agent)
+        for cp in (page.get("content_patches") or []):
+            field = cp.get("field") or "content"
+            html_patch = cp.get("html_patch") or ""
+            category = cp.get("category") or "body"
+            severity = int(cp.get("severity") or 2)
+            impact = int(cp.get("impact") or 4)
+            effort = int(cp.get("effort") or 2)
+            priority = float(cp.get("priority") or 5.0)
+            patchable = bool(cp.get("patchable", True))
+            problem = cp.get("problem") or ("Missing content block" if lang == "en" else "Ontbrekend contentblok")
+            proposed = cp.get("proposed") or None
+
+            patches.append({
+                "url": url,
+                "field": field,
+                "problem": problem,
+                "current": cp.get("current") or "(none)",
+                "proposed": proposed,
+                "html_patch": html_patch,
+                "category": category,
+                "severity": severity,
+                "impact": impact,
+                "effort": effort,
+                "priority": priority,
+                "patchable": patchable,
+            })
+
+            task, why = _task_texts_for_content(field, lang)
+            plan_items.append({
+                "url": url,
+                "task": task,
+                "why": why,
+                "category": "content",
+                "field": field,
+                "severity": severity,
+                "impact": impact,
+                "effort": effort,
+                "effort_label": {1: "S", 2: "M", 3: "L"}.get(effort, "M"),
+                "priority": priority,
+                "patchable": patchable,
+                "html_patch": html_patch,
                 "lang": lang
             })
 
@@ -979,7 +1058,7 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
         page = by_url.get(url) or {}
         lang = _detect_lang([page.get("title") or "", page.get("h1") or "", page.get("meta_description") or ""] + (page.get("paragraphs") or []), site_lang)
         impact, effort = _impact_effort_for_patch(pch["category"], pch.get("problem") or "")
-        sev = 2 if (pch["category"] == "canonical" and pch.get("problem") == "differs from page URL") else (1 if pch["category"] in ("open_graph", "canonical") else 1)
+        sev = 2 if (pch["category"] == "canonical" and pch["problem"] == "differs from page URL") else (1 if pch["category"] in ("open_graph", "canonical") else 1)
 
         task, why = _task_texts_for_patch(pch["category"], lang)
         priority = round((impact + sev) / max(1, effort), 2)
@@ -1249,18 +1328,21 @@ def generate_report(conn, job):
         elems.append(Paragraph("No AEO job output yet.", S["Normal"]))
     else:
         headers = ["Page URL", "Score (0–100)", "Issues", "Metrics"]
-        colw = [0.36 * width, 0.14 * width, 0.25 * width, 0.25 * width]
+        colw = [0.32 * width, 0.14 * width, 0.28 * width, 0.26 * width]
         data = [headers]
         for r in aeo_scorecards:
             metrics_txt = ", ".join([f"{k}:{v}" for k, v in (r.get("metrics") or {}).items()])
             issues_txt = ", ".join(r.get("issues") or []) or "OK"
-            data.append([P(_shorten(r["url"], 120)), P(str(r["score"]), "Tiny"), P(issues_txt, "Tiny"), P(metrics_txt, "Tiny")])
+            url_txt = r.get("url") or ""
+            if r.get("type"):
+                url_txt = f"{url_txt}  [{r.get('type')}]"
+            data.append([P(_shorten(url_txt, 120)), P(str(r["score"]), "Tiny"), P(issues_txt, "Tiny"), P(metrics_txt, "Tiny")])
         elems.append(_make_table(data, colw))
     elems.append(Spacer(1, 8))
 
     elems.append(Paragraph("AEO — Q&A (snippet-ready, ready-to-paste)", S["Heading2"]))
     if not aeo_qna_rows:
-        elems.append(Paragraph("No Q&A candidates generated.", S["Normal"]))
+        elems.append(Paragraph("No Q&A candidates generated (FAQ pages only).", S["Normal"]))
     else:
         headers = ["Page URL", "Q", "Proposed answer (≤80 words)", "Gaps"]
         colw = [0.28 * width, 0.26 * width, 0.30 * width, 0.16 * width]
