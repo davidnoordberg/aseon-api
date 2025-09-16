@@ -1,25 +1,16 @@
-# aeo_agent.py
 import os
-import io
 import re
 import json
-import base64
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
-
-from psycopg.rows import dict_row
 from openai import OpenAI
+from psycopg.rows import dict_row
 
 OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
 _openai_key = os.getenv("OPENAI_API_KEY")
 _openai_client = OpenAI(api_key=_openai_key) if _openai_key else None
 
-
-# -----------------------------------------------------
-# DB helpers
-# -----------------------------------------------------
 def _fetch_latest_job(conn, site_id: str, jtype: str):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -48,9 +39,6 @@ def _fetch_site_meta(conn, site_id: str) -> Dict[str, Any]:
         )
         return cur.fetchone() or {}
 
-# -----------------------------------------------------
-# Helpers
-# -----------------------------------------------------
 def _norm_url(u: str) -> str:
     if not u: return ""
     p = urlsplit(u)
@@ -63,19 +51,15 @@ def _norm_url(u: str) -> str:
     return urlunsplit((scheme, host, path, "", ""))
 
 def _autolang(site_meta: Dict[str, Any], crawl: Optional[Dict[str, Any]]) -> str:
-    # 1) explicit site language
     lang = (site_meta.get("language") or "").strip().lower()
     if lang:
         return "nl" if lang.startswith("nl") else "en"
-    # 2) infer from country
     c = (site_meta.get("country") or "").strip().lower()
     if c in ("nl", "nld", "netherlands"):
         return "nl"
-    # 3) fallback english
     return "en"
 
 def _page_language(page: Dict[str, Any], default_lang: str) -> str:
-    # crawl may include language per page in future; for now default
     return (page.get("language") or default_lang).split("-")[0].lower()
 
 def _word_count(text: str) -> int:
@@ -89,13 +73,8 @@ def _shorten(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else (s[: n-1] + "…")
 
-# -----------------------------------------------------
-# LLM helpers (optional)
-# -----------------------------------------------------
 def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx: str, n: int = 4) -> List[Dict[str, str]]:
-    """Generate n concise Q&A pairs (≤60–80 words answers) grounded in given context."""
     if not _openai_client:
-        # Heuristic fallback when no LLM key: template QAs from title/h1 only
         topic = (h1 or title or "").strip() or "deze pagina"
         if lang == "nl":
             qs = [
@@ -138,7 +117,6 @@ def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx
             ],
         )
         txt = resp.choices[0].message.content.strip()
-        # Expect JSON; be forgiving
         m = re.search(r"\[.*\]", txt, re.S)
         data = json.loads(m.group(0)) if m else []
         out = []
@@ -151,9 +129,6 @@ def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx
     except Exception:
         return []
 
-# -----------------------------------------------------
-# Builders
-# -----------------------------------------------------
 def _faq_html_block(qas: List[Dict[str, str]], lang: str) -> str:
     label = "Veelgestelde vragen" if lang == "nl" else "Frequently asked questions"
     lis = []
@@ -189,12 +164,9 @@ def _faq_jsonld(qas: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
 def _kb_context_snippet() -> str:
-    # If your API exposes RAG context, call it at app layer; here we keep it pluggable.
-    # Agent stays pure; upstream can pass a kb_ctx into the job.payload if desired.
     return ""
 
 def _score_page(has_faq_schema: bool, qas: List[Dict[str, str]]) -> Tuple[int, Dict[str, Any], List[str]]:
-    """Return (score_0_100, metrics, issues) based on AEO readiness."""
     answers_ok = sum(1 for x in qas if _word_count(x["a"]) <= 80)
     n = len(qas)
     metrics = {
@@ -207,32 +179,13 @@ def _score_page(has_faq_schema: bool, qas: List[Dict[str, str]]) -> Tuple[int, D
     if answers_ok < n: issues.append("Some answers >80 words.")
     if not has_faq_schema: issues.append("No FAQPage JSON-LD.")
     score = 0
-    score += min(n, 6) * 10          # up to 60 pts for enough Q&A
-    score += answers_ok * 5           # up to 30 pts for short answers
+    score += min(n, 6) * 10
+    score += answers_ok * 5
     score += 10 if has_faq_schema else 0
     score = min(score, 100)
     return score, metrics, issues
 
-# -----------------------------------------------------
-# Main job
-# -----------------------------------------------------
 def generate_aeo(conn, job):
-    """
-    Input: site_id, optional payload: {"per_page_qas": 4, "use_kb": true}
-    Output:
-    {
-      "site": {...}, "summary": {...},
-      "pages": [
-        {
-          "url": "...", "lang": "nl", "title": "...", "h1": "...",
-          "qas":[{"q":"...","a":"..."}],
-          "score": 78, "metrics": {...}, "issues": ["..."],
-          "faq_html": "<section>...</section>",
-          "faq_jsonld": {...}
-        }, ...
-      ]
-    }
-    """
     site_id = job["site_id"]
     payload = job.get("payload") or {}
     per_page_qas = int(payload.get("per_page_qas") or 4)
@@ -252,9 +205,8 @@ def generate_aeo(conn, job):
         title = (p.get("title") or "").strip()
         h1 = (p.get("h1") or "").strip()
         page_lang = _page_language(p, lang_default)
-        body_preview = (p.get("text") or p.get("excerpt") or "")  # optional fields if your crawler stores text
+        body_preview = (p.get("text") or p.get("excerpt") or "")
 
-        # Reuse FAQ items if they reference this page as source
         reused = []
         for item in (faq_job.get("faqs") or []):
             if (item.get("source") or "").strip().startswith(url):
@@ -263,7 +215,6 @@ def generate_aeo(conn, job):
                 if q and a:
                     reused.append({"q": q, "a": a})
 
-        # If not enough, top up via LLM (grounded in preview+KB)
         if len(reused) < per_page_qas:
             extra = _llm_qas_from_page(page_lang, title, h1, body_preview, kb_ctx, n=per_page_qas - len(reused))
         else:
@@ -288,7 +239,6 @@ def generate_aeo(conn, job):
             "faq_jsonld": faq_jsonld
         })
 
-    # site-level summary
     avg = round(sum(x["score"] for x in pages) / max(1, len(pages)))
     needs = sum(1 for x in pages if not x["metrics"]["has_faq_schema"])
     summary = {
