@@ -1,4 +1,5 @@
 # report_agent.py
+
 import os
 import io
 import re
@@ -27,7 +28,6 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from xml.sax.saxutils import escape as xml_escape
 
-# Optional LLM (voor NL/EN voorstellen en samenvatting)
 from openai import OpenAI
 
 OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -149,7 +149,6 @@ _NL_HINTS = [" de ", " het ", " een ", " en ", " voor ", " met ", " jouw ", " je
 _EN_HINTS = [" the ", " and ", " for ", " with ", " your ", " we ", " our ", " to ", " of "]
 
 def _detect_lang(texts: List[str], site_lang: Optional[str]) -> str:
-    """Return 'nl' or 'en'. Prefer site_lang, then shallow lexical hints."""
     site = (site_lang or "").lower()
     default = "nl" if site.startswith("nl") else "en"
     sample = (" ".join([t for t in texts if t])[:800] + " ").lower()
@@ -166,10 +165,6 @@ def _detect_lang(texts: List[str], site_lang: Optional[str]) -> str:
 # Core helpers (unique pages, duplicates, proposals)
 # -----------------------------------------------------
 def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Unieke, genormaliseerde URL's. Kies per URL de beste variant:
-    status=200 > anders, daarna hoogste word_count.
-    """
     bucket: Dict[str, Dict[str, Any]] = {}
 
     def _score(pp: Dict[str, Any]) -> Tuple[int, int]:
@@ -211,6 +206,9 @@ def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
     return inlinks
 
 
+# -----------------------------------------------------
+# Copy proposals via LLM or fallback
+# -----------------------------------------------------
 def _propose_copy(
     url: str,
     title: Optional[str],
@@ -221,10 +219,6 @@ def _propose_copy(
     paras: Optional[List[str]],
     lang: str = "en",
 ) -> Dict[str, str]:
-    """
-    Genereer voorstellen voor title/meta/H1-intro en OG-tags.
-    LLM indien beschikbaar; deterministische fallback anders.
-    """
     base = (h1 or title or "").strip()
 
     if lang == "nl":
@@ -294,20 +288,29 @@ def _propose_copy(
         except Exception:
             out = fallback
 
-    # OG uit title/meta afleiden
     og_title = out["title"]
     og_desc = out["meta"]
     return {**out, "og_title": og_title, "og_desc": og_desc}
 
 
 # -----------------------------------------------------
-# Text issue builder (concrete current + proposal)
+# Text issue builder
 # -----------------------------------------------------
+_TEXT_FINDINGS_ALL = {
+    "Missing <title>",
+    "Title length suboptimal",
+    "Duplicate <title>",
+    "Missing meta description",
+    "Meta description length suboptimal",
+    "Duplicate meta description",
+    "H1 duplicates title",
+    "Missing H1",
+    "Low visible text",
+}
+
+_PATCHABLE_FINDINGS = {"Missing canonical", "Canonical differs from page URL", "Missing Open Graph tags"}
+
 def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Per pagina: detecteer tekstuele issues (title/meta/H1/low-text) en geef
-    huidige tekst + voorstel + HTML-patch. Voorstellen in paginataal.
-    """
     if not crawl:
         return []
     pages = _unique_pages(crawl.get("pages") or [])
@@ -341,17 +344,17 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
         if need_title:
             reason = []
             if not title:
-                reason.append("ontbreekt" if lang == "nl" else "missing")
+                reason.append("missing" if lang != "nl" else "ontbreekt")
             if title and (len(title) < 30 or len(title) > 65):
-                reason.append("lengte suboptimaal" if lang == "nl" else "length suboptimal")
+                reason.append("length suboptimal" if lang != "nl" else "lengte suboptimaal")
             if title and title_counts.get(title.lower(), 0) > 1:
-                reason.append("dubbel op site" if lang == "nl" else "duplicate site-wide")
+                reason.append("duplicate site-wide" if lang != "nl" else "dubbel op site")
             rows.append(
                 {
                     "url": url,
                     "field": "title",
                     "problem": ", ".join(reason),
-                    "current": title or ("(leeg)" if lang == "nl" else "(empty)"),
+                    "current": title or ("(empty)" if lang != "nl" else "(leeg)"),
                     "proposed": prop["title"],
                     "html_patch": f"<title>{xml_escape(prop['title'])}</title>",
                     "lang": lang,
@@ -361,19 +364,18 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
         if need_meta:
             reason = []
             if not meta:
-                reason.append("ontbreekt" if lang == "nl" else "missing")
-            # stricter band voor echte snippet
+                reason.append("missing" if lang != "nl" else "ontbreekt")
             if meta and (len(meta) < 140 or len(meta) > 160):
-                reason.append("lengte suboptimaal" if lang == "nl" else "length suboptimal")
+                reason.append("length suboptimal" if lang != "nl" else "lengte suboptimaal")
             if meta and meta_counts.get(meta.lower(), 0) > 1:
-                reason.append("dubbel op site" if lang == "nl" else "duplicate site-wide")
+                reason.append("duplicate site-wide" if lang != "nl" else "dubbel op site")
             md = prop["meta"]
             rows.append(
                 {
                     "url": url,
                     "field": "meta_description",
                     "problem": ", ".join(reason),
-                    "current": meta or ("(leeg)" if lang == "nl" else "(empty)"),
+                    "current": meta or ("(empty)" if lang != "nl" else "(leeg)"),
                     "proposed": md,
                     "html_patch": f"<meta name=\"description\" content=\"{_attr_escape(md)}\">",
                     "lang": lang,
@@ -386,7 +388,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
                 {
                     "url": url,
                     "field": "h1",
-                    "problem": "H1 is identiek aan title" if lang == "nl" else "H1 duplicates title",
+                    "problem": "H1 duplicates title" if lang != "nl" else "H1 is identiek aan title",
                     "current": h1,
                     "proposed": h1_alt,
                     "html_patch": f"<h1>{xml_escape(h1_alt)}</h1>",
@@ -400,8 +402,8 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
                 {
                     "url": url,
                     "field": "intro_paragraph",
-                    "problem": "weinig zichtbare tekst (<250 woorden)" if lang == "nl" else "low visible text (<250 words)",
-                    "current": (paras[0] if paras else ("(geen tekst)" if lang == "nl" else "(no visible paragraph)")),
+                    "problem": "low visible text (<250 words)" if lang != "nl" else "weinig zichtbare tekst (<250 woorden)",
+                    "current": (paras[0] if paras else ("(no visible paragraph)" if lang != "nl" else "(geen tekst)")),
                     "proposed": intro,
                     "html_patch": f"<p>{xml_escape(intro)}</p>",
                     "lang": lang,
@@ -412,7 +414,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
 
 
 # -----------------------------------------------------
-# Duplicates section (groups + per-URL voorstel)
+# Duplicates section
 # -----------------------------------------------------
 def _build_duplicate_groups(crawl: Optional[Dict[str, Any]], site_lang: Optional[str]):
     if not crawl:
@@ -480,25 +482,7 @@ def _build_duplicate_groups(crawl: Optional[Dict[str, Any]], site_lang: Optional
 # -----------------------------------------------------
 # Technical SEO findings (deduped pages)
 # -----------------------------------------------------
-_TEXT_FINDINGS_ALL = {
-    "Missing <title>",
-    "Title length suboptimal",
-    "Duplicate <title>",
-    "Missing meta description",
-    "Meta description length suboptimal",
-    "Duplicate meta description",
-    "H1 duplicates title",
-    "Missing H1",
-    "Low visible text",
-}
-
-# findings die we via patches (tag_patches) al oplossen → niet dubbel in plan
-_PATCHABLE_FINDINGS = {"Missing canonical", "Canonical differs from page URL", "Missing Open Graph tags"}
-
 def _build_seo_findings(crawl: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Return (all_rows, pages) where pages = unique pages list we reuse later.
-    """
     if not crawl:
         return [], []
     pages = _unique_pages(crawl.get("pages") or [])
@@ -518,7 +502,7 @@ def _build_seo_findings(crawl: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str,
         og_title = p.get("og_title")
         og_desc = p.get("og_description")
         word_count = int(p.get("word_count") or 0)
-        inl = _build_link_graph(pages).get(u, 0)
+        inl = inlinks.get(u, 0)
 
         def add(find, sev, fix, accept):
             out.append({"url": u, "finding": find, "severity": sev, "fix": fix, "accept": accept})
@@ -619,7 +603,58 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
 
 
 # -----------------------------------------------------
-# AEO (concrete from aeo job) → scorecards, Q&A rows, patches, plan_items
+# AEO (from AEO job: scorecards/issues -> findings)
+# -----------------------------------------------------
+def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not aeo_concrete:
+        return out
+    for page in (aeo_concrete.get("scorecards") or []):
+        url = page.get("url") or ""
+        issues = page.get("issues") or []
+        metrics = page.get("metrics") or {}
+        qas = int(metrics.get("qas") or 0)
+
+        for iss in issues:
+            s = (iss or "").lower()
+            if "too few q&a" in s:
+                out.append({
+                    "url": url,
+                    "finding": "Too few Q&A on page",
+                    "severity": "medium" if qas > 0 else "high",
+                    "fix": "Add 3–6 concise Q&A with answers ≤80 words; cover the core intents of the page.",
+                    "accept": ["≥3 Q&A present", "Each answer ≤80 words", "Lead sentence contains the answer"],
+                })
+            elif "no faqpage json-ld" in s:
+                out.append({
+                    "url": url,
+                    "finding": "No FAQPage JSON-LD",
+                    "severity": "medium",
+                    "fix": "Add valid FAQPage JSON-LD matching on-page Q&A.",
+                    "accept": ["Rich Results Test: valid FAQPage", "JSON-LD matches visible questions/answers"],
+                })
+            elif "some answers >80 words" in s:
+                out.append({
+                    "url": url,
+                    "finding": "Overlong FAQ answers",
+                    "severity": "low",
+                    "fix": "Trim answers to ≤80 words; lead with the answer and keep nouns/verbs concrete.",
+                    "accept": ["All answers ≤80 words", "Answer appears in sentence 1"],
+                })
+
+        if qas == 0:
+            out.append({
+                "url": url,
+                "finding": "No Q&A section on page",
+                "severity": "high",
+                "fix": "Add a short FAQ section (3–6 Q&A) focused on the page’s main intents.",
+                "accept": ["FAQ block visible", "≥3 Q&A present", "Answers ≤80 words"],
+            })
+    return out
+
+
+# -----------------------------------------------------
+# AEO concrete (from aeo job) -> scorecards, Q&A rows, patches, plan_items
 # -----------------------------------------------------
 def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     rows = []
@@ -738,12 +773,9 @@ def _geo_recommendations(site_meta: Dict[str, Any], crawl: Optional[Dict[str, An
 
 
 # -----------------------------------------------------
-# Canonical & OG patches (concrete HTML)
+# Canonical & OG patches
 # -----------------------------------------------------
 def _collect_proposals_by_url(text_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
-    """
-    Maak een map url -> {title?, meta?, og_title?, og_desc?} vanuit text_rows.
-    """
     out: Dict[str, Dict[str, str]] = {}
     for r in text_rows:
         if r["field"] not in ("title", "meta_description"):
@@ -754,7 +786,6 @@ def _collect_proposals_by_url(text_rows: List[Dict[str, Any]]) -> Dict[str, Dict
             out[u]["title"] = r["proposed"]
         if r["field"] == "meta_description":
             out[u]["meta"] = r["proposed"]
-    # derive OG defaults
     for u, m in out.items():
         m.setdefault("title", None)
         m.setdefault("meta", None)
@@ -779,7 +810,6 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
         og_title = p.get("og_title")
         og_desc = p.get("og_description")
 
-        # Canonical patch if missing/different
         preferred = u
         if not canon or _norm_url(canon) != preferred:
             patches.append(
@@ -792,7 +822,6 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
                 }
             )
 
-        # OG patch if missing (derive text from proposals or fallback to current title/meta)
         ogt = proposals.get(u, {}).get("og_title") or (p.get("title") or "")[:60]
         ogd = proposals.get(u, {}).get("og_desc") or (p.get("meta_description") or "")[:200]
 
@@ -854,7 +883,6 @@ def _impact_effort_for_finding(finding: str) -> Tuple[int, int]:
         return 3, 2
     if f == "missing h1":
         return 3, 1
-    # fallback for misc technicals
     return 2, 2
 
 
@@ -862,25 +890,17 @@ def _task_texts_for_text(field: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
     f = (field or "").lower()
     if f == "title":
-        return (
-            "Titel optimaliseren (uniek + lengte)" if nl else "Optimize title (unique + in-range)",
-            "Verbetert CTR en duidelijkheid; voorkomt duplicaten." if nl else "Improves CTR and clarity; avoids duplicates.",
-        )
+        return ("Titel optimaliseren (uniek + lengte)" if nl else "Optimize title (unique + in-range)",
+                "Verbetert CTR en duidelijkheid; voorkomt duplicaten." if nl else "Improves CTR and clarity; avoids duplicates.")
     if f == "meta_description":
-        return (
-            "Meta description toevoegen/optimaliseren" if nl else "Add/optimize meta description",
-            "Betere snippet-kwaliteit en hogere doorklik." if nl else "Improves snippet quality and click-through.",
-        )
+        return ("Meta description toevoegen/optimaliseren" if nl else "Add/optimize meta description",
+                "Betere snippet-kwaliteit en hogere doorklik." if nl else "Improves snippet quality and click-through.")
     if f == "h1":
-        return (
-            "H1 herschrijven (anders dan title)" if nl else "Rewrite H1 (not identical to title)",
-            "Meer context voor gebruiker en zoekmachine." if nl else "Adds context for users and search engines.",
-        )
+        return ("H1 herschrijven (anders dan title)" if nl else "Rewrite H1 (not identical to title)",
+                "Meer context voor gebruiker en zoekmachine." if nl else "Adds context for users and search engines.")
     if f == "intro_paragraph":
-        return (
-            "Intro-tekst toevoegen/verbeteren" if nl else "Add/improve intro paragraph",
-            "≥250 woorden, antwoord-first; versterkt topical authority." if nl else "≥250 words, answer-first; strengthens topical authority.",
-        )
+        return ("Intro-tekst toevoegen/verbeteren" if nl else "Add/improve intro paragraph",
+                "≥250 woorden, antwoord-first; versterkt topical authority." if nl else "≥250 words, answer-first; strengthens topical authority.")
     return ("Tekstoptimalisatie", "Contentverbetering") if nl else ("Text optimisation", "Content improvement")
 
 
@@ -905,25 +925,20 @@ def _task_texts_for_finding(finding: str, lang: str) -> Tuple[str, str]:
         return ("Interne links toevoegen", "Verhoogt crawlbaarheid en autoriteit; ≥2 inlinks.") if nl else ("Add internal links", "Improves crawlability and authority; ≥2 inlinks.")
     if f == "missing h1":
         return ("H1 toevoegen", "Duidelijk hoofdonderwerp voor bezoekers en bots.") if nl else ("Add H1", "Clear primary topic for users and bots.")
-    # fallback
     return (("Technische SEO-fix: " + finding), "Los dit item op.") if nl else (("Technical SEO fix: " + finding), "Resolve this issue.")
 
 
 def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any]], technical_rows: List[Dict[str, Any]], pages: List[Dict[str, Any]], site_lang: Optional[str]) -> List[Dict[str, Any]]:
-    # map pagina -> taal (autodetect)
     by_url = {_norm_url(p.get("final_url") or p.get("url") or ""): p for p in (pages or [])}
-
     items: List[Dict[str, Any]] = []
 
-    # 1) Tekst-items (title/meta/H1/intro)
     for r in text_rows:
         url = r["url"]
         lang = r.get("lang") or _detect_lang([(by_url.get(url) or {}).get("title") or "", (by_url.get(url) or {}).get("h1") or ""] + ((by_url.get(url) or {}).get("paragraphs") or []), site_lang)
         impact, effort = _impact_effort_for_text(r["field"])
 
-        # heuristische severity op basis van probleem
         prob = (r.get("problem") or "").lower()
-        if r["field"] == "title" and ("ontbreekt" in prob or "missing" in prob or "dubbel" in prob or "duplicate" in prob):
+        if r["field"] == "title" and ("missing" in prob or "duplicate" in prob or "ontbreekt" in prob or "dubbel" in prob):
             severity = 3
         elif r["field"] == "title":
             severity = 2
@@ -959,7 +974,6 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
             }
         )
 
-    # 2) Tag patches (canonical/OG) — taal afgeleid van pagina
     for pch in tag_patches:
         url = pch["url"]
         page = by_url.get(url) or {}
@@ -988,7 +1002,6 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
             }
         )
 
-    # 3) Overige technische issues (excl. patchable canonical/OG en excl. text-gerelateerde)
     for r in technical_rows:
         if r["finding"] in _PATCHABLE_FINDINGS:
             continue
@@ -1019,7 +1032,6 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
             }
         )
 
-    # sorteer op prioriteit desc, dan effort asc
     items.sort(key=lambda x: (-x["priority"], x["effort"], x["url"]))
     return items
 
@@ -1039,12 +1051,10 @@ def _csv_base64(rows: List[Dict[str, Any]], columns: List[str]) -> str:
 def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any]], site_lang: Optional[str], extra_patches: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
-    # text_rows
     for r in text_rows:
-        # schat severity/impact/effort zoals in plan_items
         impact, effort = _impact_effort_for_text(r["field"])
         prob = (r.get("problem") or "").lower()
-        if r["field"] == "title" and ("ontbreekt" in prob or "missing" in prob or "dubbel" in prob or "duplicate" in prob):
+        if r["field"] == "title" and ("missing" in prob or "duplicate" in prob or "ontbreekt" in prob or "dubbel" in prob):
             severity = 3
         elif r["field"] == "title":
             severity = 2
@@ -1077,7 +1087,6 @@ def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Di
             }
         )
 
-    # tag patches
     for pch in tag_patches:
         impact, effort = _impact_effort_for_patch(pch["category"], pch.get("problem") or "")
         sev = 2 if (pch["category"] == "canonical" and pch.get("problem") == "differs from page URL") else (1 if pch["category"] in ("open_graph", "canonical") else 1)
@@ -1099,9 +1108,7 @@ def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Di
             }
         )
 
-    # extra patches (AEO)
     for ap in (extra_patches or []):
-        # AEO patches al bevatten impact/effort/severity (numeric or label). Zorg labels.
         sev_num = 2
         sev_lbl = (ap.get("severity") or "medium")
         if isinstance(ap.get("severity"), int):
@@ -1128,7 +1135,7 @@ def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Di
 
 
 # -----------------------------------------------------
-# Optional LLM executive summary (site-taal)
+# Optional LLM executive summary
 # -----------------------------------------------------
 def _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows, aeo_scorecards=None) -> Optional[str]:
     if not _openai_client:
@@ -1174,7 +1181,6 @@ def generate_report(conn, job):
     site_id = job["site_id"]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Inputs
     site_meta = _fetch_site_meta(conn, site_id)
     crawl = _fetch_latest_job(conn, site_id, "crawl")
     keywords = _fetch_latest_job(conn, site_id, "keywords")
@@ -1182,29 +1188,26 @@ def generate_report(conn, job):
     schema_job = _fetch_latest_job(conn, site_id, "schema")
     aeo_job = _fetch_latest_job(conn, site_id, "aeo")
 
-    # Findings
     seo_rows_all, unique_pages = _build_seo_findings(crawl)
     text_rows = _build_text_findings(crawl, site_meta.get("language"))
     dup_groups = _build_duplicate_groups(crawl, site_meta.get("language"))
-    # filter out patchables from technical for the "other" section
     technical_rows = [r for r in seo_rows_all if r["finding"] not in _TEXT_FINDINGS_ALL and r["finding"] not in _PATCHABLE_FINDINGS]
-    aeo_quality_rows = _aeo_findings_from_faq(faq, crawl)
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
     tag_patches = _build_canonical_og_patches(crawl, text_rows)
 
-    # AEO concrete (uit aeo job)
     aeo_concrete = _aeo_from_job(aeo_job)
     aeo_scorecards = aeo_concrete.get("scorecards", [])
     aeo_qna_rows = aeo_concrete.get("rows", [])
     aeo_patches = aeo_concrete.get("patches", [])
     aeo_plan_items = aeo_concrete.get("plan_items", [])
 
-    # Implementatieplan (basis) + AEO items
+    aeo_quality_rows = _aeo_findings_from_faq(faq, crawl)
+    aeo_quality_rows += _aeo_findings_from_aeo_job(aeo_concrete)
+
     plan_base = _plan_items(text_rows, tag_patches, technical_rows, unique_pages, site_meta.get("language"))
     plan_items = plan_base + aeo_plan_items
     plan_items.sort(key=lambda x: (-x["priority"], x.get("effort", 1), x["url"]))
 
-    # Exports (patches: text + tag + aeo)
     patches_export_rows = _patch_rows_for_export(text_rows, tag_patches, site_meta.get("language"), extra_patches=aeo_patches)
     patches_csv_b64 = _csv_base64(
         patches_export_rows,
@@ -1215,14 +1218,12 @@ def generate_report(conn, job):
         ["url", "task", "why", "category", "field", "severity", "impact", "effort", "effort_label", "priority", "patchable", "html_patch", "lang"],
     )
 
-    # Executive summary in site-taal (met AEO scorecards context)
     exec_summary = _try_llm_summary(site_meta, seo_rows_all, geo_rows, aeo_quality_rows, aeo_scorecards) or (
         "Dit rapport bevat concrete issues en aanbevelingen voor SEO (techniek), GEO (entity/schema) en AEO (answer readiness), inclusief acceptatiecriteria."
         if (site_meta.get("language") or "").lower().startswith("nl")
         else "This report lists concrete issues and recommendations across SEO, GEO and AEO with acceptance criteria."
     )
 
-    # --------- PDF ----------
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -1236,7 +1237,6 @@ def generate_report(conn, job):
     elems: List[Any] = []
     S = _styles()
 
-    # Cover
     title = f"SEO • GEO • AEO Audit — {site_meta.get('url') or ''}"
     elems.append(Paragraph(title, S["Title"]))
     elems.append(Paragraph(f"Generated: {now}", S["Normal"]))
@@ -1244,7 +1244,6 @@ def generate_report(conn, job):
     elems.append(Paragraph(exec_summary, S["Small"]))
     elems.append(PageBreak())
 
-    # --- AEO — Answer readiness (scorecards) ---
     elems.append(Paragraph("AEO — Answer readiness (scorecards)", S["Heading2"]))
     if not aeo_scorecards:
         elems.append(Paragraph("No AEO job output yet.", S["Normal"]))
@@ -1259,7 +1258,6 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(Spacer(1, 8))
 
-    # --- AEO — Q&A (ready-to-paste) ---
     elems.append(Paragraph("AEO — Q&A (snippet-ready, ready-to-paste)", S["Heading2"]))
     if not aeo_qna_rows:
         elems.append(Paragraph("No Q&A candidates generated.", S["Normal"]))
@@ -1267,17 +1265,16 @@ def generate_report(conn, job):
         headers = ["Page URL", "Q", "Proposed answer (≤80 words)", "Gaps"]
         colw = [0.28 * width, 0.26 * width, 0.30 * width, 0.16 * width]
         data = [headers]
-        for r in aeo_qna_rows[:80]:  # cap rows in PDF
+        for r in aeo_qna_rows[:80]:
             data.append([P(_shorten(r["url"], 120)), P(r["q"]), P(r["a"]), P(r["gaps"], "Tiny")])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- SEO — Concrete text fixes (ready-to-paste) ---
     elems.append(Paragraph("SEO — Concrete text fixes (ready-to-paste)", S["Heading2"]))
     if not text_rows:
-        elems.append(Paragraph("Geen tekstuele problemen gevonden in titels/meta/H1/intro." if (site_meta.get("language") or "").lower().startswith("nl") else "No text issues found in titles/meta/H1/intro.", S["Normal"]))
+        elems.append(Paragraph("No text issues found in titles/meta/H1/intro." if (site_meta.get("language") or "").lower().startswith("en") else "Geen tekstuele problemen gevonden in titels/meta/H1/intro.", S["Normal"]))
     else:
-        headers = ["Page URL", "Veld", "Probleem", "Huidig", "Voorstel (ready-to-paste)"] if (site_meta.get("language") or "").lower().startswith("nl") else ["Page URL", "Field", "Issue", "Current", "Proposed (ready-to-paste)"]
+        headers = ["Page URL", "Field", "Issue", "Current", "Proposed (ready-to-paste)"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Veld", "Probleem", "Huidig", "Voorstel (ready-to-paste)"]
         colw = [0.23 * width, 0.10 * width, 0.15 * width, 0.24 * width, 0.28 * width]
         data = [headers]
         for r in text_rows:
@@ -1292,19 +1289,18 @@ def generate_report(conn, job):
             )
         elems.append(_make_table(data, colw))
         elems.append(Spacer(1, 6))
-        elems.append(Paragraph("HTML-patches (kopieer & plak):" if (site_meta.get("language") or "").lower().startswith("nl") else "HTML patches (copy & paste):", S["Small"]))
+        elems.append(Paragraph("HTML patches (copy & paste):" if (site_meta.get("language") or "").lower().startswith("en") else "HTML-patches (kopieer & plak):", S["Small"]))
         for r in text_rows[:12]:
             elems.append(KeepTogether([P(f"{r['field']} — {r['url']}", "Tiny"), Code(r["html_patch"]), Spacer(1, 4)]))
     elems.append(PageBreak())
 
-    # --- Duplicate groups (title/meta) ---
     elems.append(Paragraph("Duplicate groups — titles", S["Heading2"]))
     if not dup_groups["title_groups"]:
-        elems.append(Paragraph("Geen dubbele titles gevonden." if (site_meta.get("language") or "").lower().startswith("nl") else "No duplicate titles found.", S["Normal"]))
+        elems.append(Paragraph("No duplicate titles found." if (site_meta.get("language") or "").lower().startswith("en") else "Geen dubbele titles gevonden.", S["Normal"]))
     else:
         for g in dup_groups["title_groups"]:
-            elems.append(Paragraph(f"Huidige title (×{g['count']}): {xml_escape(_shorten(g['value'], 120))}" if (site_meta.get("language") or "").lower().startswith("nl") else f"Current title (×{g['count']}): {xml_escape(_shorten(g['value'], 120))}", S["Small"]))
-            headers = ["Page URL", "Uniek voorstel"] if (site_meta.get("language") or "").lower().startswith("nl") else ["Page URL", "Unique proposal"]
+            elems.append(Paragraph(f"Current title (×{g['count']}): {xml_escape(_shorten(g['value'], 120))}" if (site_meta.get("language") or "").lower().startswith("en") else f"Huidige title (×{g['count']}): {xml_escape(_shorten(g['value'], 120))}", S["Small"]))
+            headers = ["Page URL", "Unique proposal"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Uniek voorstel"]
             colw = [0.55 * width, 0.45 * width]
             data = [headers]
             for row in g["rows"]:
@@ -1315,11 +1311,11 @@ def generate_report(conn, job):
 
     elems.append(Paragraph("Duplicate groups — meta descriptions", S["Heading2"]))
     if not dup_groups["meta_groups"]:
-        elems.append(Paragraph("Geen dubbele meta descriptions gevonden." if (site_meta.get("language") or "").lower().startswith("nl") else "No duplicate meta descriptions found.", S["Normal"]))
+        elems.append(Paragraph("No duplicate meta descriptions found." if (site_meta.get("language") or "").lower().startswith("en") else "Geen dubbele meta descriptions gevonden.", S["Normal"]))
     else:
         for g in dup_groups["meta_groups"]:
-            elems.append(Paragraph(f"Huidige meta (×{g['count']}): {xml_escape(_shorten(g['value'], 180))}" if (site_meta.get("language") or "").lower().startswith("nl") else f"Current meta (×{g['count']}): {xml_escape(_shorten(g['value'], 180))}", S["Small"]))
-            headers = ["Page URL", "Uniek voorstel"] if (site_meta.get("language") or "").lower().startswith("nl") else ["Page URL", "Unique proposal"]
+            elems.append(Paragraph(f"Current meta (×{g['count']}): {xml_escape(_shorten(g['value'], 180))}" if (site_meta.get("language") or "").lower().startswith("en") else f"Huidige meta (×{g['count']}): {xml_escape(_shorten(g['value'], 180))}", S["Small"]))
+            headers = ["Page URL", "Unique proposal"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Uniek voorstel"]
             colw = [0.55 * width, 0.45 * width]
             data = [headers]
             for row in g["rows"]:
@@ -1328,12 +1324,11 @@ def generate_report(conn, job):
             elems.append(Spacer(1, 6))
     elems.append(PageBreak())
 
-    # --- Canonical & Open Graph patches ---
     elems.append(Paragraph("HTML patches — Canonical & Open Graph", S["Heading2"]))
     if not tag_patches:
-        elems.append(Paragraph("Geen patches nodig." if (site_meta.get("language") or "").lower().startswith("nl") else "No patches needed.", S["Normal"]))
+        elems.append(Paragraph("No patches needed." if (site_meta.get("language") or "").lower().startswith("en") else "Geen patches nodig.", S["Normal"]))
     else:
-        headers = ["Page URL", "Categorie", "Probleem", "Huidig", "Patch (copy/paste)"] if (site_meta.get("language") or "").lower().startswith("nl") else ["Page URL", "Category", "Issue", "Current", "Patch (copy/paste)"]
+        headers = ["Page URL", "Category", "Issue", "Current", "Patch (copy/paste)"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Categorie", "Probleem", "Huidig", "Patch (copy/paste)"]
         colw = [0.23 * width, 0.12 * width, 0.15 * width, 0.25 * width, 0.25 * width]
         data = [headers]
         for pch in tag_patches:
@@ -1341,26 +1336,26 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- Implementatieplan ---
-    impl_title = "Implementatieplan (prioriteit × impact × effort)" if (site_meta.get("language") or "").lower().startswith("nl") else "Implementation plan (priority × impact × effort)"
+    impl_title = "Implementation plan (priority × impact × effort)" if (site_meta.get("language") or "").lower().startswith("en") else "Implementatieplan (prioriteit × impact × effort)"
     elems.append(Paragraph(impl_title, S["Heading2"]))
     if not plan_items:
-        elems.append(Paragraph("Geen taken gegenereerd." if (site_meta.get("language") or "").lower().startswith("nl") else "No tasks generated.", S["Normal"]))
+        elems.append(Paragraph("No tasks generated." if (site_meta.get("language") or "").lower().startswith("en") else "Geen taken gegenereerd.", S["Normal"]))
     else:
-        headers = ["Status", "URL", "Taak", "Waarom/impact", "Effort", "Prioriteit", "Patch"] if (site_meta.get("language") or "").lower().startswith("nl") else ["Status", "URL", "Task", "Why/impact", "Effort", "Priority", "Patch"]
+        headers = ["Status", "URL", "Task", "Why/impact", "Effort", "Priority", "Patch"] if (site_meta.get("language") or "").lower().startswith("en") else ["Status", "URL", "Taak", "Waarom/impact", "Effort", "Prioriteit", "Patch"]
         colw = [0.07 * width, 0.23 * width, 0.20 * width, 0.25 * width, 0.09 * width, 0.08 * width, 0.08 * width]
         data = [headers]
-        for it in plan_items[:60]:  # cap in PDF voor leesbaarheid
+        for it in plan_items[:60]:
             checkbox = "☐"
-            patch_note = "ja" if it.get("patchable") and it.get("html_patch") else "—"
+            patch_note = "yes" if it.get("patchable") and it.get("html_patch") else "—"
+            if not (site_meta.get("language") or "").lower().startswith("en"):
+                patch_note = "ja" if it.get("patchable") and it.get("html_patch") else "—"
             data.append([P(checkbox, "Tiny"), P(_shorten(it["url"], 110), "Tiny"), P(_shorten(it["task"], 120), "Tiny"), P(_shorten(it["why"], 180), "Tiny"), P(it["effort_label"], "Tiny"), P(str(it["priority"]), "Tiny"), P(patch_note, "Tiny")])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- SEO — Other technical issues ---
     elems.append(Paragraph("SEO — Other technical issues", S["Heading2"]))
     if not technical_rows:
-        elems.append(Paragraph("Geen overige technische issues." if (site_meta.get("language") or "").lower().startswith("nl") else "No other technical issues.", S["Normal"]))
+        elems.append(Paragraph("No other technical issues." if (site_meta.get("language") or "").lower().startswith("en") else "Geen overige technische issues.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
@@ -1370,10 +1365,9 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- GEO Recommendations (entity/schema) ---
     elems.append(Paragraph("GEO Recommendations (entity/schema)", S["Heading2"]))
     if not geo_rows:
-        elems.append(Paragraph("Geen schema/entity-aanbevelingen." if (site_meta.get("language") or "").lower().startswith("nl") else "No schema/entity recommendations.", S["Normal"]))
+        elems.append(Paragraph("No schema/entity recommendations." if (site_meta.get("language") or "").lower().startswith("en") else "Geen schema/entity-aanbevelingen.", S["Normal"]))
     else:
         headers = ["Page URL", "Recommendation", "Severity", "Fix (summary)", "Acceptance Criteria"]
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
@@ -1383,10 +1377,9 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- AEO Findings (quality heuristics) ---
     elems.append(Paragraph("AEO Findings (answer & citation readiness)", S["Heading2"]))
     if not aeo_quality_rows:
-        elems.append(Paragraph("Geen AEO-issues." if (site_meta.get("language") or "").lower().startswith("nl") else "No AEO findings.", S["Normal"]))
+        elems.append(Paragraph("No AEO findings." if (site_meta.get("language") or "").lower().startswith("en") else "Geen AEO-issues.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
@@ -1396,7 +1389,6 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- Appendix: JSON-LD Snippets (paste & adapt) ---
     elems.append(Paragraph("Appendix — JSON-LD Snippets (paste & adapt)", S["Heading2"]))
     brand = site_meta.get("account_name") or "YourBrand"
     home = (site_meta.get("url") or "").strip().rstrip("/") or "https://example.com"
@@ -1409,7 +1401,6 @@ def generate_report(conn, job):
         elems.append(Paragraph(title_txt, S["H3tight"]))
         elems.append(KeepTogether([Code(json.dumps(obj, indent=2, ensure_ascii=False)), Spacer(1, 6)]))
 
-    # Appendix — AEO JSON-LD per page (indien aanwezig)
     if aeo_job:
         elems.append(Paragraph("Appendix — AEO JSON-LD per page", S["Heading2"]))
         for page in (aeo_job.get("pages") or []):
@@ -1427,7 +1418,6 @@ def generate_report(conn, job):
     pdf_bytes = buffer.getvalue()
     buffer.close()
 
-    # return payload + exports
     pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
     return {
         "pdf_base64": pdf_base64,
@@ -1447,7 +1437,6 @@ def generate_report(conn, job):
                 "aeo_findings": bool(aeo_quality_rows),
             },
         },
-        # exports
         "patches_json": patches_export_rows,
         "patches_csv_base64": patches_csv_b64,
         "plan_items": plan_items,
