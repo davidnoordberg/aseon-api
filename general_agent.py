@@ -1,7 +1,7 @@
-# general agent
-
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
+from typing import Any, Dict
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -12,7 +12,8 @@ from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
 from faq_agent import generate_faqs
-import report_agent  # voor echte report-generatie
+import report_agent  # report generation
+import aeo_agent     # AEO generation
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -22,7 +23,6 @@ INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 DSN = os.environ["DATABASE_URL"]
 running = True
 
-
 # ---------- Logging ----------
 def log(level, msg, **kwargs):
     payload = {"ts": datetime.now(timezone.utc).isoformat(),
@@ -30,16 +30,13 @@ def log(level, msg, **kwargs):
                "msg": msg, **kwargs}
     print(json.dumps(payload), flush=True)
 
-
 def handle_sigterm(signum, frame):
     global running
     log("info", "received_shutdown")
     running = False
 
-
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
-
 
 # ---------- Helpers ----------
 def normalize_output(obj):
@@ -48,7 +45,6 @@ def normalize_output(obj):
         if isinstance(o, uuid.UUID): return str(o)
         return str(o)
     return json.loads(json.dumps(obj, default=default))
-
 
 def claim_one_job(conn):
     with conn.cursor() as cur:
@@ -68,7 +64,6 @@ def claim_one_job(conn):
         row = cur.fetchone()
         conn.commit()
         return row
-
 
 def finish_job(conn, job_id, ok, output=None, err=None):
     with conn.cursor() as cur:
@@ -98,9 +93,7 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
-            log("error", "finish_job_failed_write",
-                job_id=str(job_id), error=err_text)
-
+            log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
 
 # ---------- Site Info ----------
 def get_site_info(conn, site_id):
@@ -115,7 +108,7 @@ def get_site_info(conn, site_id):
         if not row or not row["url"]:
             raise ValueError("Site not found")
 
-        # <<< fix: normaliseer root URL zodat crawl altijd op www. host draait
+        # normalize root URL (ensure www. for aseon.io)
         url = row["url"].strip()
         if url.startswith("https://aseon.io") or url.startswith("http://aseon.io"):
             url = url.replace("aseon.io", "www.aseon.io")
@@ -124,7 +117,6 @@ def get_site_info(conn, site_id):
         row["url"] = url
 
         return row
-
 
 def get_latest_job_output(conn, site_id, jtype):
     with conn.cursor(row_factory=dict_row) as cur:
@@ -137,7 +129,6 @@ def get_latest_job_output(conn, site_id, jtype):
         """, (site_id, jtype))
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
-
 
 # ---------- Crawl ----------
 def run_crawl(conn, site_id, payload):
@@ -154,18 +145,15 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
-
 # ---------- Keywords ----------
 def run_keywords(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     market = (payload or {}).get("market", {}) or {}
     market.setdefault("language", site.get("language") or "en")
     market.setdefault("country", site.get("country") or "NL")
-
     payload = dict(payload or {})
     payload["market"] = market
     return generate_keywords(conn, site_id, payload)
-
 
 # ---------- Schema ----------
 def run_schema(conn, site_id, payload):
@@ -202,7 +190,6 @@ def run_schema(conn, site_id, payload):
         "_context_used": context_used if biz_type == "FAQPage" else None
     }
 
-
 # ---------- FAQ ----------
 def run_faq(conn, site_id, payload):
     site = get_site_info(conn, site_id)
@@ -212,20 +199,22 @@ def run_faq(conn, site_id, payload):
                    "country": site.get("country")}
     return out
 
+# ---------- AEO ----------
+def run_aeo(conn, site_id, payload):
+    job_stub = {"site_id": site_id, "payload": payload or {}}
+    return aeo_agent.generate_aeo(conn, job_stub)
 
 # ---------- Report ----------
 def run_report(conn, site_id, payload):
     job_stub = {"site_id": site_id, "payload": payload or {}}
     return report_agent.generate_report(conn, job_stub)
 
-
 # ---------- Dispatcher ----------
 def process_job(conn, job):
     jtype = job["type"]
     site_id = job["site_id"]
     payload = job.get("payload") or {}
-    log("info", "job_start", id=str(job["id"]), type=jtype,
-        site_id=str(site_id))
+    log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
 
     if jtype == "crawl":
         output = run_crawl(conn, site_id, payload)
@@ -235,6 +224,8 @@ def process_job(conn, job):
         output = run_keywords(conn, site_id, payload)
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
+    elif jtype == "aeo":
+        output = run_aeo(conn, site_id, payload)
     elif jtype == "report":
         output = run_report(conn, site_id, payload)
     else:
@@ -243,14 +234,13 @@ def process_job(conn, job):
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
-
 # ---------- Main loop ----------
 def main():
     global running
     log("info", "agent_boot",
         poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_FAQ_SCHEMA_TIED",
+        marker="AGENT_VERSION_AEO_ENABLED",
         ingest_enabled=INGEST_ENABLED)
     pool = ConnectionPool(DSN, min_size=1, max_size=4,
                           kwargs={"row_factory": dict_row})
@@ -273,7 +263,6 @@ def main():
             log("error", "loop_error", error=str(loop_err))
             time.sleep(POLL_INTERVAL_SEC)
     log("info", "agent_exit")
-
 
 if __name__ == "__main__":
     main()
