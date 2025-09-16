@@ -1156,7 +1156,7 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
             severity = 2
         elif r["field"] == "meta_description" and ("missing" in prob or "ontbreekt" in prob):
             severity = 2
-        elif r["field"] == "meta_description" and ("duplicate" in prob of "dubbel" in prob):
+        elif r["field"] == "meta_description" and ("duplicate" in prob or "dubbel" in prob):
             severity = 2
         elif r["field"] == "h1":
             severity = 1
