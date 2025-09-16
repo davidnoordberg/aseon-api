@@ -17,13 +17,12 @@ OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
 _openai_key = os.getenv("OPENAI_API_KEY")
 _openai_client = OpenAI(api_key=_openai_key) if _openai_key else None
 
-# Product-wide toggles (kun je via job['payload']['toggles'] overschrijven)
 DEFAULT_TOGGLES = {
-    "language_mode": "auto_default_en",            # detecteer, anders EN
-    "faq_mode": "strict",                          # FAQ alleen op type=faq of schema
-    "micro_faq_enabled": False,                    # geen micro-FAQ op non-FAQ
-    "max_qas_faq": 6,                              # 3–6 Q&A in patch/rapport
-    "emit_jsonld_when_visible_only": True,         # JSON-LD alleen als content zichtbaar is
+    "language_mode": "auto_default_en",
+    "faq_mode": "strict",                 # FAQ alleen als het echt FAQ is
+    "micro_faq_enabled": False,
+    "max_qas_faq": 6,                     # toon/patch max 6
+    "emit_jsonld_when_visible_only": True,
 }
 
 # -----------------------------
@@ -44,7 +43,6 @@ def _fetch_latest_job(conn, site_id: str, jtype: str):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
-
 def _fetch_site_meta(conn, site_id: str) -> Dict[str, Any]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -59,7 +57,7 @@ def _fetch_site_meta(conn, site_id: str) -> Dict[str, Any]:
         return cur.fetchone() or {}
 
 # -----------------------------
-# URL helpers
+# URL / language
 # -----------------------------
 def _norm_url(u: str) -> str:
     if not u:
@@ -76,9 +74,6 @@ def _norm_url(u: str) -> str:
         path = path[:-1]
     return urlunsplit((scheme, host, path, "", ""))
 
-# -----------------------------
-# Language helpers
-# -----------------------------
 def _autolang(site_meta: Dict[str, Any], crawl: Optional[Dict[str, Any]]) -> str:
     lang = (site_meta.get("language") or "").strip().lower()
     if lang:
@@ -92,7 +87,7 @@ def _page_language(page: Dict[str, Any], default_lang: str) -> str:
     return (page.get("language") or default_lang).split("-")[0].lower()
 
 # -----------------------------
-# Page-type classifier (rules-first)
+# Page-type classifier
 # -----------------------------
 def _classify_page_type(url: str, title: str, h1: str) -> str:
     u = url.lower()
@@ -133,10 +128,6 @@ def _shorten(s: str, n: int) -> str:
 def _word_count(text: str) -> int:
     return len((text or "").strip().split())
 
-def _has_faq_schema(page: Dict[str, Any]) -> bool:
-    types = [t.lower() for t in (page.get("jsonld_types") or [])]
-    return any(t == "faqpage" for t in types)
-
 def _first_paragraph(paragraphs: List[str]) -> str:
     for p in (paragraphs or []):
         if _word_count(p) >= 10:
@@ -144,24 +135,85 @@ def _first_paragraph(paragraphs: List[str]) -> str:
     return (paragraphs or [""])[0].strip() if (paragraphs or []) else ""
 
 # -----------------------------
-# Q&A extraction (robust)
+# JSON-LD helpers
 # -----------------------------
-_Q_HINT = re.compile(r"\?$|^(what|how|why|when|where|who|can|does|is|are)\b", re.I)
+def _jsonld_objects(page: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for k in ("jsonld", "json_ld", "structured_data", "ld_json"):
+        v = page.get(k)
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    out.append(item)
+        elif isinstance(v, dict):
+            out.append(v)
+    return out
+
+def _type_lower(x: Any) -> List[str]:
+    if isinstance(x, list):
+        return [str(t).lower() for t in x]
+    if isinstance(x, str):
+        return [x.lower()]
+    return []
+
+def _has_faq_schema(page: Dict[str, Any]) -> bool:
+    # via simple type list
+    types = [t.lower() for t in (page.get("jsonld_types") or [])]
+    if any(t == "faqpage" for t in types):
+        return True
+    # via full JSON-LD objects
+    for obj in _jsonld_objects(page):
+        for t in _type_lower(obj.get("@type")):
+            if t == "faqpage":
+                return True
+    return False
+
+# -----------------------------
+# Q&A extraction
+# -----------------------------
+_Q_HINT_EN = re.compile(r"\?$|^(what|how|why|when|where|who|can|does|is|are)\b", re.I)
 _Q_HINT_NL = re.compile(r"\?$|^(wat|hoe|waarom|wanneer|waar|wie|kan|doet|is|zijn)\b", re.I)
 
 def _extract_qas_from_structured(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Gebruik aanwezige velden als ze bestaan: faqs/faq_items/faq_qas."""
+    """
+    Lees Q&A uit allerlei bekende velden (breed gedekt) en uit JSON-LD FAQPage.
+    """
     out: List[Dict[str, str]] = []
-    for key in ("faqs", "faq_items", "faq_qas"):
-        items = page.get(key) or []
-        for it in items:
-            q = (it.get("q") or it.get("question") or "").strip()
-            a = (it.get("a") or it.get("answer") or "").strip()
-            if q and a:
-                out.append({"q": q, "a": a})
+
+    # 1) Polulaire veldnamen (arrays van {q,a} of {question,answer})
+    candidates = []
+    for key in ("faqs", "faq_items", "faq_qas", "faq", "faq_list", "qa_pairs", "q_and_a", "qna", "questions"):
+        v = page.get(key)
+        if isinstance(v, list):
+            candidates.extend(v)
+        elif isinstance(v, dict) and isinstance(v.get("items"), list):
+            candidates.extend(v.get("items") or [])
+
+    for it in candidates:
+        if not isinstance(it, dict):
+            continue
+        q = (it.get("q") or it.get("question") or it.get("name") or "").strip()
+        a = (it.get("a") or it.get("answer") or (it.get("acceptedAnswer") or {}).get("text") or "").strip()
+        if q and a:
+            out.append({"q": q, "a": a})
+
+    # 2) JSON-LD FAQPage → mainEntity
+    for obj in _jsonld_objects(page):
+        types = _type_lower(obj.get("@type"))
+        if "faqpage" in types:
+            main = obj.get("mainEntity") or []
+            if isinstance(main, list):
+                for m in main:
+                    if not isinstance(m, dict):
+                        continue
+                    q = (m.get("name") or m.get("question") or "").strip()
+                    acc = m.get("acceptedAnswer") or {}
+                    a = (acc.get("text") or acc.get("answer") or "").strip() if isinstance(acc, dict) else ""
+                    if q and a:
+                        out.append({"q": q, "a": a})
+
     # dedupe op vraag
-    seen = set()
-    dedup: List[Dict[str, str]] = []
+    dedup, seen = [], set()
     for qa in out:
         k = qa["q"].strip().lower()
         if k in seen:
@@ -171,30 +223,36 @@ def _extract_qas_from_structured(page: Dict[str, Any]) -> List[Dict[str, str]]:
     return dedup
 
 def _extract_qas_from_headings_and_paragraphs(page: Dict[str, Any], lang: str) -> List[Dict[str, str]]:
-    """Heuristiek: koppel h2/h3 (vraag) aan dichtstbijzijnde paragraaf (antwoord)."""
-    questions = (page.get("h3") or []) + (page.get("h2") or [])
+    """
+    Heuristiek: neem h2/h3/h4 die eruitzien als vragen en koppel die aan de dichtstbijzijnde
+    VOLGENDE paragraaf met ≥12 woorden.
+    """
+    headings = (page.get("h2") or []) + (page.get("h3") or []) + (page.get("h4") or [])
     paragraphs = page.get("paragraphs") or []
-    qre = _Q_HINT_NL if lang == "nl" else _Q_HINT
+    qre = _Q_HINT_NL if lang == "nl" else _Q_HINT_EN
 
-    qs = [q.strip() for q in questions if q and _word_count(q) <= 25 and (qre.search(q.strip()) is not None)]
-    # simpele koppeling: zip op index; filter te korte antwoorden
+    # indexeer eerste zinnige paragrafen
+    para_ix = [i for i, p in enumerate(paragraphs) if _word_count(p) >= 12]
+
     qas: List[Dict[str, str]] = []
-    for i, q in enumerate(qs):
-        if i >= len(paragraphs):
-            break
-        a = (paragraphs[i] or "").strip()
-        if _word_count(a) < 12:
-            # zoek volgende bruikbare paragraaf
-            for j in range(i + 1, min(i + 4, len(paragraphs))):
-                cand = (paragraphs[j] or "").strip()
-                if _word_count(cand) >= 12:
-                    a = cand
-                    break
-        if q and a:
-            qas.append({"q": q, "a": a})
+    for q in headings:
+        if not q:
+            continue
+        q = q.strip()
+        if _word_count(q) > 25 or not qre.search(q):
+            continue
+        # vind dichtstbijzijnde volgende paragraaf
+        answer = ""
+        if para_ix:
+            # neem de eerste para-index — in echte DOM zou je posities hebben; hier nemen we de eerstvolgende
+            answer = paragraphs[para_ix[0]].strip()
+            # schuif het venster op
+            para_ix = para_ix[1:]
+        if q and answer:
+            qas.append({"q": q, "a": answer})
+
     # dedupe
-    seen = set()
-    dedup: List[Dict[str, str]] = []
+    dedup, seen = [], set()
     for qa in qas:
         k = qa["q"].strip().lower()
         if k in seen:
@@ -210,10 +268,9 @@ def _trim_to_80w(q: str, a: str) -> Tuple[str, str, bool]:
     return q, " ".join(words[:80]) + "…", True
 
 # -----------------------------
-# LLM fallback (FAQ) & blocks (non-FAQ)
+# LLM helpers
 # -----------------------------
 def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx: str, n: int = 4) -> List[Dict[str, str]]:
-    # Fallback zonder OpenAI-key
     if not _openai_client:
         topic = (h1 or title or "").strip() or ("deze pagina" if lang == "nl" else "this page")
         if lang == "nl":
@@ -235,7 +292,7 @@ def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx
     sys = (
         "You create snippet-ready Q&A for Answer/Generative Engines. "
         "Write in the requested language. Each answer must be ≤80 words, lead with the answer, "
-        "use only facts from the provided context. Return a JSON array of {q,a}."
+        "and only use facts from the provided context. Return a JSON array of {q,a}."
     )
     user = {
         "language": lang,
@@ -256,7 +313,6 @@ def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx
             ],
         )
         txt = resp.choices[0].message.content.strip()
-        # probeer JSON array te parsen
         m = re.search(r"\[.*\]", txt, re.S)
         data = json.loads(m.group(0)) if m else []
         out = []
@@ -269,6 +325,9 @@ def _llm_qas_from_page(lang: str, title: str, h1: str, body_preview: str, kb_ctx
     except Exception:
         return []
 
+# -----------------------------
+# FAQ HTML/JSON-LD builders
+# -----------------------------
 def _faq_html_block(qas: List[Dict[str, str]], lang: str) -> str:
     label = "Veelgestelde vragen" if lang == "nl" else "Frequently asked questions"
     items = []
@@ -299,10 +358,9 @@ def _faq_jsonld(qas: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
 # -----------------------------
-# Copy recepten (non-FAQ)
+# Non-FAQ content blocks
 # -----------------------------
 def _llm_copy_recipe(lang: str, page_type: str, title: str, h1: str, body_preview: str) -> Dict[str, Any]:
-    # Fallback zonder LLM → compacte blokken
     def fb_text(en: str, nl: str) -> str:
         return nl if lang == "nl" else en
 
@@ -341,13 +399,7 @@ def _llm_copy_recipe(lang: str, page_type: str, title: str, h1: str, body_previe
         "Language matches the requested language; keep each block concise."
     )
     user = json.dumps(
-        {
-            "language": lang,
-            "page_type": page_type,
-            "title": title,
-            "h1": h1,
-            "body_preview": _shorten(body_preview, 1200),
-        },
+        {"language": lang, "page_type": page_type, "title": title, "h1": h1, "body_preview": _shorten(body_preview, 1200)},
         ensure_ascii=False,
     )
     try:
@@ -374,8 +426,76 @@ def _llm_copy_recipe(lang: str, page_type: str, title: str, h1: str, body_previe
     except Exception:
         return out
 
+def _patch_from_blocks(url: str, blocks: Dict[str, Any], lang: str) -> List[Dict[str, Any]]:
+    patches: List[Dict[str, Any]] = []
+    hero = blocks.get("hero") or {}
+    if hero:
+        html = f"""<section class="hero">
+  <h1>{hero.get('h1','')}</h1>
+  <p class="subhead">{hero.get('subhead','')}</p>
+  <div class="ctas">
+    <a href="#" class="btn btn-primary">{hero.get('primary_cta','')}</a>
+    <a href="#" class="btn btn-secondary">{hero.get('secondary_cta','')}</a>
+  </div>
+</section>"""
+        patches.append({
+            "url": url, "field": "hero",
+            "problem": "Missing/weak hero section" if lang == "en" else "Ontbrekende/zwakke hero-sectie",
+            "current": "(none)", "proposed": None, "html_patch": html,
+            "category": "body", "severity": 2, "impact": 5, "effort": 2, "priority": 5.5, "patchable": True
+        })
+    if hero.get("subhead"):
+        patches.append({
+            "url": url, "field": "subhead",
+            "problem": "Clarify value in one sentence" if lang == "en" else "Verduidelijk de waarde in één zin",
+            "current": "(none)", "proposed": None,
+            "html_patch": f"""<p class="page-subhead">{hero.get('subhead')}</p>""",
+            "category": "body", "severity": 1, "impact": 3, "effort": 1, "priority": 4.0, "patchable": True
+        })
+    vps = blocks.get("value_props") or []
+    if vps:
+        lis = "".join([f"<li><strong>{vp.get('title','')}</strong> — {vp.get('desc','')}</li>" for vp in vps[:4]])
+        patches.append({
+            "url": url, "field": "value_props",
+            "problem": "Add 3–4 concrete value props" if lang == "en" else "Voeg 3–4 concrete voordelen toe",
+            "current": "(none)", "proposed": None,
+            "html_patch": f"""<section class="value-props"><ul>{lis}</ul></section>""",
+            "category": "body", "severity": 2, "impact": 4, "effort": 2, "priority": 5.0, "patchable": True
+        })
+    steps = blocks.get("steps") or []
+    if steps:
+        lis = "".join([f"<li>{s}</li>" for s in steps[:5]])
+        patches.append({
+            "url": url, "field": "steps",
+            "problem": "Clarify process in 3–5 steps" if lang == "en" else "Verduidelijk proces in 3–5 stappen",
+            "current": "(none)", "proposed": None,
+            "html_patch": f"""<section class="steps"><ol>{lis}</ol></section>""",
+            "category": "body", "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
+        })
+    proof = blocks.get("proof") or []
+    if proof:
+        lis = "".join([f"<li>{p}</li>" for p in proof[:3]])
+        patches.append({
+            "url": url, "field": "proof",
+            "problem": "Add social proof" if lang == "en" else "Voeg social proof toe",
+            "current": "(none)", "proposed": None,
+            "html_patch": f"""<section class="proof"><ul>{lis}</ul></section>""",
+            "category": "body", "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
+        })
+    ctas = blocks.get("ctas") or []
+    if ctas:
+        btns = "".join([f"""<a href="{c.get('href_hint','#')}" class="btn">{c.get('label','')}</a>""" for c in ctas[:3]])
+        patches.append({
+            "url": url, "field": "ctas",
+            "problem": "Calls to action" if lang == "en" else "CTA’s toevoegen",
+            "current": "(none)", "proposed": None,
+            "html_patch": f"""<div class="ctas">{btns}</div>""",
+            "category": "body", "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
+        })
+    return patches
+
 # -----------------------------
-# AEO scoring
+# Scoring
 # -----------------------------
 _EXPECTED_SCHEMA = {
     "home": {"website", "organization"},
@@ -390,21 +510,39 @@ _EXPECTED_SCHEMA = {
     "other": set(),
 }
 
-def _has_expected_schema(jsonld_types: List[str], page_type: str) -> bool:
+def _has_expected_schema(jsonld_types: List[str], page: Dict[str, Any], page_type: str) -> bool:
     types = {t.lower() for t in (jsonld_types or [])}
     expected = _EXPECTED_SCHEMA.get(page_type, set())
-    return any(t in types for t in expected)
+    if any(t in types for t in expected):
+        return True
+    # fallback: via JSON-LD objects
+    for obj in _jsonld_objects(page):
+        for t in _type_lower(obj.get("@type")):
+            if t in expected:
+                return True
+    return False
 
-def _score_nonfaq_page(
-    page: Dict[str, Any],
-    page_type: str,
-    intro_words: int,
-    has_expected: bool,
-    canonical_ok: bool,
-    title_ok: bool,
-    meta_ok: bool,
-    has_cta_link: bool,
-) -> Tuple[int, List[str], Dict[str, int]]:
+def _title_ok(s: str) -> bool:
+    s = (s or "").strip()
+    return 30 <= len(s) <= 65
+
+def _meta_ok(s: str) -> bool:
+    s = (s or "").strip()
+    return 140 <= len(s) <= 160
+
+def _canonical_ok(url: str, canon: str) -> bool:
+    if not canon:
+        return False
+    return _norm_url(url) == _norm_url(canon)
+
+def _has_primary_cta(page: Dict[str, Any]) -> bool:
+    links = [str(x).lower() for x in (page.get("links") or [])]
+    hints = ("/contact", "/pricing", "/subscription", "/scan", "/get-started", "mailto:")
+    return any(any(h in l for h in hints) for l in links)
+
+def _score_nonfaq_page(page: Dict[str, Any], page_type: str, intro_words: int, has_expected: bool,
+                       canonical_ok: bool, title_ok: bool, meta_ok: bool, has_cta_link: bool
+                       ) -> Tuple[int, List[str], Dict[str, int]]:
     score = 0
     issues: List[str] = []
     metrics = {
@@ -415,7 +553,7 @@ def _score_nonfaq_page(
         "canonical_ok": 1 if canonical_ok else 0,
         "cta_present": 1 if has_cta_link else 0,
     }
-    # Weights (max 45)
+    # Weights
     score += metrics["intro_20_80w"] * 10
     score += metrics["has_expected_schema"] * 10
     score += metrics["title_in_range"] * 8
@@ -436,7 +574,7 @@ def _score_nonfaq_page(
     if not metrics["cta_present"]:
         issues.append("No primary CTA link detected")
 
-    return min(score, 90), issues, metrics  # reserve headroom vs FAQ max
+    return min(score, 90), issues, metrics
 
 def _score_faq_page(qas_count: int, has_faq_schema: bool, answers_leq_80w: int) -> Tuple[int, List[str], Dict[str, int]]:
     issues: List[str] = []
@@ -446,11 +584,9 @@ def _score_faq_page(qas_count: int, has_faq_schema: bool, answers_leq_80w: int) 
     if qas_count >= 3:
         score += 40
     elif qas_count == 2:
-        score += 20
-        issues.append("Too few Q&A (min 3).")
+        score += 20; issues.append("Too few Q&A (min 3).")
     elif qas_count == 1:
-        score += 10
-        issues.append("Too few Q&A (min 3).")
+        score += 10; issues.append("Too few Q&A (min 3).")
     else:
         issues.append("No Q&A present.")
 
@@ -460,106 +596,18 @@ def _score_faq_page(qas_count: int, has_faq_schema: bool, answers_leq_80w: int) 
     else:
         issues.append("No FAQPage JSON-LD.")
 
-    # Answer length quality (max 30)
+    # Answer length (max 30)
     if qas_count > 0:
         ratio = answers_leq_80w / float(qas_count)
         score += int(30 * ratio)
         if answers_leq_80w < qas_count:
             issues.append("Some answers >80 words.")
 
-    metrics = {
-        "qas": qas_count,
-        "has_faq_schema": 1 if has_faq_schema else 0,
-        "answers_leq_80w": answers_leq_80w,
-    }
+    metrics = {"qas": qas_count, "has_faq_schema": 1 if has_faq_schema else 0, "answers_leq_80w": answers_leq_80w}
     return min(score, 100), issues, metrics
 
 # -----------------------------
-# Content patch builders (non-FAQ)
-# -----------------------------
-def _patch_from_blocks(url: str, blocks: Dict[str, Any], lang: str) -> List[Dict[str, Any]]:
-    patches: List[Dict[str, Any]] = []
-    # hero
-    hero = blocks.get("hero") or {}
-    if hero:
-        html = f"""<section class="hero">
-  <h1>{hero.get('h1','')}</h1>
-  <p class="subhead">{hero.get('subhead','')}</p>
-  <div class="ctas">
-    <a href="#" class="btn btn-primary">{hero.get('primary_cta','')}</a>
-    <a href="#" class="btn btn-secondary">{hero.get('secondary_cta','')}</a>
-  </div>
-</section>"""
-        patches.append({
-            "url": url, "field": "hero",
-            "problem": "Missing/weak hero section" if lang == "en" else "Ontbrekende/zwakke hero-sectie",
-            "current": "(none)",
-            "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 2, "impact": 5, "effort": 2, "priority": 5.5, "patchable": True
-        })
-    # subhead (as separate emphasis)
-    if hero.get("subhead"):
-        html = f"""<p class="page-subhead">{hero.get('subhead')}</p>"""
-        patches.append({
-            "url": url, "field": "subhead",
-            "problem": "Clarify value in one sentence" if lang == "en" else "Verduidelijk de waarde in één zin",
-            "current": "(none)", "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 1, "impact": 3, "effort": 1, "priority": 4.0, "patchable": True
-        })
-    # value props
-    vps = blocks.get("value_props") or []
-    if vps:
-        lis = "".join([f"<li><strong>{vp.get('title','')}</strong> — {vp.get('desc','')}</li>" for vp in vps[:4]])
-        html = f"""<section class="value-props"><ul>{lis}</ul></section>"""
-        patches.append({
-            "url": url, "field": "value_props",
-            "problem": "Add 3–4 concrete value props" if lang == "en" else "Voeg 3–4 concrete voordelen toe",
-            "current": "(none)", "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 2, "impact": 4, "effort": 2, "priority": 5.0, "patchable": True
-        })
-    # steps
-    steps = blocks.get("steps") or []
-    if steps:
-        lis = "".join([f"<li>{s}</li>" for s in steps[:5]])
-        html = f"""<section class="steps"><ol>{lis}</ol></section>"""
-        patches.append({
-            "url": url, "field": "steps",
-            "problem": "Clarify process in 3–5 steps" if lang == "en" else "Verduidelijk proces in 3–5 stappen",
-            "current": "(none)", "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
-        })
-    # proof
-    proof = blocks.get("proof") or []
-    if proof:
-        lis = "".join([f"<li>{p}</li>" for p in proof[:3]])
-        html = f"""<section class="proof"><ul>{lis}</ul></section>"""
-        patches.append({
-            "url": url, "field": "proof",
-            "problem": "Add social proof" if lang == "en" else "Voeg social proof toe",
-            "current": "(none)", "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
-        })
-    # ctas
-    ctas = blocks.get("ctas") or []
-    if ctas:
-        btns = "".join([f"""<a href="{c.get('href_hint','#')}" class="btn">{c.get('label','')}</a>""" for c in ctas[:3]])
-        html = f"""<div class="ctas">{btns}</div>"""
-        patches.append({
-            "url": url, "field": "ctas",
-            "problem": "Calls to action" if lang == "en" else "CTA’s toevoegen",
-            "current": "(none)", "proposed": None,
-            "html_patch": html, "category": "body",
-            "severity": 1, "impact": 3, "effort": 1, "priority": 3.5, "patchable": True
-        })
-    return patches
-
-# -----------------------------
-# Main: generate_aeo
+# Main
 # -----------------------------
 def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     bucket: Dict[str, Dict[str, Any]] = {}
@@ -576,41 +624,19 @@ def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             bucket[u] = p
     return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
 
-def _title_ok(s: str) -> bool:
-    s = (s or "").strip()
-    return 30 <= len(s) <= 65
-
-def _meta_ok(s: str) -> bool:
-    s = (s or "").strip()
-    return 140 <= len(s) <= 160
-
-def _canonical_ok(url: str, canon: str) -> bool:
-    if not canon:
-        return False
-    return _norm_url(url) == _norm_url(canon)
-
-def _has_primary_cta(page: Dict[str, Any]) -> bool:
-    links = [str(x).lower() for x in (page.get("links") or [])]
-    hints = ("/contact", "/pricing", "/subscription", "/scan", "/get-started", "mailto:")
-    return any(any(h in l for h in hints) for l in links)
-
-def _detect_faq_page(url: str, page: Dict[str, Any], page_type: str) -> bool:
-    return page_type == "faq" or _has_faq_schema(page)
-
 def generate_aeo(conn, job) -> Dict[str, Any]:
     """
-    Build AEO analysis per page.
-    Returns a dict:
+    Returns:
     {
       "pages": [
-         {
-           "url": ..., "lang": ..., "type": "faq|other|...",
-           "score": int, "issues": [..], "metrics": {...},
-           "qas": [...], "faq_html": "<section>..</section>", "faq_jsonld": {...},
-           "content_patches": [...]
-         }, ...
+        {
+          "url": str, "lang": "en|nl", "type": "faq|home|service|...",
+          "score": int, "issues": [str], "metrics": { ... },
+          "qas": [{q,a}], "faq_html": str, "faq_jsonld": { ... },
+          "content_patches": [ ... ]  # only for non-FAQ
+        }, ...
       ],
-      "toggles": {...}
+      "toggles": { ... }
     }
     """
     site_id = job["site_id"]
@@ -638,36 +664,33 @@ def generate_aeo(conn, job) -> Dict[str, Any]:
 
         lang = _page_language(p, default_lang)
         page_type = _classify_page_type(url, title, h1)
-        is_faq = _detect_faq_page(url, p, page_type) if toggles["faq_mode"] == "strict" else (page_type == "faq" or _has_faq_schema(p) or "/faq" in url)
 
-        # Common signals
+        is_faq = (_has_faq_schema(p) or page_type == "faq") if toggles["faq_mode"] == "strict" else ("/faq" in url or _has_faq_schema(p) or page_type == "faq")
+
+        # Common page signals
         intro = _first_paragraph(paragraphs)
         intro_words = _word_count(intro)
-        has_expected = _has_expected_schema(jsonld_types, page_type if not is_faq else "faq")
-        title_ok = _title_ok(title)
-        meta_ok = _meta_ok(meta)
+        has_expected = _has_expected_schema(jsonld_types, p, "faq" if is_faq else page_type)
+        title_ok = (30 <= len(title) <= 65)
+        meta_ok = (140 <= len(meta) <= 160)
         canon_ok = _canonical_ok(url, canon)
         has_cta = _has_primary_cta(p)
 
-        page_obj: Dict[str, Any] = {
-            "url": url,
-            "lang": lang,
-            "type": "faq" if is_faq else page_type,
-        }
+        page_obj: Dict[str, Any] = {"url": url, "lang": lang, "type": "faq" if is_faq else page_type}
 
         if is_faq:
-            # 1) haal Q&A uit gestructureerde velden
+            # 1) structured fields
             qas = _extract_qas_from_structured(p)
 
-            # 2) heuristiek op h2/h3 + paragrafen
+            # 2) headings + paragraphs fallback
             if not qas:
                 qas = _extract_qas_from_headings_and_paragraphs(p, lang)
 
-            # 3) LLM fallback als nog steeds leeg
+            # 3) LLM fallback
             if not qas:
-                qas = _llm_qas_from_page(lang, title, h1, " ".join(paragraphs[:6]), "", n=max(3, min(6, toggles["max_qas_faq"])))
+                qas = _llm_qas_from_page(lang, title, h1, " ".join(paragraphs[:8]), "", n=max(3, min(6, toggles["max_qas_faq"])))
 
-            # trim answers naar ≤80w voor metrics + rapport
+            # trim to ≤80w
             qas_trimmed: List[Dict[str, str]] = []
             answers_leq_80 = 0
             for qa in qas:
@@ -676,25 +699,21 @@ def generate_aeo(conn, job) -> Dict[str, Any]:
                     answers_leq_80 += 1
                 qas_trimmed.append({"q": q, "a": a})
 
-            score, issues, metrics = _score_faq_page(len(qas_trimmed), has_expected or _has_faq_schema(p), answers_leq_80)
+            score, issues, metrics = _score_faq_page(len(qas_trimmed), _has_faq_schema(p), answers_leq_80)
             page_obj["score"] = score
             page_obj["issues"] = issues
             page_obj["metrics"] = metrics
 
-            # Alleen een compacte set (max_qas_faq) meest nuttige Q&A voor patches/rapport
             top_qas = qas_trimmed[: int(toggles["max_qas_faq"])]
-
-            # HTML en JSON-LD patches (zichtbaar → JSON-LD ook)
             faq_html = _faq_html_block(top_qas, lang) if top_qas else ""
             faq_jsonld = _faq_jsonld(top_qas) if (top_qas and (not toggles["emit_jsonld_when_visible_only"] or faq_html)) else {}
 
             page_obj["qas"] = top_qas
             page_obj["faq_html"] = faq_html
             page_obj["faq_jsonld"] = faq_jsonld
-            page_obj["content_patches"] = []  # niet voor FAQ
+            page_obj["content_patches"] = []
         else:
-            # Non-FAQ content-suggesties
-            blocks = _llm_copy_recipe(lang, page_type, title, h1, " ".join(paragraphs[:6]))
+            blocks = _llm_copy_recipe(lang, page_type, title, h1, " ".join(paragraphs[:8]))
             patches = _patch_from_blocks(url, blocks, lang)
             page_obj["content_patches"] = patches
 
@@ -705,7 +724,6 @@ def generate_aeo(conn, job) -> Dict[str, Any]:
             page_obj["score"] = score
             page_obj["issues"] = issues
             page_obj["metrics"] = metrics
-
             page_obj["qas"] = []
             page_obj["faq_html"] = ""
             page_obj["faq_jsonld"] = {}
