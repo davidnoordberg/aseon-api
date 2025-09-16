@@ -711,7 +711,6 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
 
 # -----------------------------------------------------
 # AEO (from AEO job: scorecards/issues -> findings)
-#   Uses derived metrics from _aeo_from_job (qas_detected, has_faq_schema_detected)
 # -----------------------------------------------------
 def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -749,7 +748,6 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
                     "fix": "Add valid FAQPage JSON-LD matching on-page Q&A.",
                     "accept": ["Rich Results Test: valid FAQPage", "JSON-LD matches visible questions/answers"],
                 })
-            # Overlong answers (if provided in metrics)
             if int(metrics.get("answers_gt_80w") or 0) > 0:
                 out.append({
                     "url": url,
@@ -763,7 +761,6 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
 
 # -----------------------------------------------------
 # AEO concrete (from aeo job) -> scorecards, Q&A rows, patches, plan_items
-#   Enriched with heuristics + JSON-LD fallback for Q&A
 # -----------------------------------------------------
 def _task_texts_for_content(field: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
@@ -805,12 +802,10 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         lang = page.get("lang") or "en"
         ptype = _infer_ptype(url, page)
 
-        # Collect Q&A from job + JSON-LD
         qas_job = page.get("qas") or []
         qas_ld = _qas_from_jsonld(page.get("faq_jsonld") or {})
         merged_qas: List[Dict[str, str]] = []
 
-        # Merge & dedupe by question
         seen = set()
         for src in (qas_job, qas_ld):
             for qa in src:
@@ -824,16 +819,13 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 seen.add(k)
                 merged_qas.append({"q": q, "a": a})
 
-        # Count overlong answers before trimming
         answers_gt_80w = sum(1 for qa in merged_qas if len((qa["a"] or "").split()) > 80)
 
-        # Build Q&A rows for the report (trim to ≤80 words)
         if ptype == "faq" and merged_qas:
             for qa in merged_qas:
                 trimmed, _ = _trim_words(qa["a"], 80)
                 rows.append({"url": url, "q": qa["q"], "a": trimmed, "gaps": ", ".join(page.get("issues") or []) or "OK"})
 
-        # Prepare patches for FAQ (only if relevant)
         faq_html = page.get("faq_html") or ""
         faq_jsonld = page.get("faq_jsonld") or {}
 
@@ -882,7 +874,6 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "lang": lang
             })
 
-        # Content patches for non-FAQ (optional from AEO agent)
         for cp in (page.get("content_patches") or []):
             field = cp.get("field") or "content"
             html_patch = cp.get("html_patch") or ""
@@ -927,10 +918,8 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "lang": lang
             })
 
-        # Scorecard (issues corrected by our detection)
         score = int(page.get("score") or 0)
         issues = [str(i) for i in (page.get("issues") or [])]
-        # remove false positives
         if ptype == "faq":
             if merged_qas and len(merged_qas) >= 3:
                 issues = [i for i in issues if "too few q&a" not in i.lower()]
@@ -938,7 +927,7 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 issues = [i for i in issues if "no faqpage json-ld" not in i.lower()]
 
         metrics_in = page.get("metrics") or {}
-        metrics = dict(metrics_in)  # copy
+        metrics = dict(metrics_in)
         metrics["qas_detected"] = len(merged_qas)
         metrics["answers_gt_80w"] = answers_gt_80w
         metrics["answers_leq_80w"] = max(0, len(merged_qas) - answers_gt_80w)
@@ -1167,7 +1156,7 @@ def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any
             severity = 2
         elif r["field"] == "meta_description" and ("missing" in prob or "ontbreekt" in prob):
             severity = 2
-        elif r["field"] == "meta_description" and ("duplicate" in prob or "dubbel" in prob):
+        elif r["field"] == "meta_description" and ("duplicate" in prob of "dubbel" in prob):
             severity = 2
         elif r["field"] == "h1":
             severity = 1
@@ -1418,7 +1407,6 @@ def generate_report(conn, job):
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
     tag_patches = _build_canonical_og_patches(crawl, text_rows)
 
-    # Enriched AEO
     aeo_concrete = _aeo_from_job(aeo_job)
     aeo_scorecards = aeo_concrete.get("scorecards", [])
     aeo_qna_rows = aeo_concrete.get("rows", [])
@@ -1555,18 +1543,23 @@ def generate_report(conn, job):
             elems.append(Spacer(1, 6))
     elems.append(PageBreak())
 
-    # Canonical & Open Graph patches (render patch cell as monospace to avoid parser issues)
+    # Canonical & Open Graph patches — tabel ZONDER patch-code
     elems.append(Paragraph("HTML patches — Canonical & Open Graph", S["Heading2"]))
     if not tag_patches:
         elems.append(Paragraph("No patches needed." if (site_meta.get("language") or "").lower().startswith("en") else "Geen patches nodig.", S["Normal"]))
     else:
-        headers = ["Page URL", "Category", "Issue", "Current", "Patch (copy/paste)"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Categorie", "Probleem", "Huidig", "Patch (copy/paste)"]
-        colw = [0.23 * width, 0.12 * width, 0.15 * width, 0.25 * width, 0.25 * width]
+        headers = ["Page URL", "Category", "Issue", "Current"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Categorie", "Probleem", "Huidig"]
+        colw = [0.35 * width, 0.15 * width, 0.20 * width, 0.30 * width]
         data = [headers]
         for pch in tag_patches:
-            # Use Code() for patch column to keep literal HTML; avoids ReportLab paragraph parser errors
-            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny"), Code(pch.get("html_patch") or "")])
+            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny")])
         elems.append(_make_table(data, colw))
+        elems.append(Spacer(1, 6))
+        # Patch-codeblokken los onder de tabel (voorkomt paraparser issues)
+        elems.append(Paragraph("Patches (copy & paste):" if (site_meta.get("language") or "").lower().startswith("en") else "Patches (kopieer & plak):", S["Small"]))
+        for pch in tag_patches[:40]:
+            label = f"{pch['category']} — {pch['url']}"
+            elems.append(KeepTogether([P(_shorten(label, 140), "Tiny"), Code(pch.get("html_patch") or ""), Spacer(1, 4)]))
     elems.append(PageBreak())
 
     # Implementation plan
