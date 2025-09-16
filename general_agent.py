@@ -1,7 +1,5 @@
 import os, json, time, signal, uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
-
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -12,8 +10,8 @@ from keywords_agent import generate_keywords
 from schema_agent import generate_schema
 from ingest_agent import ingest_crawl_output
 from faq_agent import generate_faqs
-import report_agent  # report generation
-import aeo_agent     # AEO generation
+import report_agent
+import aeo_agent
 
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
@@ -23,7 +21,6 @@ INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").lower() == "true"
 DSN = os.environ["DATABASE_URL"]
 running = True
 
-# ---------- Logging ----------
 def log(level, msg, **kwargs):
     payload = {"ts": datetime.now(timezone.utc).isoformat(),
                "level": level.upper(),
@@ -38,7 +35,6 @@ def handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
-# ---------- Helpers ----------
 def normalize_output(obj):
     def default(o):
         if isinstance(o, datetime): return o.isoformat()
@@ -93,9 +89,9 @@ def finish_job(conn, job_id, ok, output=None, err=None):
                  WHERE id=%s
             """, (err_text, job_id))
             conn.commit()
-            log("error", "finish_job_failed_write", job_id=str(job_id), error=err_text)
+            log("error", "finish_job_failed_write",
+                job_id=str(job_id), error=err_text)
 
-# ---------- Site Info ----------
 def get_site_info(conn, site_id):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
@@ -107,15 +103,12 @@ def get_site_info(conn, site_id):
         row = cur.fetchone()
         if not row or not row["url"]:
             raise ValueError("Site not found")
-
-        # normalize root URL (ensure www. for aseon.io)
         url = row["url"].strip()
         if url.startswith("https://aseon.io") or url.startswith("http://aseon.io"):
             url = url.replace("aseon.io", "www.aseon.io")
         if not url.endswith("/"):
             url += "/"
         row["url"] = url
-
         return row
 
 def get_latest_job_output(conn, site_id, jtype):
@@ -130,13 +123,11 @@ def get_latest_job_output(conn, site_id, jtype):
         r = cur.fetchone()
         return (r or {}).get("output") if r else None
 
-# ---------- Crawl ----------
 def run_crawl(conn, site_id, payload):
     max_pages = int((payload or {}).get("max_pages", 10))
     ua = (payload or {}).get("user_agent") or "AseonBot/0.1 (+https://aseon.ai)"
     site = get_site_info(conn, site_id)
     result = crawl_site(site["url"], max_pages=max_pages, ua=ua)
-
     if INGEST_ENABLED:
         try:
             inserted = ingest_crawl_output(conn, site_id, result)
@@ -145,7 +136,6 @@ def run_crawl(conn, site_id, payload):
             log("error", "ingest_failed", error=str(e))
     return result
 
-# ---------- Keywords ----------
 def run_keywords(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     market = (payload or {}).get("market", {}) or {}
@@ -155,14 +145,12 @@ def run_keywords(conn, site_id, payload):
     payload["market"] = market
     return generate_keywords(conn, site_id, payload)
 
-# ---------- Schema ----------
 def run_schema(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     biz_type = (payload or {}).get("biz_type", "Organization")
     extras = (payload or {}).get("extras") or {}
     use_ctx = (payload or {}).get("use_context", "auto")
     count = int((payload or {}).get("count", 3))
-
     faqs_for_schema = None
     context_used = "none"
     if biz_type == "FAQPage" and use_ctx in ("auto", "faq", "documents", "crawl"):
@@ -170,7 +158,6 @@ def run_schema(conn, site_id, payload):
         if latest_faq and isinstance(latest_faq.get("faqs"), list) and latest_faq["faqs"]:
             faqs_for_schema = latest_faq["faqs"]
             context_used = "faq"
-
     data = generate_schema(
         biz_type=biz_type,
         site_name=site.get("account_name"),
@@ -179,7 +166,6 @@ def run_schema(conn, site_id, payload):
         extras={**extras, "count": count, "faqs": faqs_for_schema,
                 "use_context": use_ctx}
     )
-
     return {
         "schema": data,
         "biz_type": biz_type,
@@ -190,7 +176,6 @@ def run_schema(conn, site_id, payload):
         "_context_used": context_used if biz_type == "FAQPage" else None
     }
 
-# ---------- FAQ ----------
 def run_faq(conn, site_id, payload):
     site = get_site_info(conn, site_id)
     out = generate_faqs(conn, site_id, payload or {})
@@ -199,23 +184,15 @@ def run_faq(conn, site_id, payload):
                    "country": site.get("country")}
     return out
 
-# ---------- AEO ----------
-def run_aeo(conn, site_id, payload):
-    job_stub = {"site_id": site_id, "payload": payload or {}}
-    return aeo_agent.generate_aeo(conn, job_stub)
-
-# ---------- Report ----------
 def run_report(conn, site_id, payload):
     job_stub = {"site_id": site_id, "payload": payload or {}}
     return report_agent.generate_report(conn, job_stub)
 
-# ---------- Dispatcher ----------
 def process_job(conn, job):
     jtype = job["type"]
     site_id = job["site_id"]
     payload = job.get("payload") or {}
     log("info", "job_start", id=str(job["id"]), type=jtype, site_id=str(site_id))
-
     if jtype == "crawl":
         output = run_crawl(conn, site_id, payload)
     elif jtype == "schema":
@@ -225,26 +202,23 @@ def process_job(conn, job):
     elif jtype == "faq":
         output = run_faq(conn, site_id, payload)
     elif jtype == "aeo":
-        output = run_aeo(conn, site_id, payload)
+        output = aeo_agent.generate_aeo(conn, job)
     elif jtype == "report":
         output = run_report(conn, site_id, payload)
     else:
         raise ValueError(f"Unknown job type: {jtype}")
-
     log("info", "job_done", id=str(job["id"]), type=jtype)
     return output
 
-# ---------- Main loop ----------
 def main():
     global running
     log("info", "agent_boot",
         poll_interval=POLL_INTERVAL_SEC, batch_size=BATCH_SIZE,
         git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown",
-        marker="AGENT_VERSION_AEO_ENABLED",
+        marker="AGENT_VERSION_FAQ_SCHEMA_TIED",
         ingest_enabled=INGEST_ENABLED)
     pool = ConnectionPool(DSN, min_size=1, max_size=4,
                           kwargs={"row_factory": dict_row})
-
     while running:
         try:
             with pool.connection() as conn:
@@ -256,8 +230,7 @@ def main():
                     output = process_job(conn, job)
                     finish_job(conn, job["id"], True, output, None)
                 except Exception as e:
-                    log("error", "job_failed", id=str(job["id"]),
-                        error=str(e))
+                    log("error", "job_failed", id=str(job["id"]), error=str(e))
                     finish_job(conn, job["id"], False, None, e)
         except Exception as loop_err:
             log("error", "loop_error", error=str(loop_err))
