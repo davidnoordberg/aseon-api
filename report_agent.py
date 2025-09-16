@@ -553,6 +553,61 @@ def _build_seo_findings(crawl: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str,
 
 
 # -----------------------------------------------------
+# AEO helpers (type inference, JSON-LD → Q&A)
+# -----------------------------------------------------
+def _infer_page_type(url: str, crawl: Optional[Dict[str, Any]], existing: Optional[str] = None) -> str:
+    """Prefer FAQ when heuristics say so (path/jsonld), otherwise keep existing or 'other'."""
+    ex = (existing or "").lower()
+    if ex == "faq":
+        return "faq"
+    u = _norm_url(url)
+    try:
+        path = urlsplit(u).path.lower()
+    except Exception:
+        path = u.lower()
+    if "/faq" in path or path.rstrip("/").endswith("/faq"):
+        return "faq"
+    if crawl:
+        for p in (crawl.get("pages") or []):
+            pu = _norm_url(p.get("final_url") or p.get("url") or "")
+            if pu == u:
+                types = [t.lower() for t in (p.get("jsonld_types") or [])]
+                if "faqpage" in types:
+                    return "faq"
+                break
+    return (existing or "other").lower()
+
+
+def _extract_qas_from_faq_jsonld(faq_jsonld: Any, lang: str = "en") -> List[Dict[str, str]]:
+    """Fallback: build Q&A rows from JSON-LD when the AEO job didn't include 'qas'."""
+    out: List[Dict[str, str]] = []
+    if not faq_jsonld:
+        return out
+    try:
+        obj = faq_jsonld
+        if isinstance(obj, str):
+            obj = json.loads(obj)
+        entities = obj.get("mainEntity") or []
+        for it in entities:
+            q = (it.get("name") or it.get("question") or "").strip()
+            a = ""
+            ans = it.get("acceptedAnswer") or {}
+            if isinstance(ans, dict):
+                a = (ans.get("text") or "").strip()
+            if not q or not a:
+                continue
+            a_plain = re.sub(r"<[^>]+>", " ", a)
+            a_plain = re.sub(r"\s+", " ", a_plain).strip()
+            words = a_plain.split()
+            if len(words) > 80:
+                a_plain = " ".join(words[:80])
+            out.append({"q": q, "a": a_plain})
+    except Exception:
+        pass
+    return out
+
+
+# -----------------------------------------------------
 # AEO (quality heuristics from FAQ job)
 # -----------------------------------------------------
 def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -619,7 +674,6 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
         for iss in issues:
             s = (iss or "").lower()
             if "too few q&a" in s:
-                # Alleen relevant wanneer het om een FAQ-pagina gaat
                 if ptype == "faq":
                     out.append({
                         "url": url,
@@ -687,7 +741,7 @@ def _task_texts_for_content(field: str, lang: str) -> Tuple[str, str]:
     return label, why
 
 
-def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _aeo_from_job(aeo: Optional[Dict[str, Any]], crawl: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     rows = []
     patches = []
     plan_items = []
@@ -699,18 +753,34 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for page in (aeo.get("pages") or []):
         url = page.get("url")
         lang = page.get("lang") or "en"
-        ptype = (page.get("type") or "other").lower()
+        ptype_raw = (page.get("type") or "other").lower()
+        ptype = _infer_page_type(url, crawl, ptype_raw)
         score = int(page.get("score") or 0)
-        issues = page.get("issues") or []
-        metrics = page.get("metrics") or {}
+
+        # Filter issues/metrics voor non-FAQ pagina’s
+        issues_all = page.get("issues") or []
+        if ptype != "faq":
+            issues = [i for i in issues_all if not re.search(r"(faq|q&a|json-ld)", i or "", re.I)]
+        else:
+            issues = issues_all
+
+        metrics_all = page.get("metrics") or {}
+        if ptype != "faq":
+            metrics = {k: v for k, v in metrics_all.items() if k not in ("qas", "has_faq_schema", "answers_leq_80w")}
+        else:
+            metrics = metrics_all
+
         scorecards.append({"url": url, "type": ptype, "score": score, "issues": issues, "metrics": metrics})
 
-        # Q&A alleen tonen voor FAQ-pagina’s
+        # Alleen Q&A tonen voor FAQ; gebruik JSON-LD als 'qas' ontbreekt
         if ptype == "faq":
-            for qa in (page.get("qas") or []):
+            qas_list = (page.get("qas") or [])
+            if not qas_list and page.get("faq_jsonld"):
+                qas_list = _extract_qas_from_faq_jsonld(page.get("faq_jsonld"), lang)
+            for qa in qas_list:
                 rows.append({"url": url, "q": qa.get("q"), "a": qa.get("a"), "gaps": ", ".join(issues) or "OK"})
 
-        # FAQ patches alleen als type == faq
+        # FAQ HTML-blok/JSON-LD patches alleen voor FAQ
         faq_html = page.get("faq_html") or ""
         faq_jsonld = page.get("faq_jsonld") or {}
         if ptype == "faq" and faq_html.strip():
@@ -720,19 +790,16 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "current": "(none or not snippet-ready)",
                 "proposed": "Add FAQ HTML block (3–6 Q&A, answers ≤80 words)",
                 "html_patch": faq_html,
-                "category": "body", "severity": "medium", "impact": 5, "effort": 2, "priority": 6.0, "patchable": True
+                "category": "body", "severity": 2, "impact": 5, "effort": 2, "priority": 6.0, "patchable": True
             })
             plan_items.append({
                 "url": url,
-                "task": "Add FAQ section (3–6 Q&A, ≤80 words)" if lang == "en" else "FAQ-blok toevoegen (3–6 Q&A, ≤80 woorden)",
-                "why": "Improves answer/snippet eligibility in AE/LLM surfaces" if lang == "en" else "Verbetert snippet-eligibility in AE/LLM-oppervlakken",
+                "task": "FAQ-blok toevoegen (3–6 Q&A, ≤80 woorden)" if lang == "nl" else "Add FAQ section (3–6 Q&A, ≤80 words)",
+                "why": "Verbetert snippet-eligibility in AE/LLM-oppervlakken" if lang == "nl" else "Improves answer/snippet eligibility in AE/LLM surfaces",
                 "category": "content",
                 "field": "faq_html_block",
                 "severity": 2, "impact": 5, "effort": 2, "effort_label": "M",
-                "priority": 6.0,
-                "patchable": True,
-                "html_patch": faq_html,
-                "lang": lang
+                "priority": 6.0, "patchable": True, "html_patch": faq_html, "lang": lang
             })
 
         if ptype == "faq" and faq_jsonld:
@@ -743,22 +810,19 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "current": "(none)",
                 "proposed": "Inject <script type='application/ld+json'>FAQPage…</script> in <head> or <body>",
                 "html_patch": html,
-                "category": "head", "severity": "medium", "impact": 4, "effort": 1, "priority": 6.0, "patchable": True
+                "category": "head", "severity": 2, "impact": 4, "effort": 1, "priority": 6.0, "patchable": True
             })
             plan_items.append({
                 "url": url,
-                "task": "Add FAQPage JSON-LD" if lang == "en" else "FAQPage JSON-LD toevoegen",
-                "why": "Validates Q&A for rich results; clearer AE extraction" if lang == "en" else "Valideert Q&A voor rich results; duidelijkere AE-extractie",
+                "task": "FAQPage JSON-LD toevoegen" if lang == "nl" else "Add FAQPage JSON-LD",
+                "why": "Valideert Q&A voor rich results; duidelijkere AE-extractie" if lang == "nl" else "Validates Q&A for rich results; clearer AE extraction",
                 "category": "tag",
                 "field": "faq_jsonld",
                 "severity": 2, "impact": 4, "effort": 1, "effort_label": "S",
-                "priority": 6.0,
-                "patchable": True,
-                "html_patch": html,
-                "lang": lang
+                "priority": 6.0, "patchable": True, "html_patch": html, "lang": lang
             })
 
-        # Content patches voor niet-FAQ paginatypes (van AEO-agent)
+        # Content patches voor overige paginatypes (door AEO-agent geleverd)
         for cp in (page.get("content_patches") or []):
             field = cp.get("field") or "content"
             html_patch = cp.get("html_patch") or ""
@@ -788,19 +852,11 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
             task, why = _task_texts_for_content(field, lang)
             plan_items.append({
-                "url": url,
-                "task": task,
-                "why": why,
-                "category": "content",
-                "field": field,
-                "severity": severity,
-                "impact": impact,
-                "effort": effort,
-                "effort_label": {1: "S", 2: "M", 3: "L"}.get(effort, "M"),
-                "priority": priority,
-                "patchable": patchable,
-                "html_patch": html_patch,
-                "lang": lang
+                "url": url, "task": task, "why": why, "category": "content", "field": field,
+                "severity": severity, "impact": impact,
+                "effort": effort, "effort_label": {1: "S", 2: "M", 3: "L"}.get(effort, "M"),
+                "priority": priority, "patchable": patchable,
+                "html_patch": html_patch, "lang": lang
             })
 
     return {"rows": rows, "patches": patches, "plan_items": plan_items, "scorecards": scorecards}
@@ -911,7 +967,8 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
                     "category": "open_graph",
                     "problem": "missing og:title/og:description" if (not og_title and not og_desc) else ("missing og:title" if not og_title else "missing og:description"),
                     "current": f"og:title={'present' if og_title else 'missing'}, og:description={'present' if og_desc else 'missing'}",
-                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n" f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
+                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n"
+                                   f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
                 }
             )
 
@@ -1274,7 +1331,8 @@ def generate_report(conn, job):
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
     tag_patches = _build_canonical_og_patches(crawl, text_rows)
 
-    aeo_concrete = _aeo_from_job(aeo_job)
+    # --- AEO concrete + fixes ---
+    aeo_concrete = _aeo_from_job(aeo_job, crawl)
     aeo_scorecards = aeo_concrete.get("scorecards", [])
     aeo_qna_rows = aeo_concrete.get("rows", [])
     aeo_patches = aeo_concrete.get("patches", [])
@@ -1414,7 +1472,7 @@ def generate_report(conn, job):
         colw = [0.23 * width, 0.12 * width, 0.15 * width, 0.25 * width, 0.25 * width]
         data = [headers]
         for pch in tag_patches:
-            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny"), P(pch["html_patch"], "Tiny")])
+            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny"), Code(pch["html_patch"])])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
