@@ -117,7 +117,21 @@ def Code(text: str) -> XPreformatted:
 
 
 def _make_table(data: List[List[Any]], col_widths: List[float]) -> Table:
-    t = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+    """
+    Hardening: elke stringcel eerst veilig maken (escape + Paragraph),
+    zodat ruwe HTML (bv. <link rel="canonical">) nooit door de paraparser gaat.
+    """
+    safe_data: List[List[Any]] = []
+    for row in data:
+        safe_row: List[Any] = []
+        for cell in row:
+            if isinstance(cell, str):
+                cell = P(cell, "Small")
+            # Paragraph / XPreformatted / KeepTogether etc. laten we ongemoeid
+            safe_row.append(cell)
+        safe_data.append(safe_row)
+
+    t = Table(safe_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
     t.setStyle(
         TableStyle(
             [
@@ -582,10 +596,6 @@ def _trim_words(s: str, limit: int = 80) -> Tuple[str, bool]:
     return " ".join(words[:limit]) + "…", True
 
 def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
-    """
-    Extract Q/A pairs from a FAQPage JSON-LD object.
-    Handles dict, list, minimal structure.
-    """
     out: List[Dict[str, str]] = []
 
     def _handle_entity(entity):
@@ -606,7 +616,6 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
     def _handle_root(obj):
         if not isinstance(obj, dict):
             return
-        # If it's a graph array wrapped in @graph
         if "@graph" in obj and isinstance(obj["@graph"], list):
             for node in obj["@graph"]:
                 if isinstance(node, dict) and str(node.get("@type", "")).lower() == "faqpage":
@@ -616,7 +625,6 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
                             _handle_entity(ent)
                     else:
                         _handle_entity(main)
-        # Plain FAQPage object
         main = obj.get("mainEntity") or obj.get("main_entity") or []
         if isinstance(main, list):
             for ent in main:
@@ -633,7 +641,6 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
     elif isinstance(faq_jsonld, dict):
         _handle_root(faq_jsonld)
 
-    # Dedup by normalized question
     seen = set()
     deduped: List[Dict[str, str]] = []
     for qa in out:
@@ -648,7 +655,6 @@ def _infer_ptype(url: str, page: Dict[str, Any]) -> str:
     given = (page.get("type") or "").lower().strip()
     if given == "faq":
         return "faq"
-    # Heuristics
     if page.get("faq_jsonld"):
         return "faq"
     metrics = page.get("metrics") or {}
@@ -1470,7 +1476,7 @@ def generate_report(conn, job):
             url_txt = r.get("url") or ""
             if r.get("type"):
                 url_txt = f"{url_txt}  [{r.get('type')}]"
-            data.append([P(_shorten(url_txt, 120)), P(str(r.get("score", "")), "Tiny"), P(issues_txt, "Tiny"), P(metrics_txt, "Tiny")])
+            data.append([_shorten(url_txt, 120), str(r.get("score", "")), issues_txt, metrics_txt])
         elems.append(_make_table(data, colw))
     elems.append(Spacer(1, 8))
 
@@ -1483,7 +1489,7 @@ def generate_report(conn, job):
         colw = [0.28 * width, 0.26 * width, 0.30 * width, 0.16 * width]
         data = [headers]
         for r in aeo_qna_rows[:80]:
-            data.append([P(_shorten(r["url"], 120)), P(r["q"]), P(r["a"]), P(r.get("gaps") or "OK", "Tiny")])
+            data.append([_shorten(r["url"], 120), r["q"], r["a"], r.get("gaps") or "OK"])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
@@ -1498,11 +1504,11 @@ def generate_report(conn, job):
         for r in text_rows:
             data.append(
                 [
-                    P(_shorten(r["url"], 120)),
-                    P(r["field"]),
-                    P(r["problem"], "Tiny"),
-                    P(_shorten(str(r.get("current", "")), 300), "Tiny"),
-                    P(_shorten(str(r.get("proposed", "")), 300), "Tiny"),
+                    _shorten(r["url"], 120),
+                    r["field"],
+                    r["problem"],
+                    _shorten(str(r.get("current", "")), 300),
+                    _shorten(str(r.get("proposed", "")), 300),
                 ]
             )
         elems.append(_make_table(data, colw))
@@ -1523,7 +1529,7 @@ def generate_report(conn, job):
             colw = [0.55 * width, 0.45 * width]
             data = [headers]
             for row in g["rows"]:
-                data.append([P(_shorten(row["url"], 90)), P(row["proposed"], "Tiny")])
+                data.append([_shorten(row["url"], 90), row["proposed"]])
             elems.append(_make_table(data, colw))
             elems.append(Spacer(1, 6))
     elems.append(PageBreak())
@@ -1538,12 +1544,12 @@ def generate_report(conn, job):
             colw = [0.55 * width, 0.45 * width]
             data = [headers]
             for row in g["rows"]:
-                data.append([P(_shorten(row["url"], 90)), P(row["proposed"], "Tiny")])
+                data.append([_shorten(row["url"], 90), row["proposed"]])
             elems.append(_make_table(data, colw))
             elems.append(Spacer(1, 6))
     elems.append(PageBreak())
 
-    # Canonical & Open Graph patches — tabel ZONDER patch-code
+    # Canonical & Open Graph patches
     elems.append(Paragraph("HTML patches — Canonical & Open Graph", S["Heading2"]))
     if not tag_patches:
         elems.append(Paragraph("No patches needed." if (site_meta.get("language") or "").lower().startswith("en") else "Geen patches nodig.", S["Normal"]))
@@ -1552,10 +1558,9 @@ def generate_report(conn, job):
         colw = [0.35 * width, 0.15 * width, 0.20 * width, 0.30 * width]
         data = [headers]
         for pch in tag_patches:
-            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny")])
+            data.append([_shorten(pch["url"], 120), pch["category"], pch["problem"], _shorten(pch["current"], 250)])
         elems.append(_make_table(data, colw))
         elems.append(Spacer(1, 6))
-        # Patch-codeblokken los onder de tabel (voorkomt paraparser issues)
         elems.append(Paragraph("Patches (copy & paste):" if (site_meta.get("language") or "").lower().startswith("en") else "Patches (kopieer & plak):", S["Small"]))
         for pch in tag_patches[:40]:
             label = f"{pch['category']} — {pch['url']}"
@@ -1576,7 +1581,7 @@ def generate_report(conn, job):
             patch_note = "yes" if it.get("patchable") and it.get("html_patch") else "—"
             if not (site_meta.get("language") or "").lower().startswith("en"):
                 patch_note = "ja" if it.get("patchable") and it.get("html_patch") else "—"
-            data.append([P(checkbox, "Tiny"), P(_shorten(it["url"], 110), "Tiny"), P(_shorten(it["task"], 120), "Tiny"), P(_shorten(it["why"], 180), "Tiny"), P(it["effort_label"], "Tiny"), P(str(it["priority"]), "Tiny"), P(patch_note, "Tiny")])
+            data.append([checkbox, _shorten(it["url"], 110), _shorten(it["task"], 120), _shorten(it["why"], 180), it["effort_label"], str(it["priority"]), patch_note])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
@@ -1589,7 +1594,7 @@ def generate_report(conn, job):
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
         for r in technical_rows:
-            data.append([P(_shorten(r["url"], 120)), P(r["finding"]), P(r["severity"].title(), "Tiny"), P(r["fix"]), P("• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]]), "Tiny")])
+            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
@@ -1602,7 +1607,7 @@ def generate_report(conn, job):
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
         for r in geo_rows:
-            data.append([P(_shorten(r["url"], 120)), P(r["finding"]), P(r["severity"].title(), "Tiny"), P(r["fix"]), P("• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]]), "Tiny")])
+            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
@@ -1615,11 +1620,11 @@ def generate_report(conn, job):
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
         for r in aeo_quality_rows:
-            data.append([P(_shorten(r["url"], 120)), P(r["finding"]), P(r["severity"].title(), "Tiny"), P(r["fix"]), P("• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]]), "Tiny")])
+            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # Appendix — JSON-LD snippets
+    # Appendix — JSON-LD Snippets
     elems.append(Paragraph("Appendix — JSON-LD Snippets (paste & adapt)", S["Heading2"]))
     brand = site_meta.get("account_name") or "YourBrand"
     home = (site_meta.get("url") or "").strip().rstrip("/") or "https://example.com"
