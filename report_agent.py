@@ -569,7 +569,7 @@ def _build_seo_findings(crawl: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str,
 
 
 # -----------------------------------------------------
-# AEO & GEO
+# AEO (quality heuristics from FAQ job)
 # -----------------------------------------------------
 def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -618,6 +618,83 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
     return out
 
 
+# -----------------------------------------------------
+# AEO (concrete from aeo job) → scorecards, Q&A rows, patches, plan_items
+# -----------------------------------------------------
+def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = []
+    patches = []
+    plan_items = []
+    scorecards = []
+
+    if not aeo:
+        return {"rows": rows, "patches": patches, "plan_items": plan_items, "scorecards": scorecards}
+
+    for page in (aeo.get("pages") or []):
+        url = page.get("url")
+        lang = page.get("lang") or "en"
+        score = int(page.get("score") or 0)
+        issues = page.get("issues") or []
+        metrics = page.get("metrics") or {}
+        scorecards.append({"url": url, "score": score, "issues": issues, "metrics": metrics})
+
+        for qa in (page.get("qas") or []):
+            rows.append({"url": url, "q": qa.get("q"), "a": qa.get("a"), "gaps": ", ".join(issues) or "OK"})
+
+        faq_html = page.get("faq_html") or ""
+        faq_jsonld = page.get("faq_jsonld") or {}
+
+        if faq_html.strip():
+            patches.append({
+                "url": url, "field": "faq_html_block",
+                "problem": "Missing short, snippet-ready Q&A on page",
+                "current": "(none or not snippet-ready)",
+                "proposed": "Add FAQ HTML block (3–6 Q&A, answers ≤80 words)",
+                "html_patch": faq_html,
+                "category": "body", "severity": "medium", "impact": 5, "effort": 2, "priority": 6.0, "patchable": True
+            })
+            plan_items.append({
+                "url": url,
+                "task": "Add FAQ section (3–6 Q&A, ≤80 words)",
+                "why": "Improves answer/snippet eligibility in AE/LLM surfaces",
+                "category": "content",
+                "field": "faq_html_block",
+                "severity": 2, "impact": 5, "effort": 2, "effort_label": "M",
+                "priority": 6.0,
+                "patchable": True,
+                "html_patch": faq_html,
+                "lang": lang
+            })
+
+        if faq_jsonld:
+            html = "<script type=\"application/ld+json\">" + json.dumps(faq_jsonld, ensure_ascii=False) + "</script>"
+            patches.append({
+                "url": url, "field": "faq_jsonld",
+                "problem": "No/invalid FAQPage JSON-LD",
+                "current": "(none)",
+                "proposed": "Inject <script type='application/ld+json'>FAQPage…</script> in <head> of <body>",
+                "html_patch": html,
+                "category": "head", "severity": "medium", "impact": 4, "effort": 1, "priority": 6.0, "patchable": True
+            })
+            plan_items.append({
+                "url": url,
+                "task": "Add FAQPage JSON-LD",
+                "why": "Validates Q&A for rich results; clearer AE extraction",
+                "category": "tag",
+                "field": "faq_jsonld",
+                "severity": 2, "impact": 4, "effort": 1, "effort_label": "S",
+                "priority": 6.0,
+                "patchable": True,
+                "html_patch": html,
+                "lang": lang
+            })
+
+    return {"rows": rows, "patches": patches, "plan_items": plan_items, "scorecards": scorecards}
+
+
+# -----------------------------------------------------
+# GEO recommendations (entity/schema)
+# -----------------------------------------------------
 def _geo_recommendations(site_meta: Dict[str, Any], crawl: Optional[Dict[str, Any]], schema_job: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     home = (site_meta.get("url") or "").strip() or "https://example.com/"
     present_types = set()
@@ -959,7 +1036,7 @@ def _csv_base64(rows: List[Dict[str, Any]], columns: List[str]) -> str:
     return base64.b64encode(buff.getvalue().encode("utf-8")).decode("utf-8")
 
 
-def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any]], site_lang: Optional[str]) -> List[Dict[str, Any]]:
+def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any]], site_lang: Optional[str], extra_patches: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
     # text_rows
@@ -1021,13 +1098,39 @@ def _patch_rows_for_export(text_rows: List[Dict[str, Any]], tag_patches: List[Di
                 "patchable": True,
             }
         )
+
+    # extra patches (AEO)
+    for ap in (extra_patches or []):
+        # AEO patches al bevatten impact/effort/severity (numeric or label). Zorg labels.
+        sev_num = 2
+        sev_lbl = (ap.get("severity") or "medium")
+        if isinstance(ap.get("severity"), int):
+            sev_num = ap["severity"]
+            sev_lbl = {3: "high", 2: "medium", 1: "low"}.get(sev_num, "medium")
+        out.append(
+            {
+                "url": ap.get("url"),
+                "field": ap.get("field"),
+                "problem": ap.get("problem"),
+                "current": ap.get("current"),
+                "proposed": ap.get("proposed"),
+                "html_patch": ap.get("html_patch"),
+                "category": ap.get("category") or "body",
+                "severity": sev_lbl,
+                "impact": ap.get("impact", 3),
+                "effort": ap.get("effort", 2),
+                "priority": ap.get("priority", 5.0),
+                "patchable": ap.get("patchable", True),
+            }
+        )
+
     return out
 
 
 # -----------------------------------------------------
 # Optional LLM executive summary (site-taal)
 # -----------------------------------------------------
-def _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows) -> Optional[str]:
+def _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows, aeo_scorecards=None) -> Optional[str]:
     if not _openai_client:
         return None
     lang = (site_meta.get("language") or "en").lower()
@@ -1049,6 +1152,7 @@ def _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows) -> Optional[str]:
                 "geo": [r["finding"] for r in geo_rows[:3]],
                 "aeo": [r["finding"] for r in aeo_rows[:3]],
             },
+            "aeo_scores": (aeo_scorecards or [])[:5],
             "counts": {"seo": len(seo_rows), "geo": len(geo_rows), "aeo": len(aeo_rows)},
         }
         user = json.dumps(payload, ensure_ascii=False)
@@ -1076,6 +1180,7 @@ def generate_report(conn, job):
     keywords = _fetch_latest_job(conn, site_id, "keywords")
     faq = _fetch_latest_job(conn, site_id, "faq")
     schema_job = _fetch_latest_job(conn, site_id, "schema")
+    aeo_job = _fetch_latest_job(conn, site_id, "aeo")
 
     # Findings
     seo_rows_all, unique_pages = _build_seo_findings(crawl)
@@ -1083,15 +1188,24 @@ def generate_report(conn, job):
     dup_groups = _build_duplicate_groups(crawl, site_meta.get("language"))
     # filter out patchables from technical for the "other" section
     technical_rows = [r for r in seo_rows_all if r["finding"] not in _TEXT_FINDINGS_ALL and r["finding"] not in _PATCHABLE_FINDINGS]
-    aeo_rows = _aeo_findings_from_faq(faq, crawl)
+    aeo_quality_rows = _aeo_findings_from_faq(faq, crawl)
     geo_rows = _geo_recommendations(site_meta, crawl, schema_job)
     tag_patches = _build_canonical_og_patches(crawl, text_rows)
 
-    # Implementatieplan
-    plan_items = _plan_items(text_rows, tag_patches, technical_rows, unique_pages, site_meta.get("language"))
+    # AEO concrete (uit aeo job)
+    aeo_concrete = _aeo_from_job(aeo_job)
+    aeo_scorecards = aeo_concrete.get("scorecards", [])
+    aeo_qna_rows = aeo_concrete.get("rows", [])
+    aeo_patches = aeo_concrete.get("patches", [])
+    aeo_plan_items = aeo_concrete.get("plan_items", [])
 
-    # Exports
-    patches_export_rows = _patch_rows_for_export(text_rows, tag_patches, site_meta.get("language"))
+    # Implementatieplan (basis) + AEO items
+    plan_base = _plan_items(text_rows, tag_patches, technical_rows, unique_pages, site_meta.get("language"))
+    plan_items = plan_base + aeo_plan_items
+    plan_items.sort(key=lambda x: (-x["priority"], x.get("effort", 1), x["url"]))
+
+    # Exports (patches: text + tag + aeo)
+    patches_export_rows = _patch_rows_for_export(text_rows, tag_patches, site_meta.get("language"), extra_patches=aeo_patches)
     patches_csv_b64 = _csv_base64(
         patches_export_rows,
         ["url", "field", "problem", "current", "proposed", "html_patch", "category", "severity", "impact", "effort", "priority", "patchable"],
@@ -1101,8 +1215,8 @@ def generate_report(conn, job):
         ["url", "task", "why", "category", "field", "severity", "impact", "effort", "effort_label", "priority", "patchable", "html_patch", "lang"],
     )
 
-    # Executive summary in site-taal
-    exec_summary = _try_llm_summary(site_meta, seo_rows_all, geo_rows, aeo_rows) or (
+    # Executive summary in site-taal (met AEO scorecards context)
+    exec_summary = _try_llm_summary(site_meta, seo_rows_all, geo_rows, aeo_quality_rows, aeo_scorecards) or (
         "Dit rapport bevat concrete issues en aanbevelingen voor SEO (techniek), GEO (entity/schema) en AEO (answer readiness), inclusief acceptatiecriteria."
         if (site_meta.get("language") or "").lower().startswith("nl")
         else "This report lists concrete issues and recommendations across SEO, GEO and AEO with acceptance criteria."
@@ -1128,6 +1242,34 @@ def generate_report(conn, job):
     elems.append(Paragraph(f"Generated: {now}", S["Normal"]))
     elems.append(Spacer(1, 8))
     elems.append(Paragraph(exec_summary, S["Small"]))
+    elems.append(PageBreak())
+
+    # --- AEO — Answer readiness (scorecards) ---
+    elems.append(Paragraph("AEO — Answer readiness (scorecards)", S["Heading2"]))
+    if not aeo_scorecards:
+        elems.append(Paragraph("No AEO job output yet.", S["Normal"]))
+    else:
+        headers = ["Page URL", "Score (0–100)", "Issues", "Metrics"]
+        colw = [0.36 * width, 0.14 * width, 0.25 * width, 0.25 * width]
+        data = [headers]
+        for r in aeo_scorecards:
+            metrics_txt = ", ".join([f"{k}:{v}" for k, v in (r.get("metrics") or {}).items()])
+            issues_txt = ", ".join(r.get("issues") or []) or "OK"
+            data.append([P(_shorten(r["url"], 120)), P(str(r["score"]), "Tiny"), P(issues_txt, "Tiny"), P(metrics_txt, "Tiny")])
+        elems.append(_make_table(data, colw))
+    elems.append(Spacer(1, 8))
+
+    # --- AEO — Q&A (ready-to-paste) ---
+    elems.append(Paragraph("AEO — Q&A (snippet-ready, ready-to-paste)", S["Heading2"]))
+    if not aeo_qna_rows:
+        elems.append(Paragraph("No Q&A candidates generated.", S["Normal"]))
+    else:
+        headers = ["Page URL", "Q", "Proposed answer (≤80 words)", "Gaps"]
+        colw = [0.28 * width, 0.26 * width, 0.30 * width, 0.16 * width]
+        data = [headers]
+        for r in aeo_qna_rows[:80]:  # cap rows in PDF
+            data.append([P(_shorten(r["url"], 120)), P(r["q"]), P(r["a"]), P(r["gaps"], "Tiny")])
+        elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
     # --- SEO — Concrete text fixes (ready-to-paste) ---
@@ -1241,15 +1383,15 @@ def generate_report(conn, job):
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
-    # --- AEO Findings ---
+    # --- AEO Findings (quality heuristics) ---
     elems.append(Paragraph("AEO Findings (answer & citation readiness)", S["Heading2"]))
-    if not aeo_rows:
+    if not aeo_quality_rows:
         elems.append(Paragraph("Geen AEO-issues." if (site_meta.get("language") or "").lower().startswith("nl") else "No AEO findings.", S["Normal"]))
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
         colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
         data = [headers]
-        for r in aeo_rows:
+        for r in aeo_quality_rows:
             data.append([P(_shorten(r["url"], 120)), P(r["finding"]), P(r["severity"].title(), "Tiny"), P(r["fix"]), P("• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]]), "Tiny")])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
@@ -1267,6 +1409,15 @@ def generate_report(conn, job):
         elems.append(Paragraph(title_txt, S["H3tight"]))
         elems.append(KeepTogether([Code(json.dumps(obj, indent=2, ensure_ascii=False)), Spacer(1, 6)]))
 
+    # Appendix — AEO JSON-LD per page (indien aanwezig)
+    if aeo_job:
+        elems.append(Paragraph("Appendix — AEO JSON-LD per page", S["Heading2"]))
+        for page in (aeo_job.get("pages") or []):
+            pretty = json.dumps(page.get("faq_jsonld") or {}, indent=2, ensure_ascii=False)
+            if pretty.strip():
+                elems.append(Paragraph(_shorten(page.get("url") or "", 120), S["H3tight"]))
+                elems.append(KeepTogether([Code(pretty[:4000]), Spacer(1, 6)]))
+
     if schema_job and schema_job.get("schema"):
         elems.append(Paragraph("Generated (from jobs.schema)", S["H3tight"]))
         pretty = json.dumps(schema_job["schema"], indent=2, ensure_ascii=False)
@@ -1276,6 +1427,7 @@ def generate_report(conn, job):
     pdf_bytes = buffer.getvalue()
     buffer.close()
 
+    # return payload + exports
     pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
     return {
         "pdf_base64": pdf_base64,
@@ -1283,6 +1435,8 @@ def generate_report(conn, job):
             "site_id": str(site_id),
             "generated_at": now,
             "sections": {
+                "aeo_scorecards": bool(aeo_scorecards),
+                "aeo_qas": bool(aeo_qna_rows),
                 "text_fixes": bool(text_rows),
                 "duplicate_titles": bool(dup_groups["title_groups"]),
                 "duplicate_metas": bool(dup_groups["meta_groups"]),
@@ -1290,7 +1444,7 @@ def generate_report(conn, job):
                 "implementation_plan": bool(plan_items),
                 "seo_other": bool(technical_rows),
                 "geo_recommendations": bool(geo_rows),
-                "aeo_findings": bool(aeo_rows),
+                "aeo_findings": bool(aeo_quality_rows),
             },
         },
         # exports
