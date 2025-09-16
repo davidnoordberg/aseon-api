@@ -1054,7 +1054,8 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
                     "category": "open_graph",
                     "problem": "missing og:title/og:description" if (not og_title and not og_desc) else ("missing og:title" if not og_title else "missing og:description"),
                     "current": f"og:title={'present' if og_title else 'missing'}, og:description={'present' if og_desc else 'missing'}",
-                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n" f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
+                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n"
+                                   f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
                 }
             )
 
@@ -1554,7 +1555,7 @@ def generate_report(conn, job):
             elems.append(Spacer(1, 6))
     elems.append(PageBreak())
 
-    # Canonical & Open Graph patches (render patch cell as monospace to avoid line breaks like "https: //")
+    # Canonical & Open Graph patches (render patch cell as monospace to avoid parser issues)
     elems.append(Paragraph("HTML patches — Canonical & Open Graph", S["Heading2"]))
     if not tag_patches:
         elems.append(Paragraph("No patches needed." if (site_meta.get("language") or "").lower().startswith("en") else "Geen patches nodig.", S["Normal"]))
@@ -1563,8 +1564,8 @@ def generate_report(conn, job):
         colw = [0.23 * width, 0.12 * width, 0.15 * width, 0.25 * width, 0.25 * width]
         data = [headers]
         for pch in tag_patches:
-            # Use Code() for patch column to keep monospace formatting
-            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny"), Code(pch["html_patch"])])
+            # Use Code() for patch column to keep literal HTML; avoids ReportLab paragraph parser errors
+            data.append([P(_shorten(pch["url"], 120)), P(pch["category"]), P(pch["problem"], "Tiny"), P(_shorten(pch["current"], 250), "Tiny"), Code(pch.get("html_patch") or "")])
         elems.append(_make_table(data, colw))
     elems.append(PageBreak())
 
