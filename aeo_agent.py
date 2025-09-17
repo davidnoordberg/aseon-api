@@ -1,627 +1,458 @@
-# aeo_agent.py — AEO analyzer with schema/faq-agent priority, strict cleaning,
-# parity checks, near-dup clustering, scoring, and keyword-based suggestions.
-#
-# Payload options:
-#   only_faq: bool = True
-#   emit_improved: bool = True
-#   rewrite: "deterministic" | "llm" = "deterministic"
-#   max_answer_words: int = 80
-#   dedup_threshold: float = 0.88
-#   faq_paths: [str,...]  # e.g. ["/faq"]
-#
-# Output (top-level):
-# {
-#   "site": {"url": "..."},
-#   "pages": [{
-#     "url": "...", "type": "faq"|"other", "score": int, "issues": [...],
-#     "metrics": {
-#       "qas_detected": int, "answers_leq_80w": int, "answers_gt_80w": int,
-#       "parity_ok": bool, "src_counts": {"jsonld": int, "visible": int, "faq_job": int},
-#       "dup_questions": int, "has_faq_schema_detected": bool,
-#       "missing_in_schema": [...], "missing_in_visible": [...], "flags": [...]
-#     },
-#     "qas": [{"q":"...","a":"...","source":"jsonld|visible|faq_repo"}],
-#     "suggested_qas": [{"q":"...","why":"..."}]
-#   }]
-# }
+# aeo_agent.py
+# -*- coding: utf-8 -*-
+"""
+AEO FAQ Agent
+-------------
+Doel:
+- Auditeert ALLEEN een gegeven FAQ-pagina-URL.
+- Extraheert Q&A uit JSON-LD en DOM (headings/accordions/definition lists).
+- Beoordeelt elke QA (LLM of rule-based fallback).
+- Stelt verbeteringen voor (≤ ~80 woorden, concreet, non-fluff).
+- Bouwt valide FAQPage JSON-LD met verbeterde QA's.
+- Levert rijk diagnostisch resultaat voor rapportage.
 
-import html
+Ontwerp:
+- LLMClient (verwisselbaar model via env).
+- Fetcher met timeouts/retries + UA.
+- Extractors (schema + dom) met dedupe + normalisatie.
+- Reviewer met LLM + rule-based fallback.
+- JSON-LD builder + validator (basis).
+- Result objecten (Pydantic) voor downstream usage.
+
+Env:
+- OPENAI_API_KEY (optioneel)
+- LLM_MODEL (default: gpt-4o-mini)
+- LLM_TEMPERATURE (default: 0.0)
+- HTTP_TIMEOUT_SECONDS (default: 30)
+"""
+
+from __future__ import annotations
+
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+import json
+import time
+import math
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
 
-from psycopg.rows import dict_row
+import httpx
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-# ================= Core utils =================
+# ---------------------- Logging ----------------------
 
-def _escape_ascii(s: str) -> str:
-    if s is None:
-        return ""
-    t = html.unescape(str(s))
-    repl = {
-        "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
-        "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00A0": " ",
-        "\u200b": "", "\u200d": "", "\ufeff": ""
-    }
-    for k, v in repl.items():
-        t = t.replace(k, v)
-    # common mojibake
-    t = (t
-         .replace("â", "'").replace("â", '"').replace("â", '"')
-         .replace("â", "-").replace("â", "-"))
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+LOGGER = logging.getLogger("aeo_agent")
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+    LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
 
-def _norm(s: str) -> str:
-    return _escape_ascii(s).lower()
+# ---------------------- Config ----------------------
 
-def _norm_url(u: str) -> str:
-    try:
-        p = urlparse((u or "").strip())
-        scheme = p.scheme or "https"
-        host = p.netloc.lower()
-        path = p.path or "/"
-        q = f"?{p.query}" if p.query else ""
-        return f"{scheme}://{host}{path}{q}"
-    except Exception:
-        return (u or "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.0"))
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
-def _has_mojibake(s: str) -> bool:
-    return "â" in s or "\ufffd" in s
+UA = "aseon-aeo-faq-agent/1.0 (+https://www.aseon.io/)"
 
-def _fetch_latest(conn, site_id: str, jtype: str) -> Optional[Dict[str, Any]]:
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT output
-              FROM jobs
-             WHERE site_id=%s AND type=%s AND status='done'
-             ORDER BY finished_at DESC NULLS LAST, created_at DESC
-             LIMIT 1
-            """,
-            (site_id, jtype),
-        )
-        r = cur.fetchone()
-        return (r or {}).get("output") if r else None
+# ---------------------- Helpers ----------------------
 
-# ================= Extractors =================
+_WS_RE = re.compile(r"\s+")
+def norm(x: str) -> str:
+    return _WS_RE.sub(" ", (x or "").strip())
 
-def _extract_faq_from_jsonld(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    qas: List[Dict[str, str]] = []
-    jsonlds = page.get("jsonld") or page.get("ld_json") or []
-    if isinstance(jsonlds, dict):
-        jsonlds = [jsonlds]
-    for j in jsonlds:
-        if not isinstance(j, dict):
-            continue
-        t = j.get("@type")
-        tlist = [t] if isinstance(t, str) else (t or [])
-        if any(str(x).lower() == "faqpage" for x in tlist):
-            ents = j.get("mainEntity") or []
-            if isinstance(ents, dict):
-                ents = [ents]
-            for e in ents:
-                q = _escape_ascii(str(e.get("name") or e.get("question") or ""))
-                aa = e.get("acceptedAnswer") or {}
-                if isinstance(aa, list):
-                    aa = aa[0] if aa else {}
-                a = _escape_ascii(str(aa.get("text") or aa.get("answer") or ""))
-                if q and a:
-                    qas.append({"q": q, "a": a, "source": "jsonld"})
-    return qas
+def looks_like_question(text: str) -> bool:
+    t = norm(text).lower()
+    if len(t) < 3:
+        return False
+    return t.endswith("?") or t.startswith((
+        "how ","what ","why ","when ","where ","who ",
+        "can ","do ","does ","is ","are ","should ","will "
+    ))
 
-def _extract_visible_pairs_listshape(v) -> Optional[List[Dict[str, str]]]:
-    if isinstance(v, list) and v and isinstance(v[0], dict) and "q" in v[0] and "a" in v[0]:
-        out = []
-        for item in v:
-            q = _escape_ascii(str(item.get("q", "")))
-            a = _escape_ascii(str(item.get("a", "")))
-            if q and a:
-                out.append({"q": q, "a": a, "source": "visible"})
-        return out
-    return None
-
-def _extract_faq_from_visible(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    # Prefer explicit visible Q/A if crawler produced that
-    for key in ["visible_faq", "visible_qas", "faq_visible", "visibleFAQ", "visible"]:
-        out = _extract_visible_pairs_listshape(page.get(key))
-        if out:
-            return out
-    # Conservative fallback: headings that look like questions + first decent following paragraph
-    qas: List[Dict[str, str]] = []
-    heads = (page.get("h2") or []) + (page.get("h3") or [])
-    pars = page.get("paragraphs") or []
-    for q in heads:
-        q1 = _escape_ascii(str(q or ""))
-        if not q1 or not re.search(r"\?\s*$", q1):
-            continue
-        # find first paragraph ≥ 20 chars
-        a1 = ""
-        for p in pars:
-            p1 = _escape_ascii(p)
-            if len(p1) > 20:
-                a1 = p1
-                break
-        if q1 and a1:
-            qas.append({"q": q1, "a": a1, "source": "visible"})
-    return qas
-
-def _is_faq_page(url: str,
-                 page: Dict[str, Any],
-                 schema_qas: List[Dict[str,str]],
-                 visible_qas: List[Dict[str,str]],
-                 faq_paths: Optional[List[str]]) -> bool:
-    path = urlparse(url).path.lower()
-    if faq_paths:
-        if any(pat and pat.lower() in path for pat in faq_paths):
-            return True
-    if "/faq" in path:
-        return True
-    if schema_qas and len(schema_qas) >= 3:
-        return True
-    h2 = [str(x).lower() for x in (page.get("h2") or [])]
-    h3 = [str(x).lower() for x in (page.get("h3") or [])]
-    if any("faq" in x for x in h2 + h3):
-        return True
-    if visible_qas and len(visible_qas) >= 3:
-        return True
-    return False
-
-# ================= Dedup & parity =================
-
-_STOP = set("the a an to for and or but with in on at from of by as is are was were be been being this that it its your our their you we they i me my mine".split())
-
-def _tokenize(s: str) -> List[str]:
-    s = _norm(s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return [t for t in s.split() if t and t not in _STOP]
-
-def _jaccard(a: List[str], b: List[str]) -> float:
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    union = len(sa | sb)
-    return inter / union if union else 0.0
-
-def _cluster_near_dups(qas: List[Dict[str,str]], threshold: float) -> Tuple[List[List[int]], List[int]]:
-    n = len(qas); used = [False]*n; clusters=[]; canon=[]
-    for i in range(n):
-        if used[i]:
-            continue
-        base = _tokenize(qas[i]["q"]); group=[i]; used[i]=True
-        for j in range(i+1, n):
-            if used[j]:
-                continue
-            if _jaccard(base, _tokenize(qas[j]["q"])) >= threshold:
-                group.append(j); used[j]=True
-        clusters.append(group); canon.append(group[0])
-    return clusters, canon
-
-def _parity(visible_qas: List[Dict[str,str]], schema_qas: List[Dict[str,str]]) -> Tuple[bool, List[str], List[str]]:
-    vis_set = set(_norm(x["q"]) for x in visible_qas)
-    sch_set = set(_norm(x["q"]) for x in schema_qas)
-    missing_in_schema = [x for x in vis_set if x not in sch_set]
-    missing_in_visible = [x for x in sch_set if x not in vis_set]
-    return (not missing_in_schema and not missing_in_visible), missing_in_schema, missing_in_visible
-
-# ================= Cleaning & rewrite =================
-
-_HEADING_NOISE = re.compile(r"\bfaq\b|\bquick answers\b|\bour approach\b|\bgenerative seo\b", re.I)
-
-def _strip_question_restate(q: str, a: str) -> str:
-    qn = _norm(q); an = _norm(a)
-    if not qn or not an:
-        return _escape_ascii(a)
-    # avoid “Question: … Answer: [repeats question]”
-    prefix = qn[: max(10, len(qn)//2)]
-    if prefix and an.startswith(prefix):
-        # cut the raw (non-normalized) answer at the original question length
-        return _escape_ascii(a[len(q):]).lstrip("-—:,. ").strip()
-    return _escape_ascii(a)
-
-def _remove_heading_blocks(a: str) -> str:
-    s = _escape_ascii(a)
-    # remove leading “FAQ … quick answers …” style bleed
-    s = re.sub(r'^\s*(faq[^\.!\?]{0,200}[\.!\?]\s*)', '', s, flags=re.I)
-    s = re.sub(r'^\s*(faq\s*[-—:]*\s*)+', '', s, flags=re.I)
-    s = re.sub(r'^\s*[^\.!\?]{0,200}\bquick answers\b[:\-\—]?\s*', '', s, flags=re.I)
-    s = _HEADING_NOISE.sub("", s).strip(" -—:,.")
-    return s
-
-def _preclean_answer(q: str, a: str) -> str:
-    a0 = _escape_ascii(a)
-    a0 = _remove_heading_blocks(a0)
-    a0 = _strip_question_restate(q, a0)
-    return a0
-
-def _trim_words(s: str, max_words: int) -> str:
-    words = _escape_ascii(s).split()
+def truncate_words(text: str, max_words: int) -> str:
+    words = norm(text).split()
     if len(words) <= max_words:
         return " ".join(words)
     return " ".join(words[:max_words])
 
-def _deterministic_rewrite(q: str, a: str, max_words: int) -> str:
-    a0 = _preclean_answer(q, a)
-    # take first full sentence (or first + next if too short)
-    parts = re.split(r"(?<=[\.\!\?\:])\s+", a0)
-    if parts:
-        head = parts[0]
-        if len(head.split()) < 6 and len(parts) > 1:
-            head = (head + " " + parts[1]).strip()
-        a0 = head
-    return _trim_words(a0, max_words)
-
-def _postclean_answer(q: str, a: str, max_words: int) -> str:
-    a1 = _remove_heading_blocks(a)
-    a1 = _strip_question_restate(q, a1)
-    parts = re.split(r"(?<=[\.\!\?\:])\s+", a1)
-    if parts:
-        head = parts[0]
-        if len(head.split()) < 6 and len(parts) > 1:
-            head = (head + " " + parts[1]).strip()
-        a1 = head
-    a1 = _trim_words(a1, max_words)
-    if len(a1.split()) < 3:
-        a1 = _deterministic_rewrite(q, a, max_words)
-    return a1
-
-def _llm_rewrite(q: str, a: str, max_words: int) -> Optional[str]:
-    try:
-        import llm
-    except Exception:
-        return None
-    pre = _preclean_answer(q, a)
-    prompt = (
-        "Rewrite the answer below in the SAME language as the text. "
-        "Rules: ≤{maxw} words, lead with the answer, no headings like 'FAQ' or 'quick answers', "
-        "do not restate the question, avoid marketing fluff.\n"
-        "Question: {q}\n"
-        "Answer: {a}\n"
-        "Rewrite:"
-    ).format(maxw=max_words, q=q, a=pre)
-    try:
-        model = os.getenv("AEO_LLM_MODEL") or None
-        temp = float(os.getenv("AEO_LLM_TEMPERATURE") or 0.1)
-        max_tok = int(os.getenv("AEO_LLM_MAX_TOKENS") or 220)
-        if hasattr(llm, "generate"):
-            out = llm.generate(prompt, system="You are a precise copy editor.", model=model, temperature=temp, max_tokens=max_tok)
-            txt = out.get("text") if isinstance(out, dict) else str(out)
-        elif hasattr(llm, "complete"):
-            out = llm.complete(prompt, model=model, temperature=temp, max_tokens=max_tok)
-            txt = out.get("text") if isinstance(out, dict) else str(out)
-        elif hasattr(llm, "chat"):
-            msgs = [{"role":"system","content":"You are a precise copy editor."},
-                    {"role":"user","content":prompt}]
-            out = llm.chat(messages=msgs, model=model, temperature=temp, max_tokens=max_tok)
-            txt = out.get("content") if isinstance(out, dict) else str(out)
-        else:
-            txt = None
-        if txt:
-            return _postclean_answer(q, txt, max_words)
-    except Exception:
-        return None
-    return None
-
-def _validate_or_fallback(q: str, original_a: str, candidate_a: str, max_words: int) -> str:
-    a = _escape_ascii(candidate_a or "")
-    bad = False
-    if not a:
-        bad = True
-    if _HEADING_NOISE.search(a[:120]):
-        bad = True
-    if _norm(q)[: max(10, len(_norm(q))//2)] in _norm(a)[:120]:
-        bad = True
-    if len(a.split()) > max_words:
-        bad = True
-    if bad:
-        return _deterministic_rewrite(q, original_a, max_words)
-    return a
-
-# ================= FAQ-agent & keywords-agent integration =================
-
-def _harvest_faq_agent_pairs(faq_job_out: Dict[str, Any]) -> List[Dict[str,str]]:
-    pairs: List[Dict[str,str]] = []
-    if not faq_job_out:
-        return pairs
-    # Common shapes: {"pairs":[{q,a,source}]}, {"faqs":[... with q,a]}, {"first3":[...]} etc.
-    for key in ["pairs", "qas", "faqs", "first3"]:
-        arr = faq_job_out.get(key)
-        if isinstance(arr, list):
-            for it in arr:
-                q = _escape_ascii(str(it.get("q","") or it.get("question","")))
-                a = _escape_ascii(str(it.get("a","") or it.get("answer","")))
-                src = _escape_ascii(str(it.get("source","") or it.get("url","") or "faq_repo"))
-                if q and a:
-                    pairs.append({"q": q, "a": a, "source": src})
-    # Dedup by normalized question
-    seen = set(); out=[]
-    for qa in pairs:
-        nq = _norm(qa["q"])
-        if nq in seen:
-            continue
-        seen.add(nq); out.append(qa)
+def dedupe_by_question(qas: List["QAItem"]) -> List["QAItem"]:
+    seen = set()
+    out: List[QAItem] = []
+    for qa in qas:
+        key = norm(qa.question).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(qa)
     return out
 
-def _keywords_suggestions(kw_out: Dict[str, Any], existing_qs: List[str], limit: int = 5) -> List[Dict[str,str]]:
-    if not kw_out:
-        return []
-    existing = set(_norm(q) for q in existing_qs)
-    suggs = []
-    # Attempt to use kw_out["suggestions"] list of {page_title, grouped_keywords, notes}
-    arr = kw_out.get("suggestions") or []
-    for s in arr:
-        gk = s.get("grouped_keywords") or []
-        head = str(gk[0]) if gk else ""
-        if not head:
-            continue
-        if _norm(head) in existing:
-            continue
-        q = f"What about {head}?"
-        suggs.append({"q": _escape_ascii(q), "why": _escape_ascii(s.get("notes") or "Keyword cluster gap")})
-        if len(suggs) >= limit:
-            break
-    return suggs
+# ---------------------- Models ----------------------
 
-def _best_match_answer_from_repo(q: str, repo: List[Dict[str,str]], threshold: float = 0.88) -> Optional[str]:
-    tq = _tokenize(q)
-    best = (0.0, None)
-    for item in repo:
-        sim = _jaccard(tq, _tokenize(item["q"]))
-        if sim > best[0]:
-            best = (sim, item)
-    if best[0] >= threshold and best[1]:
-        return best[1]["a"]
-    return None
+class QAItem(BaseModel):
+    question: str
+    answer: str
 
-# ================= Scoring =================
+class QAReview(BaseModel):
+    question: str
+    answer: str
+    is_good: bool
+    issues: List[str] = Field(default_factory=list)
+    improved_question: Optional[str] = None
+    improved_answer: Optional[str] = None
+    word_count_answer: int = 0
 
-def _score_and_issues(page_type: str,
-                      has_schema: bool,
-                      n_qas: int,
-                      overlong: int,
-                      dup_clusters: int,
-                      parity_ok: bool) -> Tuple[int, List[str]]:
-    issues: List[str] = []
-    if page_type != "faq":
-        if n_qas == 0:
-            return 15, ["No Q&A section on page."]
-        base = 95
-        if overlong > 0:
-            issues.append("Overlong answers (>80 words).")
-            base -= 5
-        return max(15, min(100, base)), issues
+class FAQAuditResult(BaseModel):
+    url: HttpUrl
+    found_faq: bool
+    qas_extracted: List[QAItem] = Field(default_factory=list)
+    reviews: List[QAReview] = Field(default_factory=list)
+    suggestions_count: int = 0
+    faq_schema_jsonld: Optional[Dict[str, Any]] = None
+    notes: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
-    score = 100
-    if n_qas < 3:
-        issues.append("Too few Q&A (min 3).")
-        score -= 20
-    if overlong > 0:
-        issues.append("Overlong answers (>80 words).")
-        score -= 8
-    if dup_clusters > 0:
-        issues.append("Duplicate questions.")
-        score -= 7
-    if not has_schema:
-        issues.append("No FAQPage JSON-LD.")
-        score -= 15
-    if not parity_ok and has_schema:
-        issues.append("Schema/text parity mismatch.")
-        score -= 8
-    score = max(0, min(100, score))
-    if n_qas == 0:
-        score = 15
-    return score, issues
+# ---------------------- HTTP Fetcher ----------------------
 
-# ================= Per-page analysis =================
+class Fetcher:
+    def __init__(self, timeout: int = HTTP_TIMEOUT_SECONDS, retries: int = 2):
+        self.timeout = timeout
+        self.retries = retries
 
-def _analyze_page(page: Dict[str, Any],
-                  url: str,
-                  only_faq: bool,
-                  emit_improved: bool,
-                  rewrite_mode: str,
-                  max_words: int,
-                  dedup_threshold: float,
-                  faq_paths: Optional[List[str]],
-                  faq_repo: List[Dict[str,str]]) -> Optional[Dict[str, Any]]:
+    def get(self, url: str) -> str:
+        last_err: Optional[Exception] = None
+        for attempt in range(self.retries + 1):
+            try:
+                with httpx.Client(timeout=self.timeout, follow_redirects=True, headers={"User-Agent": UA}) as client:
+                    r = client.get(url)
+                    r.raise_for_status()
+                    return r.text
+            except Exception as e:
+                last_err = e
+                LOGGER.warning("GET failed (attempt %s): %s", attempt + 1, e)
+                time.sleep(min(1.5 * (attempt + 1), 4.0))
+        raise RuntimeError(f"Failed to fetch URL after retries: {last_err}")
 
-    schema_qas = _extract_faq_from_jsonld(page)
-    visible_qas = _extract_faq_from_visible(page)
+# ---------------------- LLM Client ----------------------
 
-    has_schema = bool(schema_qas)
-    is_faq = _is_faq_page(url, page, schema_qas, visible_qas, faq_paths)
-    page_type = "faq" if is_faq else "other"
+class LLMClient:
+    def __init__(self, api_key: str = OPENAI_API_KEY, model: str = LLM_MODEL, temperature: float = LLM_TEMPERATURE):
+        self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
 
-    # Source priority for FAQ pages: schema → faq_repo (aligned to visible Qs) → visible
-    base_candidates: List[Dict[str,str]] = []
-    src_counts = {"jsonld": len(schema_qas), "visible": len(visible_qas), "faq_job": 0}
+    def available(self) -> bool:
+        return bool(self.api_key)
 
-    if is_faq and schema_qas:
-        base_candidates = [{"q": qa["q"], "a": qa["a"], "source": "jsonld"} for qa in schema_qas]
-    elif is_faq and faq_repo:
-        # Align repo answers to visible questions when present
-        matched = False
-        if visible_qas:
-            for v in visible_qas:
-                repo_a = _best_match_answer_from_repo(v["q"], faq_repo, threshold=0.88)
-                if repo_a:
-                    base_candidates.append({"q": v["q"], "a": repo_a, "source": "faq_repo"})
-                    matched = True
-        if matched:
-            src_counts["faq_job"] = 1
-        if not base_candidates and visible_qas:
-            base_candidates = [{"q": qa["q"], "a": qa["a"], "source": "visible"} for qa in visible_qas]
-    else:
-        # Non-FAQ pages: optionally capture small Q&A if present (soft scoring)
-        if not only_faq and visible_qas:
-            base_candidates = [{"q": qa["q"], "a": qa["a"], "source": "visible"} for qa in visible_qas]
-
-    if only_faq and not is_faq:
-        # hard-return “other” with metrics for transparency
-        if not base_candidates:
-            return {
-                "url": url,
-                "type": "other",
-                "score": 15,
-                "issues": ["No Q&A section on page."],
-                "metrics": {
-                    "qas_detected": 0,
-                    "answers_leq_80w": 0,
-                    "answers_gt_80w": 0,
-                    "parity_ok": True,
-                    "src_counts": src_counts,
-                    "dup_questions": 0,
-                    "has_faq_schema_detected": has_schema,
-                    "missing_in_schema": [],
-                    "missing_in_visible": [],
-                    "flags": [],
-                },
-                "qas": [],
-                "suggested_qas": []
+    def chat(self, system: str, user: str) -> Optional[str]:
+        if not self.available():
+            return None
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": self.model,
+                "temperature": self.temperature,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ]
             }
+            with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
+                r = client.post(url, headers=headers, json=payload)
+                r.raise_for_status()
+                data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            LOGGER.error("LLM chat error: %s", e)
+            return None
 
-    # If still empty on a FAQ page, last resort: visible
-    if is_faq and not base_candidates and visible_qas:
-        base_candidates = [{"q": qa["q"], "a": qa["a"], "source": "visible"} for qa in visible_qas]
+# ---------------------- Extractors ----------------------
 
-    # If STILL empty, short-circuit
-    if is_faq and not base_candidates:
-        score, issues = _score_and_issues("faq", has_schema, 0, 0, 0, True)
-        return {
-            "url": url,
-            "type": "faq",
-            "score": score,
-            "issues": issues,
-            "metrics": {
-                "qas_detected": 0,
-                "answers_leq_80w": 0,
-                "answers_gt_80w": 0,
-                "parity_ok": True,
-                "src_counts": src_counts,
-                "dup_questions": 0,
-                "has_faq_schema_detected": has_schema,
-                "missing_in_schema": [],
-                "missing_in_visible": [],
-                "flags": ["empty_faq_candidates"],
-            },
-            "qas": [],
-            "suggested_qas": []
-        }
+def extract_qas_from_schema(soup: BeautifulSoup) -> List[QAItem]:
+    out: List[QAItem] = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        raw = tag.string or ""
+        if not raw.strip():
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        blocks = data if isinstance(data, list) else [data]
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("@type", "")).lower() != "faqpage":
+                continue
+            entities = b.get("mainEntity", [])
+            entities = entities if isinstance(entities, list) else [entities]
+            for e in entities:
+                if not isinstance(e, dict):
+                    continue
+                if str(e.get("@type", "")).lower() != "question":
+                    continue
+                q = norm(e.get("name") or e.get("text") or "")
+                a = ""
+                acc = e.get("acceptedAnswer") or {}
+                if isinstance(acc, dict):
+                    a = norm(acc.get("text") or "")
+                if q and a:
+                    out.append(QAItem(question=q, answer=a))
+    return out
 
-    # Dedup clusters on questions
-    clusters, canon = _cluster_near_dups(base_candidates, threshold=dedup_threshold)
-    canonical_qas: List[Dict[str,str]] = []
-    for group, ci in zip(clusters, canon):
-        canonical_qas.append(dict(base_candidates[ci]))
+def _nearest_answer_block(node) -> Optional[str]:
+    # Vind eerstvolgende betekenisvolle block als antwoord.
+    el = node.find_next(lambda el: el.name in {"p","div","dd","li","section","article"} and norm(el.get_text(" ", strip=True)))
+    if not el:
+        return None
+    txt = norm(el.get_text(" ", strip=True))
+    return txt or None
 
-    # Parity (visible vs schema on the raw extracts)
-    parity_ok, miss_in_schema, miss_in_visible = _parity(visible_qas, schema_qas)
+def extract_qas_from_dom(soup: BeautifulSoup) -> List[QAItem]:
+    out: List[QAItem] = []
 
-    # Improve answers with strict validation; keep provenance
-    improved_qas: List[Dict[str,str]] = []
-    for qa in canonical_qas:
-        q = qa["q"]; a = qa["a"]; src = qa.get("source") or "visible"
-        if emit_improved:
-            if rewrite_mode == "llm":
-                cand = _llm_rewrite(q, a, max_words)
-                cand = _validate_or_fallback(q, a, cand or "", max_words)
-            else:
-                cand = _deterministic_rewrite(q, a, max_words)
-        else:
-            cand = _escape_ascii(a)
-        improved_qas.append({"q": _escape_ascii(q), "a": cand, "source": src})
+    # 1) Headings / toggles / summary
+    for tag in soup.find_all(["h1","h2","h3","h4","h5","summary","button","dt","strong","b"]):
+        q = norm(tag.get_text(" ", strip=True))
+        if not looks_like_question(q):
+            continue
+        ans = _nearest_answer_block(tag)
+        if ans:
+            out.append(QAItem(question=q, answer=ans))
 
-    n_qas = len(improved_qas)
-    overlong = sum(1 for qa in improved_qas if len(_escape_ascii(qa["a"]).split()) > max_words)
-    dup_count = sum(max(0, len(g)-1) for g in clusters)
-    score, issues = _score_and_issues(page_type, has_schema, n_qas, overlong, dup_count, parity_ok)
+    # 2) <dl><dt>Q</dt><dd>A</dd></dl>
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        for dt, dd in zip(dts, dds):
+            q = norm(dt.get_text(" ", strip=True))
+            a = norm(dd.get_text(" ", strip=True))
+            if looks_like_question(q) and a:
+                out.append(QAItem(question=q, answer=a))
 
-    flags = []
-    if any(_has_mojibake(qa["a"]) or _has_mojibake(qa["q"]) for qa in canonical_qas):
-        flags.append("mojibake")
-    if any(_norm(qa["q"])[: max(10, len(_norm(qa["q"]))//2)] in _norm(qa["a"])[:120] for qa in improved_qas):
-        flags.append("question_restate_bleed")
-    if any(len(_escape_ascii(qa["a"]).split()) < 3 for qa in improved_qas):
-        flags.append("vague")
+    return out
 
-    m = {
-        "qas_detected": n_qas,
-        "answers_leq_80w": n_qas - overlong,
-        "answers_gt_80w": overlong,
-        "parity_ok": parity_ok,
-        "src_counts": src_counts,
-        "dup_questions": dup_count,
-        "has_faq_schema_detected": has_schema,
-        "missing_in_schema": miss_in_schema,
-        "missing_in_visible": miss_in_visible,
-        "flags": flags,
-    }
+def extract_faq(url: str, fetcher: Optional[Fetcher] = None) -> Tuple[List[QAItem], List[str], Dict[str, Any]]:
+    meta: Dict[str, Any] = {}
+    notes: List[str] = []
+    fetcher = fetcher or Fetcher()
+    html = fetcher.get(url)
+    meta["html_length"] = len(html)
+    soup = BeautifulSoup(html, "lxml")
 
+    sch = extract_qas_from_schema(soup)
+    dom = extract_qas_from_dom(soup)
+
+    all_qas = dedupe_by_question(sch + dom)
+
+    if not sch:
+        notes.append("No FAQPage JSON-LD detected.")
+    if not all_qas:
+        notes.append("No visible/parseable FAQ detected.")
+
+    meta["counts"] = {"schema": len(sch), "dom": len(dom), "unique": len(all_qas)}
+    return all_qas, notes, meta
+
+# ---------------------- Reviewer ----------------------
+
+LLM_SYSTEM = """You are an expert AEO auditor for FAQ pages.
+Assess each Q&A pair strictly:
+- Question: clear, specific, intent-rich?
+- Answer: ≤ ~80 words, factual, user-first, free of fluff/claims, actionable.
+Return ONLY JSON with keys: is_good (bool), issues (list[str]), improved_question (string|null), improved_answer (string|null).
+Keep the language of the input.
+"""
+
+def _rule_review(q: str, a: str) -> Dict[str, Any]:
+    issues: List[str] = []
+    q_ok = looks_like_question(q)
+    if not q_ok:
+        issues.append("Vraag is niet duidelijk/intentie-rijk.")
+    a_norm = norm(a)
+    if not a_norm:
+        issues.append("Leeg antwoord.")
+    wc = len(a_norm.split())
+    if wc > 90:
+        issues.append("Antwoord te lang (>90 woorden).")
+    if wc < 4:
+        issues.append("Antwoord te kort (<4 woorden).")
+    lower = a_norm.lower()
+    for bad in ["we are the best", "number one", "market leader"]:
+        if bad in lower:
+            issues.append("Marketing-claim i.p.v. concreet antwoord.")
+            break
+    improved_q = None
+    improved_a = None
+    if not q_ok:
+        q2 = norm(q)
+        if not q2.endswith("?"):
+            q2 += "?"
+        improved_q = q2
+    if issues:
+        a2 = a_norm
+        if wc > 90:
+            a2 = truncate_words(a2, 80)
+        improved_a = a2
     return {
-        "url": url,
-        "type": page_type,
-        "score": score,
+        "is_good": not issues,
         "issues": issues,
-        "metrics": m,
-        "qas": improved_qas,
-        "suggested_qas": []  # filled at top-level to avoid double work
+        "improved_question": improved_q,
+        "improved_answer": improved_a,
+        "word_count_answer": wc
     }
 
-# ================= Public entrypoint =================
+def _llm_json_parse(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(s[start:end+1])
+        return json.loads(s)
+    except Exception:
+        return None
 
-def generate_aeo(conn, job):
-    site_id = job["site_id"]
-    payload = job.get("payload") or {}
-    only_faq = bool(payload.get("only_faq", True))
-    emit_improved = bool(payload.get("emit_improved", True))
-    rewrite_mode = str(payload.get("rewrite", "deterministic")).lower()
-    max_words = int(payload.get("max_answer_words", 80))
-    dedup_threshold = float(payload.get("dedup_threshold", 0.88))
-    faq_paths = payload.get("faq_paths") if isinstance(payload.get("faq_paths"), list) else None
+class Reviewer:
+    def __init__(self, llm: Optional[LLMClient] = None):
+        self.llm = llm or LLMClient()
 
-    crawl = _fetch_latest(conn, site_id, "crawl")
-    if not crawl:
-        raise ValueError("Crawl job missing; run 'crawl' before 'aeo'.")
+    def review_one(self, qa: QAItem) -> QAReview:
+        if self.llm.available():
+            prompt = f"Question:\n{qa.question}\n\nAnswer:\n{qa.answer}\n\nReturn JSON now with exactly these keys: is_good, issues, improved_question, improved_answer"
+            raw = self.llm.chat(LLM_SYSTEM, prompt)
+            if raw:
+                data = _llm_json_parse(raw)
+                if data and set(data.keys()) >= {"is_good","issues","improved_question","improved_answer"}:
+                    wc = len(norm(data.get("improved_answer") or qa.answer).split())
+                    return QAReview(
+                        question=qa.question,
+                        answer=qa.answer,
+                        is_good=bool(data.get("is_good")),
+                        issues=list(data.get("issues") or []),
+                        improved_question=(data.get("improved_question") or None),
+                        improved_answer=(data.get("improved_answer") or None),
+                        word_count_answer=wc
+                    )
+        # fallback
+        data = _rule_review(qa.question, qa.answer)
+        return QAReview(**{
+            "question": qa.question,
+            "answer": qa.answer,
+            "is_good": data["is_good"],
+            "issues": data["issues"],
+            "improved_question": data["improved_question"],
+            "improved_answer": data["improved_answer"],
+            "word_count_answer": data["word_count_answer"]
+        })
 
-    # Pull faq-agent output (if available) to use as authoritative repo
-    faq_job_out = _fetch_latest(conn, site_id, "faq") or {}
-    faq_repo = _harvest_faq_agent_pairs(faq_job_out)
+    def review_many(self, qas: List[QAItem]) -> List[QAReview]:
+        return [self.review_one(qa) for qa in qas]
 
-    # Pull keywords for optional suggestions
-    kw_out = _fetch_latest(conn, site_id, "keywords") or {}
+# ---------------------- JSON-LD Builder & Validation ----------------------
 
-    start_url = crawl.get("start_url") or crawl.get("site_url") or ""
-    pages = crawl.get("pages") or []
+REQUIRED_FAQ_KEYS = {"@context","@type","mainEntity"}
 
-    out_pages: List[Dict[str, Any]] = []
-    for p in pages:
-        url = _norm_url(p.get("url") or "")
-        if not url:
+def build_faqpage_jsonld(items: Iterable[QAReview|QAItem]) -> Dict[str, Any]:
+    main = []
+    for it in items:
+        q = getattr(it, "improved_question", None) or getattr(it, "question", None)
+        a = getattr(it, "improved_answer", None) or getattr(it, "answer", None)
+        if not q or not a:
             continue
-        analyzed = _analyze_page(
-            page=p,
+        main.append({
+            "@type": "Question",
+            "name": q,
+            "acceptedAnswer": {"@type": "Answer", "text": a}
+        })
+    return {"@context":"https://schema.org","@type":"FAQPage","mainEntity":main}
+
+def validate_faq_jsonld(doc: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    if not isinstance(doc, dict):
+        return ["FAQ JSON-LD is not an object."]
+    missing = REQUIRED_FAQ_KEYS - set(doc.keys())
+    if missing:
+        issues.append(f"Missing keys: {', '.join(sorted(missing))}")
+    main = doc.get("mainEntity", [])
+    if not isinstance(main, list) or not main:
+        issues.append("mainEntity must be a non-empty list.")
+        return issues
+    for i, q in enumerate(main, start=1):
+        if not isinstance(q, dict):
+            issues.append(f"mainEntity[{i}] not an object")
+            continue
+        if q.get("@type") != "Question":
+            issues.append(f"mainEntity[{i}] @type != Question")
+        if not q.get("name"):
+            issues.append(f"mainEntity[{i}] missing name")
+        acc = q.get("acceptedAnswer")
+        if not isinstance(acc, dict) or acc.get("@type") != "Answer" or not acc.get("text"):
+            issues.append(f"mainEntity[{i}] invalid acceptedAnswer")
+    return issues
+
+# ---------------------- Core API ----------------------
+
+STARTER_FAQ: List[QAItem] = [
+    QAItem(question="What is this service and who is it for?", answer="It explains what the product does, who benefits, and which problems it solves."),
+    QAItem(question="How does pricing work?", answer="Outline plan structure, billing frequency, and what each plan includes."),
+    QAItem(question="How long until I see results?", answer="Set expectations with realistic timelines and the key factors that influence them."),
+    QAItem(question="Do you support my CMS or stack?", answer="State supported platforms and any integration notes or limitations."),
+    QAItem(question="How can I get support or talk to a human?", answer="Share support hours, response times, and contact options.")
+]
+
+def audit_faq_page(url: str) -> FAQAuditResult:
+    """Publieke functie: auditeer ALLEEN een FAQ-URL en produceer volledig resultaat."""
+    fetcher = Fetcher()
+    qas, notes, meta = extract_faq(url, fetcher=fetcher)
+
+    if not qas:
+        reviewer = Reviewer()
+        reviews = reviewer.review_many(STARTER_FAQ)
+        schema = build_faqpage_jsonld(reviews)
+        val_issues = validate_faq_jsonld(schema)
+        if val_issues:
+            notes.append("Generated FAQ JSON-LD validation issues: " + "; ".join(val_issues))
+        return FAQAuditResult(
             url=url,
-            only_faq=only_faq,
-            emit_improved=emit_improved,
-            rewrite_mode=rewrite_mode,
-            max_words=max_words,
-            dedup_threshold=dedup_threshold,
-            faq_paths=faq_paths,
-            faq_repo=faq_repo
+            found_faq=False,
+            qas_extracted=[],
+            reviews=reviews,
+            suggestions_count=sum(1 for r in reviews if not r.is_good or r.improved_answer or r.improved_question),
+            faq_schema_jsonld=schema,
+            notes=notes + ["No FAQ detected — starter set proposed."],
+            meta=meta
         )
-        if not analyzed:
-            continue
 
-        # Attach keyword suggestions per page (light: 0-5 unique gaps)
-        existing_qs = [qa["q"] for qa in analyzed.get("qas", [])]
-        suggestions = _keywords_suggestions(kw_out, existing_qs, limit=5)
-        if suggestions:
-            analyzed["suggested_qas"] = suggestions
+    reviewer = Reviewer()
+    reviews = reviewer.review_many(qas)
+    schema = build_faqpage_jsonld(reviews)
+    val_issues = validate_faq_jsonld(schema)
+    if val_issues:
+        notes.append("Built FAQ JSON-LD validation issues: " + "; ".join(val_issues))
 
-        out_pages.append(analyzed)
+    suggestions = sum(1 for r in reviews if (not r.is_good) or r.improved_answer or r.improved_question)
 
-    return {
-        "site": {"url": _norm_url(start_url or (pages[0].get("url") if pages else ""))},
-        "pages": out_pages
-    }
+    return FAQAuditResult(
+        url=url,
+        found_faq=True,
+        qas_extracted=qas,
+        reviews=reviews,
+        suggestions_count=suggestions,
+        faq_schema_jsonld=schema,
+        notes=notes,
+        meta=meta
+    )
+
+# ---------------------- (Optional) Small CLI ----------------------
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Audit a single FAQ page for AEO.")
+    ap.add_argument("--url", required=True)
+    args = ap.parse_args()
+    res = audit_faq_page(args.url)
+    print(json.dumps(res.dict(), ensure_ascii=False, indent=2))
