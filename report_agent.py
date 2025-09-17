@@ -24,10 +24,13 @@ def _escape_ascii(s: str) -> str:
     repl = {
         "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
         "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00A0": " ",
-        "\u200b": ""
+        "\u200b": "", "\u200d": "", "\ufeff": ""
     }
     for k, v in repl.items():
         t = t.replace(k, v)
+    # veelvoorkomende mojibake
+    t = t.replace("â", "'").replace("â", '"').replace("â", '"')
+    t = t.replace("â", "-").replace("â", "-")
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -84,6 +87,13 @@ def _trim_words(s: str, n: int) -> str:
         return " ".join(words)
     return " ".join(words[:n]) + "…"
 
+def _wcount(s: str) -> int:
+    return len(_escape_ascii(s).split())
+
+def _has_contamination(ans: str) -> bool:
+    s = _escape_ascii(ans).lower()
+    return bool(re.search(r"\bfaq\b|\bquick answers\b", s))
+
 # ========= Crawl → SEO analysis =========
 
 def _len_ok_title(s: str) -> bool:
@@ -129,7 +139,7 @@ def _analyze_seo_from_crawl(crawl: Dict[str, Any]) -> Dict[str, Any]:
             continue
         meta = p.get("meta") or {}
         title = p.get("title") or ""
-        desc = meta.get("description") or ""
+        desc = meta.get("description") or p.get("meta_description") or ""
         canonical = p.get("canonical") or ""
         og_t = meta.get("og:title") or ""
         og_d = meta.get("og:description") or ""
@@ -204,28 +214,38 @@ def _emit_aeo_scorecards(pages_aeo: List[Dict[str, Any]]) -> str:
         score = str(p.get("score", 0))
         issues = ", ".join(p.get("issues") or []) or "OK"
         m = p.get("metrics") or {}
-        src_counts = m.get("src_counts") or {}
-        metrics_txt = f"qa_ok:{m.get('answers_leq_80w',0)}, parity_ok:{bool(m.get('parity_ok'))}, src_counts:{src_counts}, qas_detected:{m.get('qas_detected',0)}, has_faq_schema_detected:{'Yes' if m.get('has_faq_schema_detected') else ''}"
+        src_counts = m.get("src_counts") or m.get("src_counts", {})
+        qas_detected = m.get("qas_detected", len(p.get("qas") or []))
+        has_faq_schema = "Yes" if m.get("has_faq_schema_detected") or p.get("has_faq_schema_detected") else ""
+        answers_leq_80w = m.get("answers_leq_80w", None)
+        parity_ok = m.get("parity_ok", None)
+        metrics_txt = f"qa_ok:{answers_leq_80w if answers_leq_80w is not None else 'n/a'}, parity_ok:{parity_ok if parity_ok is not None else 'n/a'}, src_counts:{src_counts}, qas_detected:{qas_detected}, has_faq_schema_detected:{has_faq_schema}"
         rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>[{ptype}]</td><td>{score}</td><td>{_h(issues)}</td><td><span class='mono'>{_h(metrics_txt)}</span></td></tr>")
     return "<table class='grid'>" + "\n".join(rows) + "</table>"
 
-def _emit_aeo_qna(pages_aeo: List[Dict[str, Any]]) -> str:
+def _emit_aeo_qna_clean(pages_aeo: List[Dict[str, Any]]) -> str:
     rows = []
-    rows.append("<tr><th>Page URL</th><th>Q</th><th>Proposed answer (≤80 words)</th></tr>")
+    rows.append("<tr><th>Page URL</th><th>Q</th><th>A (≤80 words)</th><th>Len</th><th>Flags</th></tr>")
     for p in pages_aeo:
-        qas = p.get("qas") or []
-        if not qas:
+        if (p.get("type") or "") != "faq":
             continue
         url = _h(p.get("url",""))
-        for qa in qas:
+        for qa in (p.get("qas") or []):
             q = _h(qa.get("q",""))
-            a = _h(qa.get("a",""))
-            rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>{q}</td><td>{a}</td></tr>")
+            a_raw = qa.get("a","")
+            a = _h(a_raw)
+            wc = _wcount(a_raw)
+            flags = []
+            if wc > 80:
+                flags.append("overlong")
+            if _has_contamination(a_raw):
+                flags.append("contam")
+            rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>{q}</td><td>{a}</td><td>{wc}</td><td>{', '.join(flags) if flags else ''}</td></tr>")
     return "<table class='grid'>" + "\n".join(rows) + "</table>"
 
 # ========= SEO sections from crawl analysis =========
 
-def _emit_seo_fixes(fixes: List[Dict[str, str]]) -> str:
+def _emit_seo_fixes(fixes: List[Dict[str, Any]]) -> str:
     if not fixes:
         return "<p>No concrete SEO text fixes found.</p>"
     rows = []
@@ -238,7 +258,7 @@ def _emit_seo_fixes(fixes: List[Dict[str, str]]) -> str:
         )
     return "<table class='grid'>" + "\n".join(rows) + "</table>"
 
-def _emit_html_patches(canon: List[Dict[str, str]], ogs: List[Dict[str,str]]) -> str:
+def _emit_html_patches(canon: List[Dict[str, Any]], ogs: List[Dict[str,Any]]) -> str:
     lines = []
     if canon:
         lines.append("<h3>HTML patches — Canonical & Open Graph</h3>")
@@ -387,7 +407,6 @@ def _try_llm_generate(prompt: str, system: Optional[str], model: Optional[str], 
     return None
 
 def _compose_llm_prompt_nl(context: Dict[str, Any]) -> str:
-    # Compact, anti-hallucinatie: alle cijfers/URL’s worden als JSON meegegeven.
     ctx_json = json.dumps(context, ensure_ascii=False)
     return (
         "Je bent een nuchtere SEO/AEO auditor. Schrijf in het Nederlands een kort, actiegericht rapport voor een CMO.\n"
@@ -405,22 +424,20 @@ def _compose_llm_prompt_nl(context: Dict[str, Any]) -> str:
 
 def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]], keywords: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     pages = crawl.get("pages") or []
-    # top issues
     bad_titles = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "title"]
     bad_descs  = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "meta_description"]
     canon_issues = crawl_an.get("canonical_patches") or []
     og_issues    = crawl_an.get("og_patches") or []
-    # aeo summary
     aeo_compact = []
     for p in aeo_pages:
+        m = p.get("metrics") or {}
         aeo_compact.append({
             "url": p.get("url"),
             "type": p.get("type"),
             "score": p.get("score"),
             "issues": p.get("issues"),
-            "qas_detected": (p.get("metrics") or {}).get("qas_detected")
+            "qas_detected": m.get("qas_detected", len(p.get("qas") or []))
         })
-    # keywords sample
     kw_sample = (keywords or {}).get("keywords") or []
     kw_sample = kw_sample[:10]
 
@@ -440,9 +457,7 @@ def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str,
     }
 
 def _render_narrative_html(title: str, text: str, label_class: str) -> str:
-    # simpele linebreak → <br>, bullets blijven leesbaar zonder externe md-parser
-    safe = _h(text)
-    safe = safe.replace("\n", "<br>")
+    safe = _h(text).replace("\n", "<br>")
     return f"<h2>{_h(title)}</h2><div class='{label_class}'>{safe}</div>"
 
 def _compose_exec_summary_fallback(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]]) -> str:
@@ -501,6 +516,8 @@ table.grid th,table.grid td{{border:1px solid #ddd;padding:8px;vertical-align:to
 table.grid th{{background:#f7f7f7;text-align:left}}
 pre{{white-space:pre-wrap;word-wrap:break-word;background:#f8f8f8;border:1px solid #eee;padding:8px;border-radius:6px}}
 div.narrative{{background:#fff;border:1px solid #eee;padding:12px;border-radius:6px}}
+.bad{{color:#b00020;font-weight:600}}
+.pill{{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff}}
 </style>
 </head>
 <body>
@@ -565,8 +582,14 @@ def generate_report(conn, job):
 
     # AEO sections
     pages_aeo = aeo.get("pages") or []
+    # Counters (voor header en sanity)
+    faq_pages = [p for p in pages_aeo if (p.get("type") or "") == "faq"]
+    total_qas = sum(len(p.get("qas") or []) for p in faq_pages)
+    overlong_total = sum(sum(1 for qa in (p.get("qas") or []) if _wcount(qa.get("a",""))>80) for p in faq_pages)
+    contam_total = sum(sum(1 for qa in (p.get("qas") or []) if _has_contamination(qa.get("a",""))) for p in faq_pages)
+
     aeo_scorecards_html = _emit_aeo_scorecards(pages_aeo)
-    aeo_qna_html = _emit_aeo_qna(pages_aeo)
+    aeo_qna_clean_html = _emit_aeo_qna_clean(pages_aeo)
 
     # SEO analysis
     crawl_analysis = _analyze_seo_from_crawl(crawl)
@@ -583,13 +606,12 @@ def generate_report(conn, job):
     if use_llm:
         ctx = _build_llm_context(site_url, crawl, crawl_analysis, pages_aeo, keywords)
         prompt = _compose_llm_prompt_nl(ctx)
-        system = "Je bent een senior SEO/AEO consultant. Wees feitelijk, bondig, en data-gedreven."
+        system = "Je bent een senior SEO/AEO consultant. Wees feitelijk, bondig en data-gedreven."
         llm_text = _try_llm_generate(prompt=prompt, system=system, model=model, temperature=temperature, max_tokens=max_tokens)
 
     if llm_text:
         narrative_blocks.append(_render_narrative_html("Executive narrative (LLM)", llm_text, "narrative"))
     else:
-        # deterministic fallback in 3 secties
         narrative_blocks.append(_render_narrative_html("Executive summary", _compose_exec_summary_fallback(site_url, crawl, crawl_analysis, pages_aeo), "narrative"))
         narrative_blocks.append(_render_narrative_html("Key actions (7 dagen)", _compose_actions_fallback(crawl_analysis, pages_aeo), "narrative"))
         narrative_blocks.append(_render_narrative_html("Quarterly outlook", _compose_quarter_fallback(pages_aeo), "narrative"))
@@ -601,9 +623,11 @@ def generate_report(conn, job):
     body.extend(narrative_blocks)
 
     body.append("<h2>AEO — Answer readiness (scorecards)</h2>")
+    body.append(f"<p><span class='pill'>FAQ pages: {len(faq_pages)}</span> <span class='pill'>FAQ Q&A: {total_qas}</span> <span class='pill'>Overlong answers: {overlong_total}</span> <span class='pill'>Contamination hits: {contam_total}</span></p>")
     body.append(aeo_scorecards_html)
-    body.append("<h2>AEO — Q&A (snippet-ready, ready-to-paste)</h2>")
-    body.append(aeo_qna_html)
+
+    body.append("<h2>AEO — Q&A (clean)</h2>")
+    body.append(aeo_qna_clean_html)
 
     body.append("<h2>SEO — Concrete text fixes (ready-to-paste)</h2>")
     body.append(_emit_seo_fixes(fixes))
@@ -624,6 +648,8 @@ def generate_report(conn, job):
     if keywords and (keywords.get("keywords") or []):
         kws = [str(x) for x in (keywords.get("keywords") or [])][:10]
         body.append("<h2>Keywords — sample</h2><p><span class='mono'>" + _h(", ".join(kws)) + "</span></p>")
+
+    body.append("<p><small class='mono'>Exports: patches.csv implementation_plan.csv</small></p>")
 
     html_doc = _html_doc(title, "\n".join(body))
     html_b64 = base64.b64encode(html_doc.encode("utf-8")).decode("ascii")
