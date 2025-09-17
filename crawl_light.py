@@ -1,376 +1,426 @@
-# crawl_light.py — DOM-order aware crawler met uitgebreide FAQ-extractie
-import re, time, gc, json, os
-from urllib.parse import urljoin, urlparse
-import requests
+# crawl_light.py — Robust DOM-order crawler with FAQ extraction
+# Replaces previous version. Exposes crawl_site(start_url, max_pages=10, ua=None).
+# Focus: populate page["dom_blocks"] and page["faq_visible"] so AEO detects all Q&A.
 
-DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "900000"))
-HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.4 (+https://aseon.ai)"}
+import os
+import re
+import gc
+import json
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+DEFAULT_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT_SEC", "10"))
+MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", "40"))
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "1500000"))
+
+# Keep in sync with aeo_agent._extract_visible_from_page expectations:
+# - Provide page["faq_visible"] as list of {"q","a"}
+# - Provide page["dom_blocks"] as list of {"tag","text"} preserving DOM order
+# - Provide page["faq_jsonld"] as parsed JSON (list/dict) or empty list
 
 _SKIP_EXT = {
     ".png",".jpg",".jpeg",".webp",".gif",".svg",".ico",".bmp",".avif",
-    ".pdf",".zip",".rar",".7z",".gz",".mp4",".mp3",".mov",".wav",".woff",".woff2",".ttf",".eot"
+    ".pdf",".zip",".rar",".7z",".gz",".mp4",".mp3",".mov",".wav",".woff",".woff2",".ttf",".eot",".otf",".webm"
 }
 
-def _seems_asset(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    if any(path.endswith(ext) for ext in _SKIP_EXT):
-        return True
-    if "favicon" in path or "apple-touch-icon" in path:
-        return True
-    return False
-
-def _normalize_host(u: str) -> str:
-    try:
-        p = urlparse(u)
-        host = p.netloc.lower()
-        if host.startswith("www."): host = host[4:]
-        return host
-    except Exception:
-        return u
-
-def _same_host(a: str, b: str):
-    try:
-        return _normalize_host(a) == _normalize_host(b)
-    except Exception:
-        return False
-
-def _fetch(url: str, ua: str):
-    resp = requests.get(
-        url,
-        headers=HEADERS_TEMPLATE(ua),
-        timeout=DEFAULT_TIMEOUT,
-        allow_redirects=True,
-    )
-    final_url = str(resp.url)
-
-    enc = (resp.encoding or "").lower()
-    if not enc or enc == "iso-8859-1":
-        try:
-            resp.encoding = resp.apparent_encoding or "utf-8"
-        except Exception:
-            resp.encoding = "utf-8"
-
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    head = (resp.text[:1000].lower() if isinstance(resp.text, str) else "")
-    is_html = "text/html" in ctype or "application/xhtml" in ctype or "<html" in head
-
-    status = resp.status_code
-    html = resp.text if (is_html and isinstance(resp.text, str)) else ""
-    if len(html) > MAX_HTML_BYTES:
-        html = html[:MAX_HTML_BYTES]
-    return final_url, status, html, is_html
-
-# ---------- helpers ----------
-_TAG_RE = re.compile(r"<[^>]+>")
-def _clean_text(s: str) -> str:
-    if not s: return ""
-    s = re.sub(r'<script[^>]*>.*?</script>', ' ', s, flags=re.I|re.S)
-    s = re.sub(r'<style[^>]*>.*?</style>', ' ', s, flags=re.I|re.S)
-    s = _TAG_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _extract_title(html: str):
-    m = re.search(r'<title[^>]*>(.*?)</title>', html, flags=re.I|re.S)
-    return _clean_text(m.group(1)) if m else None
-
-def _extract_tag_once(html: str, tag: str):
-    m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S)
-    return _clean_text(m.group(1)) if m else None
-
-def _extract_multi(html: str, tag: str, maxn=50, max_chars=600):
-    out = []
-    for m in re.finditer(rf'<{tag}\b[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S):
-        t = _clean_text(m.group(1))
-        if not t: continue
-        if len(t) > max_chars: t = t[:max_chars]
-        out.append(t)
-        if len(out) >= maxn: break
-    return out
-
-def _extract_dom_blocks(html: str, maxn=800, max_chars=700):
-    """
-    Preserveert DOM-volgorde van relevante elementen voor Q/A-detectie.
-    """
-    tags = r'(h1|h2|h3|summary|button|dt|dd|li|p)'
-    out = []
-    for m in re.finditer(rf'<{tags}\b[^>]*>(.*?)</\1>', html, flags=re.I|re.S):
-        tag = m.group(1).lower()
-        txt = _clean_text(m.group(2))
-        if not txt: continue
-        if len(txt) > max_chars: txt = txt[:max_chars]
-        out.append({"tag": tag, "text": txt})
-        if len(out) >= maxn: break
-    return out
-
-def _extract_paragraphs(html: str, maxn=300, max_chars=600):
-    return _extract_multi(html, "p", maxn=maxn, max_chars=max_chars)
-
-def _extract_jsonld_blocks(html: str):
-    blocks = []
-    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.I|re.S):
-        raw = m.group(1).strip()
-        try:
-            data = json.loads(raw)
-            blocks.append(data)
-        except Exception:
-            continue
-    return blocks
-
-def _extract_jsonld_types(data):
-    types = set()
-    def collect(d):
-        if isinstance(d, dict):
-            t = d.get("@type")
-            if isinstance(t, str): types.add(t)
-            elif isinstance(t, list):
-                for x in t:
-                    if isinstance(x, str): types.add(x)
-            for v in d.values(): collect(v)
-        elif isinstance(d, list):
-            for it in d: collect(it)
-    collect(data)
-    return sorted(types)
-
-def _canonical(html: str):
-    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\'](.*?)["\']', html, flags=re.I|re.S)
-    return m.group(1).strip() if m else None
-
-def _meta_name(html: str, name: str):
-    m = re.search(rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
-    return m.group(1).strip() if m else None
-
-def _meta_prop(html: str, prop: str):
-    m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
-    return m.group(1).strip() if m else None
-
-def _robots_meta(html: str):
-    m = re.search(r'<meta[^>]+name=["\']robots["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re/S)
-    if not m: return (False, False)
-    c = m.group(1).lower()
-    return ("noindex" in c, "nofollow" in c)
-
-def _extract_links(html: str, base_url: str):
-    hrefs = re.findall(r'href\s*=\s*["\']?([^"\' >]+)', html, flags=re.I)
-    links = []
-    for h in hrefs:
-        if not h or h.startswith("#"): continue
-        if any(bad in h.lower() for bad in ["javascript:", "(", "=", "{", "}"]): continue
-        abs_url = urljoin(base_url, h)
-        if abs_url.startswith("http") and not _seems_asset(abs_url):
-            links.append(abs_url)
-    return links
-
-# Q-detectie voor DOM-parsing (lichte heuristiek)
 QUESTION_PREFIXES = (
     "what ","how ","why ","when ","can ","does ","do ","is ","are ","should ","will ","where ","who ",
     "wat ","hoe ","waarom ","wanneer ","kan ","doet ","doen ","is ","zijn ","moet ","zal ","waar ","wie "
 )
-def _looks_like_question(s: str) -> bool:
-    if not s: return False
-    t = s.strip().lower()
-    if t.endswith("?"): return True
-    return any(t.startswith(p) for p in QUESTION_PREFIXES) and len(t.split()) >= 2
 
-def _pair_dom_qas(dom_blocks):
-    """Vorm Q/A-paren uit DOM-volgorde (summary/button/dt/h2/h3 als Q; p/dd/li als A)."""
-    if not isinstance(dom_blocks, list): return []
-    blocks = [{"tag": b.get("tag",""), "text": (b.get("text") or "").strip()} for b in dom_blocks if isinstance(b, dict)]
-    out = []
-    used = set()
-    for i, b in enumerate(blocks):
-        tag = b["tag"]
-        txt = b["text"]
-        if not txt: continue
-        if tag in ("summary","button","dt","h2","h3") or _looks_like_question(txt):
-            # zoek antwoord in de volgende blokken
-            a = ""
-            for j in range(i+1, min(i+12, len(blocks))):
-                if j in used: continue
-                t2 = blocks[j]["text"]
-                tag2 = blocks[j]["tag"]
-                if _looks_like_question(t2): break
-                if tag2 not in ("p","dd","li"): 
-                    # toch toestaan als het lang genoeg is
-                    if len(t2.split()) < 6: 
-                        continue
-                else:
-                    if len(t2.split()) < 6:
-                        continue
-                a = t2
-                used.add(j)
+def _seems_asset(url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower()
+        ext = (path.rsplit(".", 1)[-1] if "." in path else "")
+        return ("."+ext) in _SKIP_EXT
+    except Exception:
+        return False
+
+def _norm_url(url: str) -> str:
+    try:
+        u = urlparse(url.strip())
+        if not u.scheme:
+            return ""
+        # Force lowercase host, drop fragments, normalize path
+        netloc = u.netloc.lower()
+        path = re.sub(r"/{2,}", "/", u.path or "/")
+        return urlunparse((u.scheme, netloc, path, "", u.query, ""))
+    except Exception:
+        return ""
+
+def _same_host(a: str, b: str) -> bool:
+    try:
+        return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+    except Exception:
+        return False
+
+def _clean(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    return s
+
+def _text_of(node: Tag) -> str:
+    if not isinstance(node, (Tag, NavigableString)):
+        return ""
+    if isinstance(node, NavigableString):
+        return _clean(str(node))
+    # Remove script/style/noscript
+    for bad in node.find_all(["script","style","noscript","template"]):
+        bad.decompose()
+    return _clean(node.get_text(separator=" "))
+
+def _looks_like_question(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    low = t.lower()
+    if "?" in t:
+        return True
+    if any(low.startswith(p) for p in QUESTION_PREFIXES):
+        return True
+    # bullet-like "Q:" or "Vraag:" patterns
+    if re.match(r"^(q|vraag)\s*[:\-–]\s*\S", low):
+        return True
+    return False
+
+def _is_empty_answer(text: str) -> bool:
+    if not text: return True
+    words = text.strip().split()
+    return len(words) < 2
+
+def _collect_dom_blocks(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    blocks: List[Dict[str,str]] = []
+    # We take a shallow DOM walk and record text blocks in reading order for key tags.
+    TAGS = ["h1","h2","h3","h4","h5","h6","p","li","dt","dd","summary","button","a"]
+    walker = soup.body or soup
+    for el in walker.descendants:
+        if isinstance(el, Tag) and el.name in TAGS:
+            txt = _text_of(el)
+            if txt:
+                blocks.append({"tag": el.name, "text": txt})
+    # Coalesce consecutive duplicates
+    out: List[Dict[str,str]] = []
+    for b in blocks:
+        if out and out[-1]["tag"] == b["tag"] and out[-1]["text"] == b["text"]:
+            continue
+        out.append(b)
+    return out
+
+def _pair_dom_qas(dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    qas: List[Dict[str,str]] = []
+    used_idx = set()
+    N = len(dom_blocks)
+    for i in range(N):
+        blk = dom_blocks[i]
+        qtxt = blk.get("text","")
+        if not _looks_like_question(qtxt):
+            continue
+        # Answer is the concatenation of following non-question blocks until next question or up to window
+        ans_parts: List[str] = []
+        for j in range(i+1, min(i+30, N)):  # wider window than before
+            if j in used_idx: 
+                continue
+            cand = dom_blocks[j].get("text","")
+            if _looks_like_question(cand):
                 break
-            if a:
-                out.append({"q": txt, "a": a})
-    # dedupe op vraag
-    seen = set(); dedup = []
-    for qa in out:
-        key = qa["q"].strip().lower()
-        if key in seen: continue
+            if dom_blocks[j]["tag"] in ("h1","h2","h3","h4","h5","h6","dt","summary","button"):
+                # treat as a section/question boundary if header-like
+                if not ans_parts:
+                    continue
+                else:
+                    break
+            # stop if answer grows too long (>1200 chars) to avoid swallowing whole page
+            if sum(len(x) for x in ans_parts)+len(cand) > 1200:
+                break
+            ans_parts.append(cand)
+        ans = _clean(" ".join(ans_parts))
+        if not _is_empty_answer(ans):
+            used_idx.add(i)
+            qas.append({"q": qtxt if qtxt.endswith("?") else (qtxt.rstrip(".! ")+"?"), "a": ans})
+    return _dedupe_qas(qas)
+
+def _dl_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
+    out: List[Dict[str,str]] = []
+    for dl in soup.find_all("dl"):
+        dts = [el for el in dl.find_all("dt", recursive=False)]
+        dds = [el for el in dl.find_all("dd", recursive=False)]
+        # Pair by order if same length, else best-effort
+        if dts and dds:
+            for i, dt in enumerate(dts):
+                q = _text_of(dt)
+                a = _text_of(dds[i]) if i < len(dds) else ""
+                if _looks_like_question(q) and not _is_empty_answer(a):
+                    out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+    return out
+
+def _details_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
+    out: List[Dict[str,str]] = []
+    for det in soup.find_all("details"):
+        q_el = det.find("summary")
+        if q_el:
+            q = _text_of(q_el)
+            # answer is details content without summary
+            for s in det.find_all("summary"):
+                s.decompose()
+            a = _text_of(det)
+            if _looks_like_question(q) and not _is_empty_answer(a):
+                out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+    return out
+
+def _aria_accordion_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
+    out: List[Dict[str,str]] = []
+    # Patterns like <button aria-controls="answer1">Q</button> <div id="answer1">A</div>
+    for btn in soup.find_all(["button","a","div","h3","h4","h5"], attrs={"aria-controls": True}):
+        q = _text_of(btn)
+        target_id = btn.get("aria-controls")
+        a = ""
+        if target_id:
+            tgt = soup.find(id=target_id)
+            if tgt:
+                a = _text_of(tgt)
+        if _looks_like_question(q) and not _is_empty_answer(a):
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+    return out
+
+def _class_based_faq_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
+    out: List[Dict[str,str]] = []
+    FAQ_CLASS_HINTS = re.compile(r"(faq|accordion|question|qna|q-and-a)", re.I)
+    for container in soup.find_all(attrs={"class": FAQ_CLASS_HINTS}):
+        # Try heading-like as question within this container
+        q_el = None
+        for tag in ["h2","h3","h4","h5","button","summary",".question",".q"]:
+            if tag.startswith("."):
+                q_el = container.find(attrs={"class": re.compile(tag[1:], re.I)})
+            else:
+                q_el = container.find(tag)
+            if q_el:
+                break
+        if not q_el:
+            continue
+        q = _text_of(q_el)
+        # answer: remaining text inside container minus question text
+        tmp = container.clone()
+        # remove the first question element only
+        try:
+            q_el.extract()
+        except Exception:
+            pass
+        a = _text_of(container)
+        if _looks_like_question(q) and not _is_empty_answer(a):
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+    return out
+
+def _dedupe_qas(qas: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    seen = set()
+    out: List[Dict[str,str]] = []
+    for qa in qas:
+        q = _clean(qa.get("q",""))
+        a = _clean(qa.get("a",""))
+        if not q or not a:
+            continue
+        key = (q.lower(), a[:160].lower())
+        if key in seen:
+            continue
         seen.add(key)
-        dedup.append(qa)
-    return dedup[:200]
+        out.append({"q": q, "a": a})
+    return out
 
-# ---------- main ----------
-def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
-    if not start_url.startswith(("http://", "https://")):
-        start_url = "https://" + start_url
+def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[Any], List[Any]]:
+    raw_blocks: List[Any] = []
+    faq_blocks: List[Any] = []
+    for sc in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        try:
+            txt = sc.string or sc.get_text() or ""
+            txt = txt.strip()
+            if not txt:
+                continue
+            obj = json.loads(txt)
+            raw_blocks.append(obj)
+            # find FAQPage nodes
+            def walk(o):
+                if isinstance(o, dict):
+                    t = str(o.get("@type","")).lower()
+                    if t == "faqpage" or "mainEntity" in o or "@graph" in o:
+                        faq_blocks.append(o)
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+            walk(obj)
+        except Exception:
+            # Ignore JSON parse errors
+            continue
+    return raw_blocks, faq_blocks
 
-    seen, queue = set(), [start_url]
-    pages, quick_wins = [], []
-    started = time.time()
-    start_host = start_url
+def _meta(soup: BeautifulSoup, name: str) -> str:
+    el = soup.find("meta", attrs={"name": name})
+    return el.get("content","").strip() if el else ""
+
+def _meta_prop(soup: BeautifulSoup, prop: str) -> str:
+    el = soup.find("meta", attrs={"property": prop})
+    return el.get("content","").strip() if el else ""
+
+def _canonical(soup: BeautifulSoup) -> str:
+    el = soup.find("link", rel=lambda v: v and "canonical" in [x.lower() for x in (v if isinstance(v, list) else [v])])
+    href = el.get("href","").strip() if el else ""
+    return href
+
+def _robots_meta(soup: BeautifulSoup) -> Tuple[bool,bool]:
+    el = soup.find("meta", attrs={"name": re.compile(r"robots", re.I)})
+    if not el: return (False, False)
+    content = (el.get("content") or "").lower()
+    return ("noindex" in content, "nofollow" in content)
+
+def _extract_faq_visible(soup: BeautifulSoup, dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    qas: List[Dict[str,str]] = []
+    qas += _dl_qas(soup)
+    qas += _details_qas(soup)
+    qas += _aria_accordion_qas(soup)
+    qas += _class_based_faq_qas(soup)
+    # As a last resort, pair from DOM order
+    if len(qas) < 5 and dom_blocks:
+        qas += _pair_dom_qas(dom_blocks)
+    return _dedupe_qas(qas)
+
+def _extract_links(soup: BeautifulSoup, base: str) -> List[str]:
+    out: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("#"):
+            continue
+        url = urljoin(base, href)
+        url = _norm_url(url)
+        if not url: continue
+        if _seems_asset(url): continue
+        out.append(url)
+    # Dedup
+    seen = set(); deduped=[]
+    for u in out:
+        if u not in seen:
+            seen.add(u); deduped.append(u)
+    return deduped
+
+def _fetch(url: str, ua: Optional[str]) -> Tuple[int, str]:
+    headers = {"User-Agent": ua or "AseonBot/0.5 (+https://aseon.ai)"}
+    resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+    resp.raise_for_status()
+    html = resp.text
+    if len(html.encode("utf-8", "ignore")) > MAX_HTML_BYTES:
+        html = html[:MAX_HTML_BYTES]
+    return resp.status_code, html
+
+def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = None) -> Dict[str, Any]:
+    start_url = _norm_url(start_url)
+    if not start_url:
+        raise ValueError("Invalid start_url")
+    host = urlparse(start_url).netloc.lower()
+
+    visited = set()
+    queue: List[str] = [start_url]
+    pages: List[Dict[str, Any]] = []
 
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
-        if url in seen: continue
-        if _seems_asset(url): continue
-        seen.add(url)
-
+        url = _norm_url(url)
+        if not url or url in visited:
+            continue
+        if not _same_host(url, start_url):
+            continue
         try:
-            final_url, status, html, is_html = _fetch(url, ua)
+            status, html = _fetch(url, ua)
         except Exception:
+            visited.add(url)
             continue
 
-        title = h1 = meta_desc = canon = None
-        noindex = nofollow = False
-        issues = []
-        og_title = og_desc = twitter_card = None
-        jsonld_types = []
-        dom_blocks = []
-        h2 = []; h3 = []; paragraphs = []; lis = []; summaries = []; buttons = []; dts = []; dds = []
-        outlinks = []
-        faq_jsonld = None
-        faq_visible = []
-        word_count = 0
+        visited.add(url)
 
-        if is_html and html:
-            title = _extract_title(html)
-            h1 = _extract_tag_once(html, "h1")
-            h2 = _extract_multi(html, "h2", maxn=80)
-            h3 = _extract_multi(html, "h3", maxn=80)
-            paragraphs = _extract_paragraphs(html, maxn=400)
-            lis = _extract_multi(html, "li", maxn=400)
-            summaries = _extract_multi(html, "summary", maxn=400)
-            buttons = _extract_multi(html, "button", maxn=400)
-            dts = _extract_multi(html, "dt", maxn=400)
-            dds = _extract_multi(html, "dd", maxn=400)
+        soup = BeautifulSoup(html, "html.parser")
 
-            dom_blocks_tagged = _extract_dom_blocks(html, maxn=1000)
-            dom_blocks = dom_blocks_tagged  # lijst van {tag,text}
+        title = _clean(soup.title.get_text()) if soup.title else ""
+        h1 = [_clean(el.get_text()) for el in soup.find_all("h1")]
+        h2 = [_clean(el.get_text()) for el in soup.find_all("h2")]
+        h3 = [_clean(el.get_text()) for el in soup.find_all("h3")]
+        paragraphs = [_clean(el.get_text()) for el in soup.find_all("p")]
+        li = [_clean(el.get_text()) for el in soup.find_all("li")]
+        dt = [_clean(el.get_text()) for el in soup.find_all("dt")]
+        dd = [_clean(el.get_text()) for el in soup.find_all("dd")]
+        summary = [_clean(el.get_text()) for el in soup.find_all("summary")]
+        buttons = [_clean(el.get_text()) for el in soup.find_all("button")]
 
-            # Q/A uit DOM-volgorde
-            faq_visible = _pair_dom_qas(dom_blocks_tagged)
+        dom_blocks = _collect_dom_blocks(soup)
 
-            meta_desc = _meta_name(html, "description")
-            og_title = _meta_prop(html, "og:title")
-            og_desc  = _meta_prop(html, "og:description")
-            twitter_card = _meta_prop(html, "twitter:card") or _meta_name(html, "twitter:card")
-            canon = _canonical(html)
-            noindex, nofollow = _robots_meta(html)
+        _, faq_ld = _extract_jsonld(soup)
+        has_faq_schema = bool(faq_ld)
 
-            # JSON-LD parsing
-            ld_blocks = _extract_jsonld_blocks(html)
-            all_types = set()
-            for block in ld_blocks:
-                for t in _extract_jsonld_types(block):
-                    all_types.add(t)
-            jsonld_types = sorted(all_types)
+        faq_visible = _extract_faq_visible(soup, dom_blocks)
 
-            # FAQ JSON-LD kandidaten
-            faq_candidates = []
-            def looks_like_faq(obj):
-                if isinstance(obj, dict):
-                    t = obj.get("@type")
-                    if (isinstance(t, str) and t.lower() == "faqpage") or ("mainEntity" in obj):
-                        return True
-                return False
-            for b in ld_blocks:
-                if looks_like_faq(b):
-                    faq_candidates.append(b)
-                elif isinstance(b, dict) and "@graph" in b and isinstance(b["@graph"], list):
-                    for node in b["@graph"]:
-                        if looks_like_faq(node):
-                            faq_candidates.append(node)
-            if faq_candidates:
-                try:
-                    faq_jsonld = json.dumps(faq_candidates)
-                except Exception:
-                    faq_jsonld = None
-
-            outlinks = [l for l in _extract_links(html, final_url) if _same_host(start_host, l)]
-            word_count = len(_clean_text(html).split())
-
-            if not meta_desc: issues.append("missing_meta_description")
-            if not h1: issues.append("missing_h1")
-            if canon:
-                try:
-                    from urllib.parse import urlsplit
-                    if urlsplit(canon).netloc.lower().lstrip("www.") != urlsplit(final_url).netloc.lower().lstrip("www."):
-                        issues.append("canonical_differs")
-                except Exception:
-                    pass
-            if not title: issues.append("missing_title")
-
-            for link in outlinks:
-                if link not in seen and not _seems_asset(link):
-                    queue.append(link)
-
-        pages.append({
+        page = {
             "url": url,
-            "final_url": final_url,
             "status": status,
             "title": title,
-            "h1": h1,
+            "h1": h1[0] if h1 else "",
             "h2": h2,
             "h3": h3,
-            "paragraphs": paragraphs,
-            "li": lis,
-            "summary": summaries,
-            "buttons": buttons,
-            "dt": dts,
-            "dd": dds,
-            "dom_blocks": dom_blocks,         # lijst van {tag,text}
-            "faq_visible": faq_visible,       # lijst van {q,a} uit DOM
-            "meta_description": meta_desc,
-            "og_title": og_title,
-            "og_description": og_desc,
-            "twitter_card": twitter_card,
-            "canonical": canon,
-            "noindex": noindex,
-            "nofollow": nofollow,
-            "jsonld_types": jsonld_types,
-            "faq_jsonld": faq_jsonld,         # stringified JSON
-            "links": outlinks,
-            "word_count": word_count,
-            "issues": issues
-        })
+            "paragraphs": [p for p in paragraphs if p],
+            "li": [x for x in li if x],
+            "dt": [x for x in dt if x],
+            "dd": [x for x in dd if x],
+            "summary": [x for x in summary if x],
+            "buttons": [x for x in buttons if x],
+            "dom_blocks": dom_blocks,  # in-order blocks
+            "faq_visible": faq_visible, # list of {"q","a"}
+            "faq_jsonld": faq_ld,       # list/dict or empty list
+            "metrics": {
+                "has_faq_schema": has_faq_schema
+            },
+            "meta": {
+                "description": _meta(soup, "description"),
+                "og:title": _meta_prop(soup, "og:title"),
+                "og:description": _meta_prop(soup, "og:description"),
+                "twitter:card": _meta_prop(soup, "twitter:card") or _meta(soup, "twitter:card"),
+            },
+            "canonical": _canonical(soup),
+            "robots": {
+                "noindex": _robots_meta(soup)[0],
+                "nofollow": _robots_meta(soup)[1],
+            }
+        }
 
-        html = None
-        gc.collect()
+        pages.append(page)
 
-    dur_ms = int((time.time() - started) * 1000)
+        # Enqueue links
+        for link in _extract_links(soup, url):
+            if link not in visited and link not in queue and _same_host(link, start_url) and not _seems_asset(link):
+                queue.append(link)
+
+        # free memory periodically
+        if len(pages) % 5 == 0:
+            gc.collect()
+
+    # Build simple summary and quick wins used by report_agent
+    title_lengths = [len((p.get("title") or "")) for p in pages]
+    missing_meta_desc = [p for p in pages if not (p.get("meta") or {}).get("description")]
+    missing_h1 = [p for p in pages if not p.get("h1")]
+    canonical_differs = [
+        p for p in pages
+        if p.get("canonical") and _norm_url(p["canonical"]) != p["url"]
+    ]
     summary = {
-        "pages_total": len(pages),
-        "ok_200": sum(1 for p in pages if p["status"] == 200),
-        "redirect_3xx": sum(1 for p in pages if 300 <= p["status"] < 400),
-        "errors_4xx_5xx": sum(1 for p in pages if p["status"] >= 400),
-        "fetch_errors": 0,
-        "duration_ms": dur_ms,
+        "page_count": len(pages),
+        "avg_title_len": (sum(title_lengths)/len(title_lengths)) if title_lengths else 0,
+        "faq_pages": sum(1 for p in pages if p.get("faq_visible") or p.get("faq_jsonld")),
+        "has_faq_schema_count": sum(1 for p in pages if bool((p.get("metrics") or {}).get("has_faq_schema"))),
     }
-
     quick_wins = []
-    if any("missing_meta_description" in p["issues"] for p in pages):
-        quick_wins.append({"type":"missing_meta_description"})
-    if any("missing_h1" in p["issues"] for p in pages):
-        quick_wins.append({"type":"missing_h1"})
-    if any("canonical_differs" in p["issues"] for p in pages):
-        quick_wins.append({"type":"canonical_differs"})
+    if missing_meta_desc:
+        quick_wins.append({"type": "missing_meta_description"})
+    if missing_h1:
+        quick_wins.append({"type": "missing_h1"})
+    if canonical_differs:
+        quick_wins.append({"type": "canonical_differs"})
 
-    return {
-        "start_url": start_url,
-        "pages": pages,
-        "summary": summary,
-        "quick_wins": quick_wins
-    }
+    return {"start_url": start_url, "pages": pages, "summary": summary, "quick_wins": quick_wins}
