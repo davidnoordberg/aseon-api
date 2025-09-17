@@ -195,19 +195,6 @@ def _analyze_seo_from_crawl(crawl: Dict[str, Any]) -> Dict[str, Any]:
 
 # ========= AEO helpers =========
 
-def _emit_aeo_header_summary(pages_aeo: List[Dict[str, Any]]) -> str:
-    faq_pages = [p for p in pages_aeo if (p.get("type") == "faq")]
-    faq_count = len(faq_pages)
-    total_qas = sum((p.get("metrics") or {}).get("qas_detected", 0) for p in pages_aeo)
-    over80 = sum((p.get("metrics") or {}).get("qas_detected", 0) - (p.get("metrics") or {}).get("answers_leq_80w", 0) for p in pages_aeo)
-    contam = sum((p.get("metrics") or {}).get("contamination_hits", 0) for p in pages_aeo)
-    needs_rw = sum((p.get("metrics") or {}).get("needs_rewrite", 0) for p in pages_aeo)
-    return (
-        f"<p><span class='mono'>FAQ pages: {faq_count} "
-        f"Q&A: {total_qas} Overlong answers: {over80} "
-        f"Contamination hits: {contam} Needs rewrite: {needs_rw}</span></p>"
-    )
-
 def _emit_aeo_scorecards(pages_aeo: List[Dict[str, Any]]) -> str:
     rows = []
     rows.append("<tr><th>Page URL</th><th>Type</th><th>Score (0–100)</th><th>Issues</th><th>Metrics</th></tr>")
@@ -215,26 +202,16 @@ def _emit_aeo_scorecards(pages_aeo: List[Dict[str, Any]]) -> str:
         url = _h(p.get("url",""))
         ptype = _h(p.get("type","other"))
         score = str(p.get("score", 0))
-        issues_list = p.get("issues") or []
-        issues = ", ".join([i for i in issues_list if i and i != "OK"]) or "OK"
+        issues = ", ".join(p.get("issues") or []) or "OK"
         m = p.get("metrics") or {}
         src_counts = m.get("src_counts") or {}
-        metrics_txt = (
-            f"qa_ok:{m.get('answers_leq_80w',0)}, "
-            f"parity_ok:{bool(m.get('parity_ok'))}, "
-            f"src_counts:{src_counts}, "
-            f"qas_detected:{m.get('qas_detected',0)}, "
-            f"has_faq_schema_detected:{'Yes' if m.get('has_faq_schema_detected') else ''}, "
-            f"duplicates:{m.get('duplicates',0)}, "
-            f"contamination_hits:{m.get('contamination_hits',0)}, "
-            f"needs_rewrite:{m.get('needs_rewrite',0)}"
-        )
+        metrics_txt = f"qa_ok:{m.get('answers_leq_80w',0)}, parity_ok:{bool(m.get('parity_ok'))}, src_counts:{src_counts}, qas_detected:{m.get('qas_detected',0)}, has_faq_schema_detected:{'Yes' if m.get('has_faq_schema_detected') else ''}"
         rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>[{ptype}]</td><td>{score}</td><td>{_h(issues)}</td><td><span class='mono'>{_h(metrics_txt)}</span></td></tr>")
     return "<table class='grid'>" + "\n".join(rows) + "</table>"
 
 def _emit_aeo_qna(pages_aeo: List[Dict[str, Any]]) -> str:
     rows = []
-    rows.append("<tr><th>Page URL</th><th>Source</th><th>Status</th><th>Flags</th><th>Q</th><th>A (≤80w)</th></tr>")
+    rows.append("<tr><th>Page URL</th><th>Q</th><th>Proposed answer (≤80 words)</th></tr>")
     for p in pages_aeo:
         qas = p.get("qas") or []
         if not qas:
@@ -242,15 +219,8 @@ def _emit_aeo_qna(pages_aeo: List[Dict[str, Any]]) -> str:
         url = _h(p.get("url",""))
         for qa in qas:
             q = _h(qa.get("q",""))
-            a = qa.get("improved") or qa.get("a","")
-            a = _h(a)
-            source = _h(qa.get("source",""))
-            status = _h(qa.get("status",""))
-            flags = ", ".join(qa.get("flags") or [])
-            flags = _h(flags)
-            if qa.get("improved"):
-                a = f"<strong>[improved]</strong> {a}"
-            rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>{source}</td><td>{status}</td><td><span class='mono'>{flags}</span></td><td>{q}</td><td>{a}</td></tr>")
+            a = _h(qa.get("a",""))
+            rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>{q}</td><td>{a}</td></tr>")
     return "<table class='grid'>" + "\n".join(rows) + "</table>"
 
 # ========= SEO sections from crawl analysis =========
@@ -417,6 +387,7 @@ def _try_llm_generate(prompt: str, system: Optional[str], model: Optional[str], 
     return None
 
 def _compose_llm_prompt_nl(context: Dict[str, Any]) -> str:
+    # Compact, anti-hallucinatie: alle cijfers/URL’s worden als JSON meegegeven.
     ctx_json = json.dumps(context, ensure_ascii=False)
     return (
         "Je bent een nuchtere SEO/AEO auditor. Schrijf in het Nederlands een kort, actiegericht rapport voor een CMO.\n"
@@ -434,10 +405,12 @@ def _compose_llm_prompt_nl(context: Dict[str, Any]) -> str:
 
 def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]], keywords: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     pages = crawl.get("pages") or []
+    # top issues
     bad_titles = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "title"]
     bad_descs  = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "meta_description"]
     canon_issues = crawl_an.get("canonical_patches") or []
     og_issues    = crawl_an.get("og_patches") or []
+    # aeo summary
     aeo_compact = []
     for p in aeo_pages:
         aeo_compact.append({
@@ -447,6 +420,7 @@ def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str,
             "issues": p.get("issues"),
             "qas_detected": (p.get("metrics") or {}).get("qas_detected")
         })
+    # keywords sample
     kw_sample = (keywords or {}).get("keywords") or []
     kw_sample = kw_sample[:10]
 
@@ -466,7 +440,9 @@ def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str,
     }
 
 def _render_narrative_html(title: str, text: str, label_class: str) -> str:
-    safe = _h(text).replace("\n", "<br>")
+    # simpele linebreak → <br>, bullets blijven leesbaar zonder externe md-parser
+    safe = _h(text)
+    safe = safe.replace("\n", "<br>")
     return f"<h2>{_h(title)}</h2><div class='{label_class}'>{safe}</div>"
 
 def _compose_exec_summary_fallback(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]]) -> str:
@@ -589,7 +565,6 @@ def generate_report(conn, job):
 
     # AEO sections
     pages_aeo = aeo.get("pages") or []
-    aeo_header = _emit_aeo_header_summary(pages_aeo)
     aeo_scorecards_html = _emit_aeo_scorecards(pages_aeo)
     aeo_qna_html = _emit_aeo_qna(pages_aeo)
 
@@ -626,9 +601,8 @@ def generate_report(conn, job):
     body.extend(narrative_blocks)
 
     body.append("<h2>AEO — Answer readiness (scorecards)</h2>")
-    body.append(aeo_header)
     body.append(aeo_scorecards_html)
-    body.append("<h2>AEO — Q&A (clean, with provenance)</h2>")
+    body.append("<h2>AEO — Q&A (snippet-ready, ready-to-paste)</h2>")
     body.append(aeo_qna_html)
 
     body.append("<h2>SEO — Concrete text fixes (ready-to-paste)</h2>")
