@@ -1,6 +1,7 @@
 # report_agent.py — Full report (SEO + GEO + AEO) with LLM narrative + deterministic fallback
 # Returns: {"html_base64": ..., "patches_csv_base64": ..., "plan_csv_base64": ...}
 
+import os
 import base64
 import html
 import json
