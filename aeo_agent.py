@@ -1,4 +1,3 @@
-# aeo_agent.py
 # -*- coding: utf-8 -*-
 """
 AEO FAQ Agent
@@ -7,20 +6,12 @@ Doel:
 - Auditeert ALLEEN een gegeven FAQ-pagina-URL.
 - Extraheert Q&A uit JSON-LD en DOM (headings/accordions/definition lists).
 - Beoordeelt elke QA (LLM of rule-based fallback).
-- Stelt verbeteringen voor (≤ ~80 woorden, concreet, non-fluff).
+- Stelt verbeteringen voor (≤ 80 woorden, concreet, non-fluff/promo).
 - Bouwt valide FAQPage JSON-LD met verbeterde QA's.
 - Levert rijk diagnostisch resultaat voor rapportage.
 
-Ontwerp:
-- LLMClient (verwisselbaar model via env).
-- Fetcher met timeouts/retries + UA.
-- Extractors (schema + dom) met dedupe + normalisatie.
-- Reviewer met LLM + rule-based fallback.
-- JSON-LD builder + validator (basis).
-- Result objecten (Pydantic) voor downstream usage.
-
 Env:
-- OPENAI_API_KEY (optioneel)
+- OPENAI_API_KEY (optioneel; zonder key: rule-based fallback)
 - LLM_MODEL (default: gpt-4o-mini)
 - LLM_TEMPERATURE (default: 0.0)
 - HTTP_TIMEOUT_SECONDS (default: 30)
@@ -32,10 +23,8 @@ import os
 import re
 import json
 import time
-import math
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 import httpx
 from bs4 import BeautifulSoup
@@ -58,7 +47,15 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
-UA = "aseon-aeo-faq-agent/1.0 (+https://www.aseon.io/)"
+UA = "aseon-aeo-faq-agent/1.1 (+https://www.aseon.io/)"
+
+MAX_SNIPPET_WORDS = 80
+MAX_RAW_ANSWER_WORDS = 120
+
+PROMO_TRIGGERS = [
+    r"\b(contact|neem contact|boek|bestel|koop|klik hier|meld je aan|subscribe|sign ?up|demo aanvragen|afrekenen|betaling)\b",
+    r"https?://",
+]
 
 # ---------------------- Helpers ----------------------
 
@@ -72,7 +69,9 @@ def looks_like_question(text: str) -> bool:
         return False
     return t.endswith("?") or t.startswith((
         "how ","what ","why ","when ","where ","who ",
-        "can ","do ","does ","is ","are ","should ","will "
+        "can ","do ","does ","is ","are ","should ","will ",
+        "hoe ","wat ","waarom ","wanneer ","waar ","wie ",
+        "kan ","kun ","doet ","is ","zijn ","moet ","zal "
     ))
 
 def truncate_words(text: str, max_words: int) -> str:
@@ -86,10 +85,14 @@ def dedupe_by_question(qas: List["QAItem"]) -> List["QAItem"]:
     out: List[QAItem] = []
     for qa in qas:
         key = norm(qa.question).lower()
-        if key not in seen:
+        if key and key not in seen:
             seen.add(key)
             out.append(qa)
     return out
+
+def is_promotional(s: str) -> bool:
+    s_l = norm(s).lower()
+    return any(re.search(p, s_l) for p in PROMO_TRIGGERS)
 
 # ---------------------- Models ----------------------
 
@@ -130,6 +133,7 @@ class Fetcher:
                 with httpx.Client(timeout=self.timeout, follow_redirects=True, headers={"User-Agent": UA}) as client:
                     r = client.get(url)
                     r.raise_for_status()
+                    # httpx will auto-detect encoding; rely on r.text
                     return r.text
             except Exception as e:
                 last_err = e
@@ -206,8 +210,8 @@ def extract_qas_from_schema(soup: BeautifulSoup) -> List[QAItem]:
     return out
 
 def _nearest_answer_block(node) -> Optional[str]:
-    # Vind eerstvolgende betekenisvolle block als antwoord.
-    el = node.find_next(lambda el: el.name in {"p","div","dd","li","section","article"} and norm(el.get_text(" ", strip=True)))
+    # Vind eerstvolgende betekenisvolle block als antwoord (overslaan van scripts/forms/nav)
+    el = node.find_next(lambda el: el and el.name in {"p","div","dd","li","section","article"} and norm(el.get_text(" ", strip=True)))
     if not el:
         return None
     txt = norm(el.get_text(" ", strip=True))
@@ -216,8 +220,12 @@ def _nearest_answer_block(node) -> Optional[str]:
 def extract_qas_from_dom(soup: BeautifulSoup) -> List[QAItem]:
     out: List[QAItem] = []
 
-    # 1) Headings / toggles / summary
-    for tag in soup.find_all(["h1","h2","h3","h4","h5","summary","button","dt","strong","b"]):
+    # Headings / toggles / summary / buttons met accordion-achtige classes/ARIA
+    selectors = [
+        "h1","h2","h3","h4","h5","summary","button","dt","strong","b",
+        ".faq-question",".accordion-button",".accordion__button","[aria-expanded]"
+    ]
+    for tag in soup.find_all(selectors):
         q = norm(tag.get_text(" ", strip=True))
         if not looks_like_question(q):
             continue
@@ -225,7 +233,7 @@ def extract_qas_from_dom(soup: BeautifulSoup) -> List[QAItem]:
         if ans:
             out.append(QAItem(question=q, answer=ans))
 
-    # 2) <dl><dt>Q</dt><dd>A</dd></dl>
+    # <dl><dt>Q</dt><dd>A</dd></dl>
     for dl in soup.find_all("dl"):
         dts = dl.find_all("dt")
         dds = dl.find_all("dd")
@@ -260,44 +268,51 @@ def extract_faq(url: str, fetcher: Optional[Fetcher] = None) -> Tuple[List[QAIte
 
 # ---------------------- Reviewer ----------------------
 
-LLM_SYSTEM = """You are an expert AEO auditor for FAQ pages.
-Assess each Q&A pair strictly:
-- Question: clear, specific, intent-rich?
-- Answer: ≤ ~80 words, factual, user-first, free of fluff/claims, actionable.
-Return ONLY JSON with keys: is_good (bool), issues (list[str]), improved_question (string|null), improved_answer (string|null).
-Keep the language of the input.
+LLM_SYSTEM = f"""You are an expert AEO auditor for FAQ pages.
+Assess each Q&A pair strictly and rewrite if needed.
+Rules:
+- Keep the original language.
+- Answer must be ≤ {MAX_SNIPPET_WORDS} words, factual, non-promotional, no fluff.
+- Do not invent claims not supported by the provided answer text.
+- If the question isn't a proper question, fix formatting minimally (end with '?').
+
+Return ONLY JSON with keys:
+  is_good (bool),
+  issues (list of strings),
+  improved_question (string or null),
+  improved_answer (string or null).
 """
 
 def _rule_review(q: str, a: str) -> Dict[str, Any]:
     issues: List[str] = []
     q_ok = looks_like_question(q)
     if not q_ok:
-        issues.append("Vraag is niet duidelijk/intentie-rijk.")
+        issues.append("Vraag is niet duidelijk/geformatteerd als vraag.")
     a_norm = norm(a)
-    if not a_norm:
+    wc = len(a_norm.split()) if a_norm else 0
+    if wc == 0:
         issues.append("Leeg antwoord.")
-    wc = len(a_norm.split())
-    if wc > 90:
-        issues.append("Antwoord te lang (>90 woorden).")
+    if wc > MAX_RAW_ANSWER_WORDS:
+        issues.append(f"Antwoord te lang (>{MAX_RAW_ANSWER_WORDS} woorden).")
     if wc < 4:
         issues.append("Antwoord te kort (<4 woorden).")
-    lower = a_norm.lower()
-    for bad in ["we are the best", "number one", "market leader"]:
-        if bad in lower:
-            issues.append("Marketing-claim i.p.v. concreet antwoord.")
-            break
+    if is_promotional(a_norm):
+        issues.append("Promotionele/CTA-taal detected.")
+
     improved_q = None
-    improved_a = None
     if not q_ok:
         q2 = norm(q)
         if not q2.endswith("?"):
             q2 += "?"
         improved_q = q2
+
+    improved_a = None
     if issues:
         a2 = a_norm
-        if wc > 90:
-            a2 = truncate_words(a2, 80)
+        if wc > MAX_SNIPPET_WORDS:
+            a2 = truncate_words(a2, MAX_SNIPPET_WORDS)
         improved_a = a2
+
     return {
         "is_good": not issues,
         "issues": issues,
@@ -321,32 +336,38 @@ class Reviewer:
         self.llm = llm or LLMClient()
 
     def review_one(self, qa: QAItem) -> QAReview:
+        # LLM path
         if self.llm.available():
             prompt = f"Question:\n{qa.question}\n\nAnswer:\n{qa.answer}\n\nReturn JSON now with exactly these keys: is_good, issues, improved_question, improved_answer"
             raw = self.llm.chat(LLM_SYSTEM, prompt)
             if raw:
                 data = _llm_json_parse(raw)
                 if data and set(data.keys()) >= {"is_good","issues","improved_question","improved_answer"}:
-                    wc = len(norm(data.get("improved_answer") or qa.answer).split())
+                    # enforce ≤80 words hard cap post-LLM
+                    improved = data.get("improved_answer") or qa.answer
+                    improved = truncate_words(improved, MAX_SNIPPET_WORDS)
+                    wc = len(norm(improved).split())
                     return QAReview(
                         question=qa.question,
                         answer=qa.answer,
                         is_good=bool(data.get("is_good")),
                         issues=list(data.get("issues") or []),
                         improved_question=(data.get("improved_question") or None),
-                        improved_answer=(data.get("improved_answer") or None),
+                        improved_answer=improved,
                         word_count_answer=wc
                     )
         # fallback
         data = _rule_review(qa.question, qa.answer)
+        improved_ans = data["improved_answer"] or qa.answer
+        improved_ans = truncate_words(improved_ans, MAX_SNIPPET_WORDS)
         return QAReview(**{
             "question": qa.question,
             "answer": qa.answer,
             "is_good": data["is_good"],
             "issues": data["issues"],
             "improved_question": data["improved_question"],
-            "improved_answer": data["improved_answer"],
-            "word_count_answer": data["word_count_answer"]
+            "improved_answer": improved_ans,
+            "word_count_answer": len(norm(improved_ans).split())
         })
 
     def review_many(self, qas: List[QAItem]) -> List[QAReview]:
@@ -392,6 +413,9 @@ def validate_faq_jsonld(doc: Dict[str, Any]) -> List[str]:
         acc = q.get("acceptedAnswer")
         if not isinstance(acc, dict) or acc.get("@type") != "Answer" or not acc.get("text"):
             issues.append(f"mainEntity[{i}] invalid acceptedAnswer")
+        # soft length check
+        if len(norm(acc.get("text","")).split()) > MAX_SNIPPET_WORDS:
+            issues.append(f"mainEntity[{i}] answer exceeds {MAX_SNIPPET_WORDS} words")
     return issues
 
 # ---------------------- Core API ----------------------
@@ -447,7 +471,7 @@ def audit_faq_page(url: str) -> FAQAuditResult:
         meta=meta
     )
 
-# ---------------------- (Optional) Small CLI ----------------------
+# ---------------------- (Optional) CLI ----------------------
 
 if __name__ == "__main__":
     import argparse
