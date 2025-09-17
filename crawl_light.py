@@ -1,6 +1,5 @@
-# crawl_light.py — Robust DOM-order crawler with FAQ extraction
-# Replaces previous version. Exposes crawl_site(start_url, max_pages=10, ua=None).
-# Focus: populate page["dom_blocks"] and page["faq_visible"] so AEO detects all Q&A.
+# crawl_light.py — Robust crawler met volledige FAQ-extractie (DOM + JSON-LD)
+# Public API: crawl_site(start_url: str, max_pages: int = 40, ua: Optional[str] = None) -> dict
 
 import os
 import re
@@ -16,11 +15,6 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 DEFAULT_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT_SEC", "10"))
 MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", "40"))
 MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "1500000"))
-
-# Keep in sync with aeo_agent._extract_visible_from_page expectations:
-# - Provide page["faq_visible"] as list of {"q","a"}
-# - Provide page["dom_blocks"] as list of {"tag","text"} preserving DOM order
-# - Provide page["faq_jsonld"] as parsed JSON (list/dict) or empty list
 
 _SKIP_EXT = {
     ".png",".jpg",".jpeg",".webp",".gif",".svg",".ico",".bmp",".avif",
@@ -45,7 +39,6 @@ def _norm_url(url: str) -> str:
         u = urlparse(url.strip())
         if not u.scheme:
             return ""
-        # Force lowercase host, drop fragments, normalize path
         netloc = u.netloc.lower()
         path = re.sub(r"/{2,}", "/", u.path or "/")
         return urlunparse((u.scheme, netloc, path, "", u.query, ""))
@@ -63,11 +56,12 @@ def _clean(s: str) -> str:
     return s
 
 def _text_of(node: Tag) -> str:
-    if not isinstance(node, (Tag, NavigableString)):
+    if node is None:
         return ""
     if isinstance(node, NavigableString):
         return _clean(str(node))
-    # Remove script/style/noscript
+    if not isinstance(node, Tag):
+        return ""
     for bad in node.find_all(["script","style","noscript","template"]):
         bad.decompose()
     return _clean(node.get_text(separator=" "))
@@ -81,7 +75,6 @@ def _looks_like_question(text: str) -> bool:
         return True
     if any(low.startswith(p) for p in QUESTION_PREFIXES):
         return True
-    # bullet-like "Q:" or "Vraag:" patterns
     if re.match(r"^(q|vraag)\s*[:\-–]\s*\S", low):
         return True
     return False
@@ -93,7 +86,6 @@ def _is_empty_answer(text: str) -> bool:
 
 def _collect_dom_blocks(soup: BeautifulSoup) -> List[Dict[str, str]]:
     blocks: List[Dict[str,str]] = []
-    # We take a shallow DOM walk and record text blocks in reading order for key tags.
     TAGS = ["h1","h2","h3","h4","h5","h6","p","li","dt","dd","summary","button","a"]
     walker = soup.body or soup
     for el in walker.descendants:
@@ -101,7 +93,6 @@ def _collect_dom_blocks(soup: BeautifulSoup) -> List[Dict[str, str]]:
             txt = _text_of(el)
             if txt:
                 blocks.append({"tag": el.name, "text": txt})
-    # Coalesce consecutive duplicates
     out: List[Dict[str,str]] = []
     for b in blocks:
         if out and out[-1]["tag"] == b["tag"] and out[-1]["text"] == b["text"]:
@@ -118,21 +109,18 @@ def _pair_dom_qas(dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
         qtxt = blk.get("text","")
         if not _looks_like_question(qtxt):
             continue
-        # Answer is the concatenation of following non-question blocks until next question or up to window
         ans_parts: List[str] = []
-        for j in range(i+1, min(i+30, N)):  # wider window than before
-            if j in used_idx: 
+        for j in range(i+1, min(i+30, N)):
+            if j in used_idx:
                 continue
             cand = dom_blocks[j].get("text","")
             if _looks_like_question(cand):
                 break
             if dom_blocks[j]["tag"] in ("h1","h2","h3","h4","h5","h6","dt","summary","button"):
-                # treat as a section/question boundary if header-like
                 if not ans_parts:
                     continue
                 else:
                     break
-            # stop if answer grows too long (>1200 chars) to avoid swallowing whole page
             if sum(len(x) for x in ans_parts)+len(cand) > 1200:
                 break
             ans_parts.append(cand)
@@ -147,7 +135,6 @@ def _dl_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
     for dl in soup.find_all("dl"):
         dts = [el for el in dl.find_all("dt", recursive=False)]
         dds = [el for el in dl.find_all("dd", recursive=False)]
-        # Pair by order if same length, else best-effort
         if dts and dds:
             for i, dt in enumerate(dts):
                 q = _text_of(dt)
@@ -162,7 +149,6 @@ def _details_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
         q_el = det.find("summary")
         if q_el:
             q = _text_of(q_el)
-            # answer is details content without summary
             for s in det.find_all("summary"):
                 s.decompose()
             a = _text_of(det)
@@ -172,7 +158,6 @@ def _details_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
 
 def _aria_accordion_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
     out: List[Dict[str,str]] = []
-    # Patterns like <button aria-controls="answer1">Q</button> <div id="answer1">A</div>
     for btn in soup.find_all(["button","a","div","h3","h4","h5"], attrs={"aria-controls": True}):
         q = _text_of(btn)
         target_id = btn.get("aria-controls")
@@ -189,21 +174,14 @@ def _class_based_faq_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
     out: List[Dict[str,str]] = []
     FAQ_CLASS_HINTS = re.compile(r"(faq|accordion|question|qna|q-and-a)", re.I)
     for container in soup.find_all(attrs={"class": FAQ_CLASS_HINTS}):
-        # Try heading-like as question within this container
         q_el = None
-        for tag in ["h2","h3","h4","h5","button","summary",".question",".q"]:
-            if tag.startswith("."):
-                q_el = container.find(attrs={"class": re.compile(tag[1:], re.I)})
-            else:
-                q_el = container.find(tag)
+        for tag in ["h2","h3","h4","h5","button","summary"]:
+            q_el = container.find(tag)
             if q_el:
                 break
         if not q_el:
             continue
         q = _text_of(q_el)
-        # answer: remaining text inside container minus question text
-        tmp = container.clone()
-        # remove the first question element only
         try:
             q_el.extract()
         except Exception:
@@ -239,7 +217,6 @@ def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[Any], List[Any]]:
                 continue
             obj = json.loads(txt)
             raw_blocks.append(obj)
-            # find FAQPage nodes
             def walk(o):
                 if isinstance(o, dict):
                     t = str(o.get("@type","")).lower()
@@ -252,7 +229,6 @@ def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[Any], List[Any]]:
                         walk(v)
             walk(obj)
         except Exception:
-            # Ignore JSON parse errors
             continue
     return raw_blocks, faq_blocks
 
@@ -281,7 +257,6 @@ def _extract_faq_visible(soup: BeautifulSoup, dom_blocks: List[Dict[str,str]]) -
     qas += _details_qas(soup)
     qas += _aria_accordion_qas(soup)
     qas += _class_based_faq_qas(soup)
-    # As a last resort, pair from DOM order
     if len(qas) < 5 and dom_blocks:
         qas += _pair_dom_qas(dom_blocks)
     return _dedupe_qas(qas)
@@ -290,28 +265,29 @@ def _extract_links(soup: BeautifulSoup, base: str) -> List[str]:
     out: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if not href or href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("#"):
+        if not href or href.startswith(("javascript:","mailto:","#")):
             continue
         url = urljoin(base, href)
         url = _norm_url(url)
         if not url: continue
         if _seems_asset(url): continue
         out.append(url)
-    # Dedup
     seen = set(); deduped=[]
     for u in out:
         if u not in seen:
             seen.add(u); deduped.append(u)
     return deduped
 
-def _fetch(url: str, ua: Optional[str]) -> Tuple[int, str]:
+def _fetch(url: str, ua: Optional[str]) -> Tuple[int, str, str, bool]:
     headers = {"User-Agent": ua or "AseonBot/0.5 (+https://aseon.ai)"}
     resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
     resp.raise_for_status()
-    html = resp.text
-    if len(html.encode("utf-8", "ignore")) > MAX_HTML_BYTES:
+    html = resp.text if isinstance(resp.text, str) else ""
+    if len(html.encode("utf-8","ignore")) > MAX_HTML_BYTES:
         html = html[:MAX_HTML_BYTES]
-    return resp.status_code, html
+    ctype = (resp.headers.get("content-type") or "").lower()
+    is_html = "text/html" in ctype or "<html" in html.lower()
+    return resp.status_code, html if is_html else "", "text/html" if is_html else ctype, is_html
 
 def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = None) -> Dict[str, Any]:
     start_url = _norm_url(start_url)
@@ -331,14 +307,14 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
         if not _same_host(url, start_url):
             continue
         try:
-            status, html = _fetch(url, ua)
+            status, html, ctype, is_html = _fetch(url, ua)
         except Exception:
             visited.add(url)
             continue
 
         visited.add(url)
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html or "", "html.parser") if is_html else BeautifulSoup("", "html.parser")
 
         title = _clean(soup.title.get_text()) if soup.title else ""
         h1 = [_clean(el.get_text()) for el in soup.find_all("h1")]
@@ -351,12 +327,12 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
         summary = [_clean(el.get_text()) for el in soup.find_all("summary")]
         buttons = [_clean(el.get_text()) for el in soup.find_all("button")]
 
-        dom_blocks = _collect_dom_blocks(soup)
+        dom_blocks = _collect_dom_blocks(soup) if is_html else []
 
-        _, faq_ld = _extract_jsonld(soup)
+        raw_jsonld, faq_ld = _extract_jsonld(soup)
         has_faq_schema = bool(faq_ld)
 
-        faq_visible = _extract_faq_visible(soup, dom_blocks)
+        faq_visible = _extract_faq_visible(soup, dom_blocks) if is_html else []
 
         page = {
             "url": url,
@@ -371,9 +347,9 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
             "dd": [x for x in dd if x],
             "summary": [x for x in summary if x],
             "buttons": [x for x in buttons if x],
-            "dom_blocks": dom_blocks,  # in-order blocks
-            "faq_visible": faq_visible, # list of {"q","a"}
-            "faq_jsonld": faq_ld,       # list/dict or empty list
+            "dom_blocks": dom_blocks,
+            "faq_visible": faq_visible,
+            "faq_jsonld": faq_ld,
             "metrics": {
                 "has_faq_schema": has_faq_schema
             },
@@ -392,16 +368,13 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
 
         pages.append(page)
 
-        # Enqueue links
         for link in _extract_links(soup, url):
             if link not in visited and link not in queue and _same_host(link, start_url) and not _seems_asset(link):
                 queue.append(link)
 
-        # free memory periodically
         if len(pages) % 5 == 0:
             gc.collect()
 
-    # Build simple summary and quick wins used by report_agent
     title_lengths = [len((p.get("title") or "")) for p in pages]
     missing_meta_desc = [p for p in pages if not (p.get("meta") or {}).get("description")]
     missing_h1 = [p for p in pages if not p.get("h1")]
