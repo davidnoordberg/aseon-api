@@ -1,6 +1,15 @@
-# aeo_agent.py — AEO (Answer Engine Optimization) analyzer with FAQ gating,
-# improved answers, parity checks, near-dup clustering, and scoring.
-# Output schema (top-level):
+# aeo_agent.py — AEO analyzer with FAQ gating, improved answers, parity checks,
+# near-dup clustering, scoring, and strict pre/post-clean for snippet quality.
+#
+# Payload options:
+#   only_faq: bool (default True)
+#   emit_improved: bool (default True)
+#   rewrite: "deterministic" | "llm" (default "deterministic")
+#   max_answer_words: int (default 80)
+#   dedup_threshold: float (default 0.88)
+#   faq_paths: [str,...]  # optional substrings/paths to treat as FAQ pages (e.g. ["/faq"])
+#
+# Output (top-level):
 # {
 #   "site": {"url": "..."},
 #   "pages": [
@@ -16,17 +25,18 @@
 #         "parity_ok": bool,
 #         "src_counts": {"jsonld": int, "visible": int, "faq_job": int},
 #         "dup_questions": int,
-#         "has_faq_schema_detected": bool
+#         "has_faq_schema_detected": bool,
+#         "missing_in_schema": [...],
+#         "missing_in_visible": [...],
+#         "flags": ["mojibake","heading_bleed","vague", ...]
 #       },
-#       "qas": [{"q": "...", "a": "..."}]
+#       "qas": [{"q":"...","a":"..."}]
 #     }
 #   ]
 # }
 
-import base64
 import html
 import json
-import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -78,7 +88,6 @@ def _norm_url(u: str) -> str:
         return (u or "").strip()
 
 def _fetch_latest(conn, site_id: str, jtype: str) -> Optional[Dict[str, Any]]:
-    from psycopg.rows import dict_row
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -108,13 +117,12 @@ def _extract_faq_from_jsonld(page: Dict[str, Any]) -> List[Dict[str, str]]:
             continue
         t = j.get("@type")
         t_list = [t] if isinstance(t, str) else (t or [])
-        if any(x.lower() == "faqpage" for x in [str(xx) for xx in t_list]):
+        if any(str(xx).lower() == "faqpage" for xx in t_list):
             ents = j.get("mainEntity") or []
             if isinstance(ents, dict):
                 ents = [ents]
             for e in ents:
                 name = _escape_ascii(str(e.get("name") or e.get("question") or ""))
-                ans = ""
                 aa = e.get("acceptedAnswer") or {}
                 if isinstance(aa, list):
                     aa = aa[0] if aa else {}
@@ -124,44 +132,49 @@ def _extract_faq_from_jsonld(page: Dict[str, Any]) -> List[Dict[str, str]]:
     return qas
 
 def _extract_faq_from_visible(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    # Prefer explicit fields produced by crawler, else light heuristics
-    candidates = []
+    # Prefer explicit v.q/a pairs from crawler if present
     for key in ["visible_faq", "visible_qas", "faq_visible", "visibleFAQ", "visible"]:
         v = page.get(key)
         if isinstance(v, list) and v and isinstance(v[0], dict) and "q" in v[0] and "a" in v[0]:
-            candidates = v
-            break
-    qas: List[Dict[str, str]] = []
-    if candidates:
-        for item in candidates:
-            q = _escape_ascii(str(item.get("q","")))
-            a = _escape_ascii(str(item.get("a","")))
-            if q and a:
-                qas.append({"q": q, "a": a, "source": "visible"})
-        return qas
+            out = []
+            for item in v:
+                q = _escape_ascii(str(item.get("q","")))
+                a = _escape_ascii(str(item.get("a","")))
+                if q and a:
+                    out.append({"q": q, "a": a, "source": "visible"})
+            return out
 
-    # Heuristic fallback: scan headings + paragraphs block (very conservative)
+    # Conservative fallback (may over-include; gets cleaned later)
+    qas: List[Dict[str, str]] = []
     heads = (page.get("h2") or []) + (page.get("h3") or [])
     pars = page.get("paragraphs") or []
-    i = 0
-    while i < len(heads):
-        q = _escape_ascii(str(heads[i] or ""))
-        if not q:
-            i += 1
+    # Map each heading to the next sufficiently long paragraph
+    for q in heads:
+        q1 = _escape_ascii(str(q or ""))
+        if not q1:
             continue
-        # find the next paragraph as answer
-        a = ""
+        a1 = ""
         for p in pars:
-            if len(_escape_ascii(p)) > 20:
-                a = _escape_ascii(p)
+            p1 = _escape_ascii(p)
+            if len(p1) > 20:
+                a1 = p1
                 break
-        if q and a:
-            qas.append({"q": q, "a": a, "source": "visible"})
-        i += 1
+        if q1 and a1:
+            qas.append({"q": q1, "a": a1, "source": "visible"})
     return qas
 
-def _is_faq_page(url: str, page: Dict[str, Any], schema_qas: List[Dict[str,str]], visible_qas: List[Dict[str,str]]) -> bool:
-    if "/faq" in url.lower():
+def _is_faq_page(url: str,
+                 page: Dict[str, Any],
+                 schema_qas: List[Dict[str,str]],
+                 visible_qas: List[Dict[str,str]],
+                 faq_paths: Optional[List[str]]) -> bool:
+    path = urlparse(url).path.lower()
+    if faq_paths:
+        for pat in faq_paths:
+            if pat and pat.lower() in path:
+                return True
+        return False
+    if "/faq" in path:
         return True
     if schema_qas and len(schema_qas) >= 3:
         return True
@@ -192,7 +205,6 @@ def _jaccard(a: List[str], b: List[str]) -> float:
     return inter / union if union else 0.0
 
 def _cluster_near_dups(qas: List[Dict[str,str]], threshold: float) -> Tuple[List[List[int]], List[int]]:
-    # returns clusters (list of lists of indices) and canonical index per cluster
     n = len(qas)
     used = [False]*n
     clusters: List[List[int]] = []
@@ -222,22 +234,61 @@ def _parity(visible_qas: List[Dict[str,str]], schema_qas: List[Dict[str,str]]) -
     ok = not missing_in_schema and not missing_in_visible
     return ok, missing_in_schema, missing_in_visible
 
-# ============= Answer improvement =============
+# ============= Answer cleaning & rewrite =============
+
+_HEADING_NOISE = re.compile(r"\bfaq\b|\bquick answers\b|\bmanagement summary\b|\bhome\b", re.I)
+
+def _preclean_answer(q: str, a: str) -> str:
+    a0 = _escape_ascii(a)
+    # drop known heading/noise fragments at start
+    a0 = re.sub(r"^\s*(faq\s*[-—:]*\s*)+", "", a0, flags=re.I)
+    # drop generic section labels
+    if _HEADING_NOISE.search(a0[:80]):
+        a0 = _HEADING_NOISE.sub("", a0).strip(" -—:,.")
+    # remove question restatement prefix if present
+    a0 = _strip_question_restate(q, a0)
+    return a0
+
+def _postclean_answer(q: str, a: str, max_words: int) -> str:
+    a1 = _escape_ascii(a)
+    # if LLM echoed headings or question, strip again
+    a1 = re.sub(r"^\s*faq[\s:—-]+.*", "", a1, flags=re.I).strip()
+    a1 = _strip_question_restate(q, a1)
+    # kill leftovers like “quick answers”
+    if _HEADING_NOISE.search(a1[:80]):
+        a1 = _HEADING_NOISE.sub("", a1).strip(" -—:,.")
+    # enforce one or two sentences max
+    parts = re.split(r"(?<=[\.\!\?\:])\s+", a1)
+    if parts:
+        head = parts[0]
+        if len(head.split()) < 6 and len(parts) > 1:
+            head = (head + " " + parts[1]).strip()
+        a1 = head
+    # hard trim
+    words = a1.split()
+    if len(words) > max_words:
+        a1 = " ".join(words[:max_words])
+    # if too short after cleaning, fallback to deterministic
+    if len(a1.split()) < 3:
+        a1 = _deterministic_rewrite(q, a, max_words)
+    return a1
 
 def _first_sentence(s: str) -> str:
     s = _escape_ascii(s)
-    # split on sentence-ish boundaries
     parts = re.split(r"(?<=[\.\!\?\:])\s+", s)
     return parts[0] if parts else s
 
 def _strip_question_restate(q: str, a: str) -> str:
     qn = _norm(q)
     an = _norm(a)
-    if qn and an.startswith(qn[: max(10, len(qn)//2)]):
-        # if answer begins by repeating the question, drop that prefix
+    if not qn or not an:
+        return _escape_ascii(a)
+    # if the answer begins with the question or a large prefix of it, strip
+    if an.startswith(qn[: max(10, len(qn)//2)]):
+        # strip up to first punctuation or the length of q
         idx = len(q)
         return _escape_ascii(a[idx:]).lstrip("-—:,. ").strip()
-    return a
+    return _escape_ascii(a)
 
 def _trim_words(s: str, max_words: int) -> str:
     words = _escape_ascii(s).split()
@@ -246,43 +297,61 @@ def _trim_words(s: str, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 def _deterministic_rewrite(q: str, a: str, max_words: int) -> str:
-    a2 = _escape_ascii(a)
-    a2 = _strip_question_restate(q, a2)
-    if _has_mojibake(a2):
-        a2 = _escape_ascii(a2)
-    # prefer first sentence; if too short, keep two sentences
-    parts = re.split(r"(?<=[\.\!\?\:])\s+", a2)
+    a0 = _preclean_answer(q, a)
+    parts = re.split(r"(?<=[\.\!\?\:])\s+", a0)
     if parts:
         head = parts[0]
         if len(head.split()) < 6 and len(parts) > 1:
             head = (head + " " + parts[1]).strip()
-        a2 = head
-    a2 = _trim_words(a2, max_words)
-    return a2
+        a0 = head
+    a0 = _trim_words(a0, max_words)
+    return a0
 
 def _llm_rewrite(q: str, a: str, max_words: int) -> Optional[str]:
     try:
         import llm  # project-local interface
     except Exception:
         return None
+    pre = _preclean_answer(q, a)
     prompt = (
-        "Rewrite the answer below in Dutch. Rules: ≤{maxw} words, lead with the answer, no question restatement, no marketing fluff.\n"
+        "Rewrite the answer below in the SAME language as the text. Rules: ≤{maxw} words, lead with the answer, "
+        "do not restate the question, do not include headings like 'FAQ' or 'quick answers', avoid marketing fluff.\n"
         "Question: {q}\n"
         "Answer: {a}\n"
         "Rewrite:"
-    ).format(maxw=max_words, q=q, a=a)
+    ).format(maxw=max_words, q=q, a=pre)
     try:
+        model = os.getenv("AEO_LLM_MODEL") or None
+        temp = float(os.getenv("AEO_LLM_TEMPERATURE") or 0.1)
+        out = None
         if hasattr(llm, "generate"):
-            out = llm.generate(prompt, system="You are a concise editor.", model=os.getenv("AEO_LLM_MODEL") or None, temperature=float(os.getenv("AEO_LLM_TEMPERATURE") or 0.1), max_tokens=220)
+            out = llm.generate(prompt, system="You are a precise copy editor.", model=model, temperature=temp, max_tokens=220)
             txt = out.get("text") if isinstance(out, dict) else str(out)
-            return _escape_ascii(txt or "").strip() or None
-        if hasattr(llm, "complete"):
-            out = llm.complete(prompt, model=os.getenv("AEO_LLM_MODEL") or None, temperature=float(os.getenv("AEO_LLM_TEMPERATURE") or 0.1), max_tokens=220)
+        elif hasattr(llm, "complete"):
+            out = llm.complete(prompt, model=model, temperature=temp, max_tokens=220)
             txt = out.get("text") if isinstance(out, dict) else str(out)
-            return _escape_ascii(txt or "").strip() or None
+        else:
+            txt = None
+        if txt:
+            return _postclean_answer(q, txt, max_words)
     except Exception:
         return None
     return None
+
+def _validate_or_fallback(q: str, original_a: str, candidate_a: str, max_words: int) -> str:
+    a = _escape_ascii(candidate_a or "")
+    bad = False
+    if not a:
+        bad = True
+    if _HEADING_NOISE.search(a[:80]):
+        bad = True
+    if _norm(q)[: max(10, len(_norm(q))//2)] in _norm(a)[:80]:
+        bad = True
+    if len(a.split()) > max_words:
+        bad = True
+    if bad:
+        return _deterministic_rewrite(q, original_a, max_words)
+    return a
 
 # ============= Scoring & issues =============
 
@@ -296,7 +365,6 @@ def _score_and_issues(page_type: str,
     if page_type != "faq":
         if n_qas == 0:
             return 15, ["No Q&A section on page."]
-        # non-faq page but has Q&A snippets (e.g., micro-FAQ sections): treat softly
         base = 95
         if overlong > 0:
             issues.append("Overlong answers (>80 words).")
@@ -332,16 +400,18 @@ def _analyze_page(page: Dict[str, Any],
                   emit_improved: bool,
                   rewrite_mode: str,
                   max_words: int,
-                  dedup_threshold: float) -> Optional[Dict[str, Any]]:
+                  dedup_threshold: float,
+                  faq_paths: Optional[List[str]]) -> Optional[Dict[str, Any]]:
 
     schema_qas = _extract_faq_from_jsonld(page)
     visible_qas = _extract_faq_from_visible(page)
 
     has_schema = bool(schema_qas)
-    page_type = "faq" if _is_faq_page(url, page, schema_qas, visible_qas) else "other"
+    is_faq = _is_faq_page(url, page, schema_qas, visible_qas, faq_paths)
+    page_type = "faq" if is_faq else "other"
 
-    if only_faq and page_type != "faq":
-        # Still record minimal metrics for non-FAQ? Return a lightweight entry
+    if only_faq and not is_faq:
+        # Minimal metrics for non-FAQ pages
         n = len(visible_qas)
         if n == 0:
             return {
@@ -360,7 +430,6 @@ def _analyze_page(page: Dict[str, Any],
                 },
                 "qas": []
             }
-        # has incidental Q&As on non-FAQ
         overlong = sum(1 for qa in visible_qas if len(_escape_ascii(qa.get("a","")).split()) > max_words)
         score, issues = _score_and_issues("other", has_schema, n, overlong, 0, True)
         qas_out = []
@@ -385,38 +454,39 @@ def _analyze_page(page: Dict[str, Any],
             "qas": qas_out
         }
 
-    # For FAQ pages, merge sources (prefer visible text as baseline; fallback to schema)
+    # Merge sources (visible baseline; add schema-only)
     merged: List[Dict[str,str]] = []
     for qa in visible_qas:
         merged.append({"q": qa["q"], "a": qa["a"], "src": "visible"})
-    # add schema Qs that are not already present
     vis_norm = set(_norm(qa["q"]) for qa in visible_qas)
     for qa in schema_qas:
         if _norm(qa["q"]) not in vis_norm:
             merged.append({"q": qa["q"], "a": qa["a"], "src": "jsonld"})
 
-    # Dedup clustering on questions
+    # Dedup clustering
     clusters, canon = _cluster_near_dups(merged, threshold=dedup_threshold)
     canonical_qas: List[Dict[str,str]] = []
     for group, ci in zip(clusters, canon):
         base = merged[ci]
         canonical_qas.append(dict(base))
 
-    # Parity check on original (not deduped) sets
+    # Parity on originals
     parity_ok, miss_in_schema, miss_in_visible = _parity(visible_qas, schema_qas)
 
-    # Improve answers
+    # Improve answers with strict guards
     improved_qas: List[Dict[str,str]] = []
     for qa in canonical_qas:
         q = qa["q"]
         a = qa["a"]
-        proposed = a
         if emit_improved:
             if rewrite_mode == "llm":
-                proposed = _llm_rewrite(q, a, max_words) or _deterministic_rewrite(q, a, max_words)
+                cand = _llm_rewrite(q, a, max_words)
+                cand = _validate_or_fallback(q, a, cand or "", max_words)
             else:
-                proposed = _deterministic_rewrite(q, a, max_words)
-        improved_qas.append({"q": q, "a": proposed})
+                cand = _deterministic_rewrite(q, a, max_words)
+        else:
+            cand = _escape_ascii(a)
+        improved_qas.append({"q": _escape_ascii(q), "a": cand})
 
     # Metrics & issues
     n_qas = len(improved_qas)
@@ -424,7 +494,6 @@ def _analyze_page(page: Dict[str, Any],
     dup_count = sum(max(0, len(g)-1) for g in clusters)
     score, issues = _score_and_issues("faq", has_schema, n_qas, overlong, dup_count, parity_ok)
 
-    # Extra quality flags can hint issues (not yet added to 'issues' to avoid noise)
     flags = []
     if any(_has_mojibake(qa["a"]) or _has_mojibake(qa["q"]) for qa in merged):
         flags.append("mojibake")
@@ -465,6 +534,7 @@ def generate_aeo(conn, job):
     rewrite_mode = str(payload.get("rewrite", "deterministic")).lower()
     max_words = int(payload.get("max_answer_words", 80))
     dedup_threshold = float(payload.get("dedup_threshold", 0.88))
+    faq_paths = payload.get("faq_paths") if isinstance(payload.get("faq_paths"), list) else None
 
     crawl = _fetch_latest(conn, site_id, "crawl")
     if not crawl:
@@ -485,7 +555,8 @@ def generate_aeo(conn, job):
             emit_improved=emit_improved,
             rewrite_mode=rewrite_mode,
             max_words=max_words,
-            dedup_threshold=dedup_threshold
+            dedup_threshold=dedup_threshold,
+            faq_paths=faq_paths
         )
         if analyzed:
             out_pages.append(analyzed)
