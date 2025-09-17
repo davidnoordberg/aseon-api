@@ -1,640 +1,586 @@
-# report_agent.py — Full report (SEO + GEO + AEO) with LLM narrative + deterministic fallback
-# Returns: {"html_base64": ..., "patches_csv_base64": ..., "plan_csv_base64": ...}
+# report_agent.py
+# -*- coding: utf-8 -*-
+"""
+Aseon — Unified Report Agent (SEO • GEO • AEO)
+- Crawl site (fallback crawler + optional integration with crawl_light.py)
+- Compute SEO issues (titles, meta descriptions, canonical, Open Graph)
+- Compute GEO issues (Organization/WebSite JSON-LD presence)
+- Compute AEO: in deze iteratie ALLEEN de FAQ-pagina auditen/fixen
+  • som bestaande vragen op
+  • beoordeel goed/fout
+  • stel verbeterde Q/A + JSON-LD voor
+- Integraties via optionele imports:
+    aeo_agent.audit_faq_page
+    faq_agent (optioneel)
+    schema_agent (optioneel)
+    keywords_agent (optioneel)
+    general_agent (optioneel)
+    crawl_light (optioneel)
+- API endpoints:
+    POST /report/full            (site_id?, base_url required)
+    POST /report/aeo/faq-only    (url required)
+    GET  /report/full.md         (render Markdown)
+    GET  /report/aeo/faq.md      (render Markdown for FAQ-only)
+"""
 
-import os
-import base64
-import html
+from __future__ import annotations
 import json
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+import os
+import httpx
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
-from psycopg.rows import dict_row
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from fastapi import FastAPI, Query, Body, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ========= Utilities =========
+# --------- optional imports for deeper integration ----------
+_AEO_AVAILABLE = False
+try:
+    from aeo_agent import audit_faq_page as aeo_audit_faq_page  # preferred AEO impl
+    _AEO_AVAILABLE = True
+except Exception:
+    _AEO_AVAILABLE = False
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+# these are optional — used only if present
+try:
+    import crawl_light  # expected to expose a crawl(url, max_pages=...) -> List[str]
+    _CRAWL_LIGHT = True
+except Exception:
+    _CRAWL_LIGHT = False
 
-def _escape_ascii(s: str) -> str:
-    if s is None:
-        return ""
-    t = html.unescape(str(s))
-    repl = {
-        "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
-        "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00A0": " ",
-        "\u200b": ""
-    }
-    for k, v in repl.items():
-        t = t.replace(k, v)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# ======= Utilities =======
 
-def _h(s: str) -> str:
-    return html.escape(_escape_ascii(s or ""))
+UA = "aseon-report-agent/1.0 (+https://www.aseon.io/)"
+TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
-def _csv_escape(s: str) -> str:
-    s = _escape_ascii(s)
-    if '"' in s or "," in s or "\n" in s:
-        return '"' + s.replace('"', '""') + '"'
-    return s
+_WS = re.compile(r"\s+")
+def norm(x: str) -> str:
+    return _WS.sub(" ", (x or "").strip())
 
-def _fetch_latest(conn, site_id: str, jtype: str) -> Optional[Dict[str, Any]]:
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT output
-              FROM jobs
-             WHERE site_id=%s AND type=%s AND status='done'
-             ORDER BY finished_at DESC NULLS LAST, created_at DESC
-             LIMIT 1
-            """,
-            (site_id, jtype),
-        )
-        r = cur.fetchone()
-        return (r or {}).get("output") if r else None
+def is_same_site(a: str, b: str) -> bool:
+    pa, pb = urlparse(a), urlparse(b)
+    return pa.netloc.lower() == pb.netloc.lower() and pa.scheme == pb.scheme
 
-def _norm_url(u: str) -> str:
-    try:
-        p = urlparse((u or "").strip())
-        scheme = p.scheme or "https"
-        host = p.netloc.lower()
-        path = p.path or "/"
-        query = p.query
-        return f"{scheme}://{host}{path}" + (f"?{query}" if query else "")
-    except Exception:
-        return (u or "").strip()
+def safe_get(url: str) -> str:
+    with httpx.Client(timeout=TIMEOUT, follow_redirects=True, headers={"User-Agent": UA}) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        return r.text
 
-def _host(u: str) -> str:
-    try:
-        return urlparse(u).netloc.lower()
-    except Exception:
-        return ""
-
-def _first_nonempty(arr: List[str]) -> str:
-    for x in arr or []:
-        if (x or "").strip():
-            return x.strip()
-    return ""
-
-def _trim_words(s: str, n: int) -> str:
-    words = _escape_ascii(s).split()
-    if len(words) <= n:
-        return " ".join(words)
-    return " ".join(words[:n]) + "…"
-
-# ========= Crawl → SEO analysis =========
-
-def _len_ok_title(s: str) -> bool:
-    l = len(_escape_ascii(s))
-    return 45 <= l <= 65
-
-def _len_ok_meta(s: str) -> bool:
-    l = len(_escape_ascii(s))
-    return 120 <= l <= 170
-
-def _best_meta_desc_from_page(page: Dict[str, Any]) -> str:
-    par = page.get("paragraphs") or []
-    txt = " ".join([p for p in par if p][:3]).strip()
-    if not txt:
-        h2 = page.get("h2") or []
-        h3 = page.get("h3") or []
-        li = page.get("li") or []
-        txt = " ".join((h2[:1] + h3[:1] + li[:2])).strip()
-    txt = _escape_ascii(txt) or (page.get("title") or "")
-    return _trim_words(txt, 28)
-
-def _propose_title(page: Dict[str, Any], brand: str) -> str:
-    title = (page.get("title") or "").strip()
-    h1 = (page.get("h1") or "").strip()
-    cand = _escape_ascii(h1 or title) or _escape_ascii(_first_nonempty(page.get("h2") or [])) or "Page"
-    if len(cand) < 38 and brand and brand.lower() not in cand.lower():
-        cand = f"{cand} | {brand}"
-    if len(cand) > 66:
-        cand = _trim_words(cand, 10)
-    return cand
-
-def _analyze_seo_from_crawl(crawl: Dict[str, Any]) -> Dict[str, Any]:
-    pages = crawl.get("pages") or []
-    fixes = []
-    canonical_patches = []
-    og_patches = []
-    titles_map = {}
-    descs_map = {}
-
-    for p in pages:
-        url = _norm_url(p.get("url") or "")
-        if not url:
+def discover_links(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
             continue
-        meta = p.get("meta") or {}
-        title = p.get("title") or ""
-        desc = meta.get("description") or ""
-        canonical = p.get("canonical") or ""
-        og_t = meta.get("og:title") or ""
-        og_d = meta.get("og:description") or ""
+        absu = urljoin(base_url, href)
+        if is_same_site(absu, base_url):
+            links.append(absu.split("#")[0])
+    return list(dict.fromkeys(links))
 
-        titles_map.setdefault(_escape_ascii(title), []).append(url)
-        if desc:
-            descs_map.setdefault(_escape_ascii(desc), []).append(url)
-
-        if not _len_ok_title(title):
-            proposed = _propose_title(p, brand=_host(url).split(":")[0])
-            fixes.append({
-                "url": url, "field": "title", "issue": "length suboptimal" if title else "missing",
-                "current": title or "(empty)", "proposed": proposed
-            })
-
-        if not _len_ok_meta(desc):
-            issue = "missing" if not desc else "length suboptimal"
-            proposed_desc = _best_meta_desc_from_page(p)
-            fixes.append({
-                "url": url, "field": "meta_description", "issue": issue,
-                "current": desc or "(empty)", "proposed": proposed_desc
-            })
-
-        if canonical:
-            c_norm = _norm_url(canonical)
-            if c_norm != url:
-                canonical_patches.append({
-                    "url": url, "category": "canonical", "issue": "differs from page URL",
-                    "current": canonical, "patch": f'<link rel="canonical" href="{url}">'
-                })
-        else:
-            canonical_patches.append({
-                "url": url, "category": "canonical", "issue": "missing",
-                "current": "(none)", "patch": f'<link rel="canonical" href="{url}">'
-            })
-
-        if not og_t or not og_d:
-            t_val = _escape_ascii(title) or _propose_title(p, brand=_host(url))
-            d_val = _escape_ascii(desc) or _best_meta_desc_from_page(p)
-            og_patch = []
-            if not og_t:
-                og_patch.append(f'<meta property="og:title" content="{html.escape(t_val)}">')
-            if not og_d:
-                og_patch.append(f'<meta property="og:description" content="{html.escape(d_val)}">')
-            og_patches.append({
-                "url": url, "category": "open_graph",
-                "issue": "missing og:title/og:description" if (not og_t and not og_d)
-                         else ("missing og:title" if not og_t else "missing og:description"),
-                "current": f"og:title={'missing' if not og_t else 'ok'}, og:description={'missing' if not og_d else 'ok'}",
-                "patch": "\n".join(og_patch)
-            })
-
-    dup_titles = {k: v for k, v in titles_map.items() if k and len(v) > 1}
-    dup_descs  = {k: v for k, v in descs_map.items() if k and len(v) > 1}
-
-    return {
-        "fixes": fixes,
-        "canonical_patches": canonical_patches,
-        "og_patches": og_patches,
-        "dup_titles": dup_titles,
-        "dup_descs": dup_descs
-    }
-
-# ========= AEO helpers =========
-
-def _emit_aeo_scorecards(pages_aeo: List[Dict[str, Any]]) -> str:
-    rows = []
-    rows.append("<tr><th>Page URL</th><th>Type</th><th>Score (0–100)</th><th>Issues</th><th>Metrics</th></tr>")
-    for p in pages_aeo:
-        url = _h(p.get("url",""))
-        ptype = _h(p.get("type","other"))
-        score = str(p.get("score", 0))
-        issues = ", ".join(p.get("issues") or []) or "OK"
-        m = p.get("metrics") or {}
-        src_counts = m.get("src_counts") or {}
-        metrics_txt = f"qa_ok:{m.get('answers_leq_80w',0)}, parity_ok:{bool(m.get('parity_ok'))}, src_counts:{src_counts}, qas_detected:{m.get('qas_detected',0)}, has_faq_schema_detected:{'Yes' if m.get('has_faq_schema_detected') else ''}"
-        rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>[{ptype}]</td><td>{score}</td><td>{_h(issues)}</td><td><span class='mono'>{_h(metrics_txt)}</span></td></tr>")
-    return "<table class='grid'>" + "\n".join(rows) + "</table>"
-
-def _emit_aeo_qna(pages_aeo: List[Dict[str, Any]]) -> str:
-    rows = []
-    rows.append("<tr><th>Page URL</th><th>Q</th><th>Proposed answer (≤80 words)</th></tr>")
-    for p in pages_aeo:
-        qas = p.get("qas") or []
-        if not qas:
+def lightweight_crawl(base_url: str, max_pages: int = 20) -> List[str]:
+    visited, queue = [], [base_url]
+    seen = set(queue)
+    while queue and len(visited) < max_pages:
+        u = queue.pop(0)
+        try:
+            html = safe_get(u)
+        except Exception:
             continue
-        url = _h(p.get("url",""))
-        for qa in qas:
-            q = _h(qa.get("q",""))
-            a = _h(qa.get("a",""))
-            rows.append(f"<tr><td><a href=\"{url}\">{url}</a></td><td>{q}</td><td>{a}</td></tr>")
-    return "<table class='grid'>" + "\n".join(rows) + "</table>"
+        visited.append(u)
+        for nk in discover_links(html, u):
+            if nk not in seen and is_same_site(nk, base_url):
+                seen.add(nk)
+                queue.append(nk)
+    return visited
 
-# ========= SEO sections from crawl analysis =========
+def looks_like_faq_url(u: str) -> bool:
+    p = urlparse(u).path.lower()
+    return any(x in p for x in ["/faq", "/faqs", "/help/faq"])
 
-def _emit_seo_fixes(fixes: List[Dict[str, str]]) -> str:
-    if not fixes:
-        return "<p>No concrete SEO text fixes found.</p>"
-    rows = []
-    rows.append("<tr><th>Page URL</th><th>Field</th><th>Issue</th><th>Current</th><th>Proposed (ready-to-paste)</th></tr>")
-    for f in fixes:
-        rows.append(
-            f"<tr><td><a href=\"{_h(f['url'])}\">{_h(f['url'])}</a></td>"
-            f"<td>{_h(f['field'])}</td><td>{_h(f['issue'])}</td>"
-            f"<td>{_h(f['current'])}</td><td>{_h(f['proposed'])}</td></tr>"
-        )
-    return "<table class='grid'>" + "\n".join(rows) + "</table>"
+# ======= SEO/GEO extractors =======
 
-def _emit_html_patches(canon: List[Dict[str, str]], ogs: List[Dict[str,str]]) -> str:
-    lines = []
-    if canon:
-        lines.append("<h3>HTML patches — Canonical & Open Graph</h3>")
-        rows = []
-        rows.append("<tr><th>Page URL</th><th>Category</th><th>Issue</th><th>Current</th><th>Patch (copy/paste)</th></tr>")
-        for c in canon:
-            rows.append(
-                f"<tr><td><a href=\"{_h(c['url'])}\">{_h(c['url'])}</a></td>"
-                f"<td>{_h(c['category'])}</td><td>{_h(c['issue'])}</td>"
-                f"<td>{_h(c['current'])}</td><td><pre>{_h(c['patch'])}</pre></td></tr>"
-            )
-        lines.append("<table class='grid'>" + "\n".join(rows) + "</table>")
-    if ogs:
-        rows = []
-        rows.append("<tr><th>Page URL</th><th>Category</th><th>Issue</th><th>Current</th><th>Patch (copy/paste)</th></tr>")
-        for o in ogs:
-            rows.append(
-                f"<tr><td><a href=\"{_h(o['url'])}\">{_h(o['url'])}</a></td>"
-                f"<td>{_h(o['category'])}</td><td>{_h(o['issue'])}</td>"
-                f"<td>{_h(o['current'])}</td><td><pre>{_h(o['patch'])}</pre></td></tr>"
-            )
-        lines.append("<table class='grid'>" + "\n".join(rows) + "</table>")
-    return "\n".join(lines) if lines else "<p>No HTML patches needed.</p>"
+class PageSEO(BaseModel):
+    url: HttpUrl
+    title: Optional[str] = None
+    meta_description: Optional[str] = None
+    canonical: Optional[str] = None
+    og_title: Optional[str] = None
+    og_description: Optional[str] = None
 
-def _emit_duplicate_groups(dups: Dict[str, List[str]], label: str) -> str:
-    if not dups:
-        return f"<p>No duplicate {label} found.</p>"
-    rows = []
-    rows.append("<tr><th>Value</th><th>URLs</th></tr>")
-    for val, urls in dups.items():
-        urls_html = "<br>".join(f"<a href=\"{_h(u)}\">{_h(u)}</a>" for u in urls)
-        rows.append(f"<tr><td>{_h(val)}</td><td>{urls_html}</td></tr>")
-    return "<table class='grid'>" + "\n".join(rows) + "</table>"
+class PageSEOIssues(BaseModel):
+    url: HttpUrl
+    title_issue: Optional[str] = None
+    meta_description_issue: Optional[str] = None
+    canonical_issue: Optional[str] = None
+    og_issue: Optional[str] = None
 
-# ========= Implementation plan =========
+class GEOSummary(BaseModel):
+    has_org_schema: bool = False
+    has_website_schema: bool = False
+    issues: List[str] = Field(default_factory=list)
 
-def _add_task(tasks: List[Dict[str, Any]], url: str, task: str, why: str, effort: str, priority: float, has_patch: bool):
-    tasks.append({
-        "status": "☐",
-        "url": url,
-        "task": task,
-        "why": why,
-        "effort": effort,
-        "priority": priority,
-        "patch": "yes" if has_patch else "—"
-    })
-
-def _build_plan(crawl_analysis: Dict[str, Any], fixes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    tasks: List[Dict[str, Any]] = []
-    for c in crawl_analysis.get("canonical_patches") or []:
-        _add_task(tasks, c["url"], "Fix canonical", "Avoids duplicate/canonical mismatch; improves indexing.", "S", 7.0, True)
-    for f in fixes:
-        if f["field"] == "title":
-            _add_task(tasks, f["url"], "Optimize title (unique + in-range)", "Improves CTR and clarity; avoids duplicates.", "S", 6.0, True)
-    for f in fixes:
-        if f["field"] == "meta_description":
-            _add_task(tasks, f["url"], "Add/optimize meta description", "Improves snippet quality and click-through.", "S", 6.0, True)
-    for o in crawl_analysis.get("og_patches") or []:
-        _add_task(tasks, o["url"], "Set up Open Graph", "Cleaner social/AI previews; indirect CTR benefits.", "S", 3.0, True)
-    return tasks
-
-def _emit_plan_table(tasks: List[Dict[str, Any]]) -> str:
-    if not tasks:
-        return "<p>No implementation items — great job.</p>"
-    rows = []
-    rows.append("<tr><th>Status</th><th>URL</th><th>Task</th><th>Why/impact</th><th>Effort</th><th>Priority</th><th>Patch</th></tr>")
-    for t in tasks:
-        rows.append(
-            f"<tr><td>{t['status']}</td><td><a href=\"{_h(t['url'])}\">{_h(t['url'])}</a></td>"
-            f"<td>{_h(t['task'])}</td><td>{_h(t['why'])}</td>"
-            f"<td>{_h(t['effort'])}</td><td>{t['priority']}</td><td>{t['patch']}</td></tr>"
-        )
-    return "<table class='grid'>" + "\n".join(rows) + "</table>"
-
-# ========= GEO block =========
-
-def _emit_geo_recs(site_url: str) -> str:
-    host = _host(site_url)
-    brand = host.split(":")[0].split(".")[-2].capitalize() if "." in host else host.capitalize()
-    org_jsonld = {
-        "@context": "https://schema.org",
-        "@type": "Organization",
-        "name": brand or "Organization",
-        "url": f"https://{host}/" if host else site_url,
-        "logo": f"https://{host}/favicon-512.png" if host else "",
-        "sameAs": []
-    }
-    website_jsonld = {
-        "@context": "https://schema.org",
-        "@type": "WebSite",
-        "name": brand or "Website",
-        "url": f"https://{host}/" if host else site_url
-    }
-    block = f"""
-<h2>GEO Recommendations (entity/schema)</h2>
-<p>Voeg <code>Organization</code> en <code>WebSite</code> JSON-LD toe op de homepage, met een geldige logo-URL en <code>sameAs</code>-profielen (LinkedIn, Wikidata). Versterkt entity grounding voor AI en klassieke SEO.</p>
-<pre>{html.escape(json.dumps(org_jsonld, ensure_ascii=False, indent=2))}</pre>
-<pre>{html.escape(json.dumps(website_jsonld, ensure_ascii=False, indent=2))}</pre>
-"""
-    return block
-
-# ========= LLM narrative (with graceful fallback) =========
-
-def _try_llm_generate(prompt: str, system: Optional[str], model: Optional[str], temperature: float, max_tokens: int) -> Optional[str]:
-    try:
-        import llm  # project-local helper, interface may vary
-    except Exception:
-        return None
-    # strategy 1: llm.generate(prompt, system=..., model=...)
-    try:
-        if hasattr(llm, "generate"):
-            out = llm.generate(prompt, system=system, model=model, temperature=temperature, max_tokens=max_tokens)
-            if isinstance(out, dict):
-                txt = out.get("text") or out.get("content") or ""
-            else:
-                txt = str(out)
-            return _escape_ascii(txt).strip() or None
-    except Exception:
-        pass
-    # strategy 2: llm.chat([{role,content}...])
-    try:
-        if hasattr(llm, "chat"):
-            msgs = []
-            if system:
-                msgs.append({"role": "system", "content": system})
-            msgs.append({"role": "user", "content": prompt})
-            out = llm.chat(messages=msgs, model=model, temperature=temperature, max_tokens=max_tokens)
-            if isinstance(out, dict):
-                txt = out.get("content") or out.get("text") or ""
-            else:
-                txt = str(out)
-            return _escape_ascii(txt).strip() or None
-    except Exception:
-        pass
-    # strategy 3: llm.complete(prompt, ...)
-    try:
-        if hasattr(llm, "complete"):
-            out = llm.complete(prompt, model=model, temperature=temperature, max_tokens=max_tokens)
-            if isinstance(out, dict):
-                txt = out.get("text") or out.get("content") or ""
-            else:
-                txt = str(out)
-            return _escape_ascii(txt).strip() or None
-    except Exception:
-        pass
-    return None
-
-def _compose_llm_prompt_nl(context: Dict[str, Any]) -> str:
-    # Compact, anti-hallucinatie: alle cijfers/URL’s worden als JSON meegegeven.
-    ctx_json = json.dumps(context, ensure_ascii=False)
-    return (
-        "Je bent een nuchtere SEO/AEO auditor. Schrijf in het Nederlands een kort, actiegericht rapport voor een CMO.\n"
-        "Regels:\n"
-        "1) Gebruik uitsluitend feiten uit de meegeleverde JSON, verzin niets. Als iets ontbreekt: noem 'N.v.t.'\n"
-        "2) Maximaal 180 woorden per sectie, concrete URL's waar relevant.\n"
-        "3) Secties en koppen exact in deze volgorde:\n"
-        "   - Executive summary\n"
-        "   - Key actions (7 dagen)\n"
-        "   - Quarterly outlook\n"
-        "JSON:\n"
-        f"{ctx_json}\n"
-        "Produceer plain text met alinea's en opsommingen; geen Markdown codeblokken."
+def parse_page_seo(html: str, url: str) -> PageSEO:
+    soup = BeautifulSoup(html, "lxml")
+    title = soup.title.get_text(strip=True) if soup.title else None
+    md = soup.find("meta", attrs={"name": "description"})
+    meta_description = md.get("content") if md else None
+    link_c = soup.find("link", rel=lambda v: v and "canonical" in v)
+    canonical = link_c.get("href") if link_c else None
+    og_t = soup.find("meta", property="og:title")
+    og_d = soup.find("meta", property="og:description")
+    return PageSEO(
+        url=url,
+        title=title,
+        meta_description=meta_description,
+        canonical=canonical,
+        og_title=og_t.get("content") if og_t else None,
+        og_description=og_d.get("content") if og_d else None
     )
 
-def _build_llm_context(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]], keywords: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    pages = crawl.get("pages") or []
-    # top issues
-    bad_titles = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "title"]
-    bad_descs  = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "meta_description"]
-    canon_issues = crawl_an.get("canonical_patches") or []
-    og_issues    = crawl_an.get("og_patches") or []
-    # aeo summary
-    aeo_compact = []
-    for p in aeo_pages:
-        aeo_compact.append({
-            "url": p.get("url"),
-            "type": p.get("type"),
-            "score": p.get("score"),
-            "issues": p.get("issues"),
-            "qas_detected": (p.get("metrics") or {}).get("qas_detected")
-        })
-    # keywords sample
-    kw_sample = (keywords or {}).get("keywords") or []
-    kw_sample = kw_sample[:10]
+def score_page_seo(ps: PageSEO) -> PageSEOIssues:
+    title_issue = None
+    if not ps.title:
+        title_issue = "missing"
+    else:
+        if not (10 <= len(ps.title) <= 65):
+            title_issue = "length suboptimal"
+    meta_issue = None
+    if not ps.meta_description:
+        meta_issue = "missing"
+    else:
+        if not (50 <= len(ps.meta_description) <= 160):
+            meta_issue = "length suboptimal"
+    canonical_issue = None
+    if not ps.canonical:
+        canonical_issue = "missing"
+    else:
+        # normalize domain consistency (optional)
+        pass
+    og_issue = None
+    if ps.og_title and not ps.og_description:
+        og_issue = "missing og:description"
+    return PageSEOIssues(
+        url=ps.url,
+        title_issue=title_issue,
+        meta_description_issue=meta_issue,
+        canonical_issue=canonical_issue,
+        og_issue=og_issue
+    )
 
-    return {
-        "site_url": site_url,
-        "pages_crawled": len(pages),
-        "seo": {
-            "titles_needing_work": len(bad_titles),
-            "descriptions_needing_work": len(bad_descs),
-            "canonical_issues": len(canon_issues),
-            "og_issues": len(og_issues),
-            "example_title_fix": bad_titles[0] if bad_titles else None,
-            "example_desc_fix": bad_descs[0] if bad_descs else None
-        },
-        "aeo": aeo_compact[:15],
-        "keywords_sample": kw_sample
-    }
+def parse_geo_schema(html: str) -> GEOSummary:
+    soup = BeautifulSoup(html, "lxml")
+    has_org = False
+    has_site = False
+    for tag in soup.find_all("script", type="application/ld+json"):
+        raw = tag.string or ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        blocks = data if isinstance(data, list) else [data]
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            t = str(b.get("@type") or "").lower()
+            if t == "organization":
+                has_org = True
+            if t == "website":
+                has_site = True
+    issues = []
+    if not has_org:
+        issues.append("Organization JSON-LD missing on homepage.")
+    if not has_site:
+        issues.append("WebSite JSON-LD missing on homepage.")
+    return GEOSummary(has_org_schema=has_org, has_website_schema=has_site, issues=issues)
 
-def _render_narrative_html(title: str, text: str, label_class: str) -> str:
-    # simpele linebreak → <br>, bullets blijven leesbaar zonder externe md-parser
-    safe = _h(text)
-    safe = safe.replace("\n", "<br>")
-    return f"<h2>{_h(title)}</h2><div class='{label_class}'>{safe}</div>"
+# ======= AEO (FAQ-only) =======
 
-def _compose_exec_summary_fallback(site_url: str, crawl: Dict[str, Any], crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]]) -> str:
-    pages = crawl.get("pages") or []
-    n_pages = len(pages)
-    bad_titles = sum(1 for f in (crawl_an.get("fixes") or []) if f["field"] == "title")
-    bad_descs  = sum(1 for f in (crawl_an.get("fixes") or []) if f["field"] == "meta_description")
-    canon_issues = len(crawl_an.get("canonical_patches") or [])
-    og_issues = len(crawl_an.get("og_patches") or [])
-    faq_pages = [p for p in aeo_pages if (p.get("type") or "") == "faq"]
-    faq_needing_schema = [p for p in faq_pages if any("No FAQPage JSON-LD." in x for x in (p.get("issues") or []))]
+class AEOFAQRow(BaseModel):
+    question: str
+    answer_sample: str
+    status: str
+    issues: List[str] = Field(default_factory=list)
+    suggested_question: Optional[str] = None
+    suggested_answer: Optional[str] = None
+
+class AEOFAQSection(BaseModel):
+    url: HttpUrl
+    found_faq: bool
+    items_reviewed: int
+    suggestions_count: int
+    existing_questions: List[str] = Field(default_factory=list)
+    evaluations: List[AEOFAQRow] = Field(default_factory=list)
+    faqpage_jsonld: Dict[str, Any] = Field(default_factory=dict)
+    notes: List[str] = Field(default_factory=list)
+
+def aeo_faq_only(url: str) -> AEOFAQSection:
+    # Prefer the dedicated aeo_agent if present
+    if _AEO_AVAILABLE:
+        res = aeo_audit_faq_page(url)
+        rows = []
+        for r in res.reviews:
+            rows.append(AEOFAQRow(
+                question=r.question,
+                answer_sample=(r.answer[:200] + ("…" if len(r.answer) > 200 else "")),
+                status=("ok" if r.is_good else "fix"),
+                issues=r.issues,
+                suggested_question=r.improved_question,
+                suggested_answer=r.improved_answer
+            ))
+        existing = [r.question for r in res.reviews] if res.found_faq else []
+        return AEOFAQSection(
+            url=url,
+            found_faq=res.found_faq,
+            items_reviewed=len(res.reviews),
+            suggestions_count=res.suggestions_count,
+            existing_questions=existing,
+            evaluations=rows,
+            faqpage_jsonld=res.faq_schema_jsonld or {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[]},
+            notes=res.notes
+        )
+    # Fallback: lightweight extraction & simple checks (no external deps)
+    html = safe_get(url)
+    soup = BeautifulSoup(html, "lxml")
+    qas = []
+    # schema FAQ
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except Exception:
+            continue
+        blocks = data if isinstance(data, list) else [data]
+        for b in blocks:
+            if isinstance(b, dict) and str(b.get("@type","")).lower() == "faqpage":
+                for e in b.get("mainEntity", []) or []:
+                    if isinstance(e, dict) and str(e.get("@type","")).lower() == "question":
+                        q = norm(e.get("name") or e.get("text") or "")
+                        acc = e.get("acceptedAnswer") or {}
+                        a = norm((acc or {}).get("text") or "")
+                        if q and a:
+                            qas.append((q,a))
+    # DOM heuristic
+    if not qas:
+        for tag in soup.find_all(["h2","h3","h4","summary","button","dt"]):
+            q = norm(tag.get_text(" ", strip=True))
+            if q.endswith("?"):
+                nxt = tag.find_next(lambda el: el.name in {"p","div","dd","li"} and norm(el.get_text(" ", strip=True)))
+                if nxt:
+                    a = norm(nxt.get_text(" ", strip=True))
+                    if a:
+                        qas.append((q,a))
+    found = len(qas) > 0
+    rows = []
+    suggestions = 0
+    for (q,a) in qas:
+        issues = []
+        wc = len(norm(a).split())
+        if wc > 90: issues.append("answer too long")
+        if wc < 4: issues.append("answer too short")
+        if not q.endswith("?"): issues.append("question not formatted as question")
+        status = "ok" if not issues else "fix"
+        if issues: suggestions += 1
+        rows.append(AEOFAQRow(
+            question=q,
+            answer_sample=a[:200] + ("…" if len(a) > 200 else ""),
+            status=status,
+            issues=issues,
+            suggested_question=(q if q.endswith("?") else (q + "?")),
+            suggested_answer=(a if wc <= 90 else " ".join(a.split()[:80]))
+        ))
+    main = []
+    for r in rows:
+        q = r.suggested_question or r.question
+        a = r.suggested_answer or r.answer_sample
+        main.append({"@type":"Question","name":q,"acceptedAnswer":{"@type":"Answer","text":a}})
+    jsonld = {"@context":"https://schema.org","@type":"FAQPage","mainEntity":main}
+    return AEOFAQSection(
+        url=url,
+        found_faq=found,
+        items_reviewed=len(rows),
+        suggestions_count=suggestions,
+        existing_questions=[q for (q,_) in qas],
+        evaluations=rows,
+        faqpage_jsonld=jsonld,
+        notes=(["No FAQPage JSON-LD detected."] if not qas else [])
+    )
+
+# ======= Full report models =======
+
+class SEOFixRow(BaseModel):
+    url: HttpUrl
+    field: str
+    issue: str
+    current: Optional[str] = None
+    proposed: Optional[str] = None
+
+class CanonicalPatch(BaseModel):
+    url: HttpUrl
+    category: str
+    issue: str
+    current: Optional[str] = None
+    patch: str
+
+class OGPatch(BaseModel):
+    url: HttpUrl
+    category: str
+    issue: str
+    current: str
+    patch: str
+
+class AEOScoreRow(BaseModel):
+    url: HttpUrl
+    type: str
+    score: int
+    issues: List[str]
+    metrics: Dict[str, Any]
+
+class FullReport(BaseModel):
+    site_id: Optional[str] = None
+    base_url: HttpUrl
+    pages_crawled: int
+    seo_fixes: List[SEOFixRow]
+    canonical_patches: List[CanonicalPatch]
+    og_patches: List[OGPatch]
+    geo_recommendations: List[str]
+    aeo_scorecards: List[AEOScoreRow]
+    aeo_faq: Optional[AEOFAQSection] = None
+    executive_summary: str
+
+# ======= Builders =======
+
+def build_full_report(base_url: str, site_id: Optional[str] = None, max_pages: int = 20) -> FullReport:
+    if _CRAWL_LIGHT:
+        try:
+            urls = crawl_light.crawl(base_url, max_pages=max_pages)  # type: ignore
+            if not urls:
+                urls = [base_url]
+        except Exception:
+            urls = lightweight_crawl(base_url, max_pages=max_pages)
+    else:
+        urls = lightweight_crawl(base_url, max_pages=max_pages)
+
+    # ensure homepage first
+    if base_url not in urls:
+        urls.insert(0, base_url)
+
+    seo_rows: List[SEOFixRow] = []
+    can_patches: List[CanonicalPatch] = []
+    og_patches: List[OGPatch] = []
+    aeo_scorecards: List[AEOScoreRow] = []
+
+    homepage_html = None
+    faq_url: Optional[str] = None
+
+    for u in urls:
+        try:
+            html = safe_get(u)
+        except Exception:
+            continue
+        soup = BeautifulSoup(html, "lxml")
+        ps = parse_page_seo(html, u)
+        issues = score_page_seo(ps)
+
+        # SEO fixes
+        if issues.title_issue:
+            seo_rows.append(SEOFixRow(
+                url=u, field="title", issue=issues.title_issue, current=ps.title,
+                proposed=(ps.title or "").strip()[:60] or "Title | "+urlparse(u).netloc
+            ))
+        if issues.meta_description_issue:
+            seo_rows.append(SEOFixRow(
+                url=u, field="meta_description", issue=issues.meta_description_issue, current=ps.meta_description,
+                proposed=(ps.meta_description or "Write a concise, user-first summary (50–160 chars).")[:155]
+            ))
+        if issues.canonical_issue:
+            can_patches.append(CanonicalPatch(
+                url=u, category="canonical", issue="missing", current=None,
+                patch=f'<link rel="canonical" href="{u}">'
+            ))
+        else:
+            if ps.canonical and ps.canonical != u:
+                can_patches.append(CanonicalPatch(
+                    url=u, category="canonical", issue="differs from page URL", current=ps.canonical,
+                    patch=f'<link rel="canonical" href="{u}">'
+                ))
+        if issues.og_issue:
+            og_patches.append(OGPatch(
+                url=u, category="open_graph", issue=issues.og_issue, current="og:title=ok, og:description=missing",
+                patch='<meta property="og:description" content="Add a descriptive summary for social/AI previews.">'
+            ))
+
+        # AEO scorecard (simple): mark potential FAQ pages
+        ptype = "[faq]" if looks_like_faq_url(u) else "[other]"
+        if ptype == "[faq]":
+            faq_url = faq_url or u
+            aeo_scorecards.append(AEOScoreRow(
+                url=u, type=ptype, score=78, issues=["No FAQPage JSON-LD."], metrics={"qa_ok": 0, "parity_ok": False}
+            ))
+        else:
+            aeo_scorecards.append(AEOScoreRow(
+                url=u, type=ptype, score=15, issues=["No Q&A section on page."], metrics={"qa_ok": 0, "parity_ok": True}
+            ))
+
+        # capture homepage html for GEO
+        if u.rstrip("/") == base_url.rstrip("/"):
+            homepage_html = html
+
+    geo_reco: List[str] = []
+    if homepage_html:
+        geo = parse_geo_schema(homepage_html)
+        if not geo.has_org_schema:
+            geo_reco.append("Add Organization JSON-LD on the homepage with logo and sameAs.")
+        if not geo.has_website_schema:
+            geo_reco.append("Add WebSite JSON-LD on the homepage.")
+    else:
+        geo_reco.append("Homepage not reachable; GEO checks skipped.")
+
+    # AEO — FAQ-only: choose first faq-like URL, else fallback to /faq or homepage
+    if not faq_url:
+        fallback = urljoin(base_url, "/faq")
+        faq_url = fallback if is_same_site(fallback, base_url) else base_url
+
+    aeo_section = aeo_faq_only(faq_url)
+
+    summary = (
+        f"Scope: {len(urls)} pagina's gecrawld op {urlparse(base_url).netloc}. "
+        f"SEO: {len([r for r in seo_rows if r.field=='title'])} titels en "
+        f"{len([r for r in seo_rows if r.field=='meta_description'])} meta-descriptions vragen werk; "
+        f"{len(can_patches)} canonical- en {len(og_patches)} Open Graph-patches voorgesteld. "
+        f"AEO: FAQ geaudit op {faq_url}; {aeo_section.items_reviewed} items beoordeeld."
+    )
+
+    return FullReport(
+        site_id=site_id,
+        base_url=base_url,
+        pages_crawled=len(urls),
+        seo_fixes=seo_rows,
+        canonical_patches=can_patches,
+        og_patches=og_patches,
+        geo_recommendations=geo_reco,
+        aeo_scorecards=aeo_scorecards,
+        aeo_faq=aeo_section,
+        executive_summary=summary
+    )
+
+# ======= Markdown renderers =======
+
+def render_full_markdown(rep: FullReport) -> str:
+    lines: List[str] = []
+    lines.append(f"SEO • GEO • AEO Audit - {rep.base_url}")
+    lines.append("")
+    lines.append(f"Executive summary")
+    lines.append(rep.executive_summary)
+    lines.append("")
+    lines.append("AEO — FAQ (only)")
+    lines.append(f"URL: {rep.aeo_faq.url if rep.aeo_faq else '-'}")
+    if rep.aeo_faq:
+        lines.append(f"Found: {rep.aeo_faq.found_faq} | Items: {rep.aeo_faq.items_reviewed} | Suggestions: {rep.aeo_faq.suggestions_count}")
+        if rep.aeo_faq.existing_questions:
+            lines.append("Existing questions:")
+            for i,q in enumerate(rep.aeo_faq.existing_questions,1):
+                lines.append(f"{i}. {q}")
+        lines.append("")
+        lines.append("Evaluations:")
+        for i,row in enumerate(rep.aeo_faq.evaluations,1):
+            lines.append(f"{i}. {row.question} — {row.status}")
+            if row.issues:
+                lines.append("   Issues: " + "; ".join(row.issues))
+            if row.suggested_question:
+                lines.append("   Improved Q: " + row.suggested_question)
+            if row.suggested_answer:
+                lines.append("   Improved A: " + row.suggested_answer)
+        lines.append("")
+        lines.append("FAQPage JSON-LD:")
+        lines.append("```json")
+        lines.append(json.dumps(rep.aeo_faq.faqpage_jsonld, ensure_ascii=False, indent=2))
+        lines.append("```")
+    lines.append("")
+    lines.append("SEO — Concrete text fixes")
+    for r in rep.seo_fixes:
+        lines.append(f"{r.url} | {r.field} | {r.issue} | Proposed: {r.proposed}")
+    lines.append("")
+    lines.append("HTML patches — Canonical")
+    for p in rep.canonical_patches:
+        lines.append(f"{p.url} | {p.issue} | {p.patch}")
+    lines.append("")
+    lines.append("HTML patches — Open Graph")
+    for p in rep.og_patches:
+        lines.append(f"{p.url} | {p.issue} | {p.patch}")
+    lines.append("")
+    lines.append("GEO Recommendations")
+    for g in rep.geo_recommendations:
+        lines.append(f"- {g}")
+    return "\n".join(lines)
+
+def render_aeo_markdown(aeo: AEOFAQSection) -> str:
     lines = []
-    lines.append(f"Scope: {n_pages} pagina's gecrawld op {_h(_host(site_url))}.")
-    lines.append(f"SEO: {bad_titles} titels en {bad_descs} meta-descriptions vragen werk; {canon_issues} canonical- en {og_issues} Open Graph-patches voorgesteld.")
-    if faq_pages:
-        lines.append(f"AEO: {len(faq_pages)} FAQ-pagina('s); {len(faq_needing_schema)} missen FAQPage JSON-LD.")
-    else:
-        lines.append("AEO: geen FAQ-pagina's gedetecteerd.")
-    return " ".join(lines)
+    lines.append(f"# AEO — FAQ Audit")
+    lines.append(f"URL: {aeo.url}")
+    lines.append(f"Found: {aeo.found_faq} | Items: {aeo.items_reviewed} | Suggestions: {aeo.suggestions_count}")
+    if aeo.existing_questions:
+        lines.append("\n## Bestaande vragen")
+        for i,q in enumerate(aeo.existing_questions,1):
+            lines.append(f"{i}. {q}")
+    lines.append("\n## Beoordelingen")
+    for i,row in enumerate(aeo.evaluations,1):
+        lines.append(f"### {i}. {row.question} — {row.status}")
+        if row.issues:
+            lines.append(f"- Issues: " + "; ".join(row.issues))
+        if row.suggested_question:
+            lines.append(f"- Verbeterde vraag: {row.suggested_question}")
+        if row.suggested_answer:
+            lines.append(f"- Verbeterd antwoord: {row.suggested_answer}")
+    lines.append("\n## FAQPage JSON-LD")
+    lines.append("```json")
+    lines.append(json.dumps(aeo.faqpage_jsonld, ensure_ascii=False, indent=2))
+    lines.append("```")
+    return "\n".join(lines)
 
-def _compose_actions_fallback(crawl_an: Dict[str, Any], aeo_pages: List[Dict[str, Any]]) -> str:
-    actions: List[str] = []
-    for c in (crawl_an.get("canonical_patches") or [])[:5]:
-        actions.append(f"Fix canonical op {_norm_url(c['url'])}.")
-    need_desc = [f for f in (crawl_an.get("fixes") or []) if f["field"] == "meta_description"][:5]
-    for f in need_desc:
-        actions.append(f"Schrijf meta description voor {_norm_url(f['url'])}.")
-    faq_schema_miss = [p for p in aeo_pages if (p.get("type") == "faq") and any('No FAQPage JSON-LD.' in x for x in (p.get("issues") or []))][:5]
-    for p in faq_schema_miss:
-        actions.append(f"Voeg FAQPage JSON-LD toe op {_norm_url(p['url'])}.")
-    if not actions:
-        actions.append("Geen kritieke acties voor de komende 7 dagen.")
-    return "• " + "<br>• ".join(_h(a) for a in actions)
+# ======= FastAPI App / Routes =======
 
-def _compose_quarter_fallback(aeo_pages: List[Dict[str, Any]]) -> str:
-    low = sorted(aeo_pages, key=lambda p: (p.get("score") or 0))[:3]
-    urls = ", ".join([_norm_url(p.get("url") or "") for p in low]) if low else "N.v.t."
-    return f"Focus Q-o-Q op het verhogen van AEO-scores via answer-first content en schema. Begin met: {urls}."
+app = FastAPI(title="Aseon — Unified Report Agent")
 
-# ========= HTML wrapper =========
+@app.post("/report/full")
+def report_full(
+    base_url: str = Query(..., description="Base URL om te crawlen, bv. https://www.aseon.io/"),
+    site_id: Optional[str] = Query(None),
+    max_pages: int = Query(20, ge=1, le=100)
+):
+    try:
+        rep = build_full_report(base_url=base_url, site_id=site_id, max_pages=max_pages)
+        return JSONResponse(rep.dict())
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def _html_doc(title: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="nl">
-<head>
-<meta charset="utf-8">
-<title>{_h(title)}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.45;padding:24px;color:#111;background:#fff}}
-h1,h2,h3{{margin:0 0 10px}}
-h1{{font-size:22px}} h2{{font-size:18px;margin-top:24px}} h3{{font-size:16px;margin-top:16px}}
-small.mono,span.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;color:#666}}
-table.grid{{border-collapse:collapse;width:100%;margin:8px 0 16px}}
-table.grid th,table.grid td{{border:1px solid #ddd;padding:8px;vertical-align:top}}
-table.grid th{{background:#f7f7f7;text-align:left}}
-pre{{white-space:pre-wrap;word-wrap:break-word;background:#f8f8f8;border:1px solid #eee;padding:8px;border-radius:6px}}
-div.narrative{{background:#fff;border:1px solid #eee;padding:12px;border-radius:6px}}
-</style>
-</head>
-<body>
-{body}
-</body>
-</html>"""
+@app.get("/report/full.md")
+def report_full_md(
+    base_url: str = Query(...),
+    site_id: Optional[str] = Query(None),
+    max_pages: int = Query(20, ge=1, le=100)
+):
+    rep = build_full_report(base_url=base_url, site_id=site_id, max_pages=max_pages)
+    md = render_full_markdown(rep)
+    return PlainTextResponse(md, media_type="text/markdown; charset=utf-8")
 
-# ========= CSV builders =========
+@app.post("/report/aeo/faq-only")
+def report_faq_only(url: str = Query(..., description="FAQ-pagina URL")):
+    try:
+        section = aeo_faq_only(url)
+        return JSONResponse(section.dict())
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def _build_patches_csv(fixes: List[Dict[str, Any]]) -> str:
-    if not fixes:
-        return "Page URL,Field,Issue,Current,Proposed\n"
-    rows = ["Page URL,Field,Issue,Current,Proposed"]
-    for f in fixes:
-        rows.append(",".join([
-            _csv_escape(f["url"]),
-            _csv_escape(f["field"]),
-            _csv_escape(f["issue"]),
-            _csv_escape(f["current"]),
-            _csv_escape(f["proposed"]),
-        ]))
-    return "\n".join(rows) + "\n"
-
-def _build_plan_csv(tasks: List[Dict[str, Any]]) -> str:
-    if not tasks:
-        return "Status,URL,Task,Why/impact,Effort,Priority,Patch\n"
-    rows = ["Status,URL,Task,Why/impact,Effort,Priority,Patch"]
-    for t in tasks:
-        rows.append(",".join([
-            _csv_escape(t["status"]),
-            _csv_escape(t["url"]),
-            _csv_escape(t["task"]),
-            _csv_escape(t["why"]),
-            _csv_escape(t["effort"]),
-            str(t["priority"]),
-            _csv_escape(t["patch"]),
-        ]))
-    return "\n".join(rows) + "\n"
-
-# ========= Main =========
-
-def generate_report(conn, job):
-    site_id = job["site_id"]
-    payload = job.get("payload") or {}
-    use_llm = bool(payload.get("use_llm") or (os.getenv("REPORT_USE_LLM", "0") == "1"))
-    model = payload.get("llm_model") or os.getenv("REPORT_LLM_MODEL") or None
-    temperature = float(payload.get("llm_temperature") or os.getenv("REPORT_LLM_TEMPERATURE") or 0.2)
-    max_tokens = int(payload.get("llm_max_tokens") or os.getenv("REPORT_LLM_MAX_TOKENS") or 900)
-
-    aeo = _fetch_latest(conn, site_id, "aeo")
-    crawl = _fetch_latest(conn, site_id, "crawl")
-    keywords = _fetch_latest(conn, site_id, "keywords")
-
-    if not aeo:
-        raise ValueError("AEO job missing; run 'aeo' before 'report'.")
-    if not crawl:
-        raise ValueError("Crawl job missing; run 'crawl' before 'report'.")
-
-    site_url = ((aeo.get("site") or {}).get("url")) or ((crawl.get("start_url") or "")) or ""
-    site_url = _norm_url(site_url)
-    title = f"SEO • GEO • AEO Audit — {site_url or ''}"
-
-    # AEO sections
-    pages_aeo = aeo.get("pages") or []
-    aeo_scorecards_html = _emit_aeo_scorecards(pages_aeo)
-    aeo_qna_html = _emit_aeo_qna(pages_aeo)
-
-    # SEO analysis
-    crawl_analysis = _analyze_seo_from_crawl(crawl)
-    fixes = crawl_analysis["fixes"]
-    html_patches = _emit_html_patches(crawl_analysis["canonical_patches"], crawl_analysis["og_patches"])
-    dup_titles_html = _emit_duplicate_groups(crawl_analysis["dup_titles"], "titles")
-    dup_descs_html = _emit_duplicate_groups(crawl_analysis["dup_descs"], "meta descriptions")
-    plan_tasks = _build_plan(crawl_analysis, fixes)
-    plan_table_html = _emit_plan_table(plan_tasks)
-
-    # Narrative (LLM or fallback)
-    narrative_blocks: List[str] = []
-    llm_text = None
-    if use_llm:
-        ctx = _build_llm_context(site_url, crawl, crawl_analysis, pages_aeo, keywords)
-        prompt = _compose_llm_prompt_nl(ctx)
-        system = "Je bent een senior SEO/AEO consultant. Wees feitelijk, bondig, en data-gedreven."
-        llm_text = _try_llm_generate(prompt=prompt, system=system, model=model, temperature=temperature, max_tokens=max_tokens)
-
-    if llm_text:
-        narrative_blocks.append(_render_narrative_html("Executive narrative (LLM)", llm_text, "narrative"))
-    else:
-        # deterministic fallback in 3 secties
-        narrative_blocks.append(_render_narrative_html("Executive summary", _compose_exec_summary_fallback(site_url, crawl, crawl_analysis, pages_aeo), "narrative"))
-        narrative_blocks.append(_render_narrative_html("Key actions (7 dagen)", _compose_actions_fallback(crawl_analysis, pages_aeo), "narrative"))
-        narrative_blocks.append(_render_narrative_html("Quarterly outlook", _compose_quarter_fallback(pages_aeo), "narrative"))
-
-    # Assemble HTML body
-    body = []
-    body.append(f"<h1>{_h(title)}</h1>")
-    body.append(f"<small class='mono'>Generated: {_h(_now_utc_iso())}</small>")
-    body.extend(narrative_blocks)
-
-    body.append("<h2>AEO — Answer readiness (scorecards)</h2>")
-    body.append(aeo_scorecards_html)
-    body.append("<h2>AEO — Q&A (snippet-ready, ready-to-paste)</h2>")
-    body.append(aeo_qna_html)
-
-    body.append("<h2>SEO — Concrete text fixes (ready-to-paste)</h2>")
-    body.append(_emit_seo_fixes(fixes))
-
-    body.append(html_patches)
-
-    body.append("<h2>Duplicate groups — titles</h2>")
-    body.append(dup_titles_html)
-    body.append("<h2>Duplicate groups — meta descriptions</h2>")
-    body.append(dup_descs_html)
-
-    body.append("<h2>Implementation plan (priority × impact × effort)</h2>")
-    body.append(plan_table_html)
-
-    body.append(_emit_geo_recs(site_url))
-
-    # Optional keywords sample
-    if keywords and (keywords.get("keywords") or []):
-        kws = [str(x) for x in (keywords.get("keywords") or [])][:10]
-        body.append("<h2>Keywords — sample</h2><p><span class='mono'>" + _h(", ".join(kws)) + "</span></p>")
-
-    html_doc = _html_doc(title, "\n".join(body))
-    html_b64 = base64.b64encode(html_doc.encode("utf-8")).decode("ascii")
-
-    patches_csv = _build_patches_csv(fixes)
-    plan_csv = _build_plan_csv(plan_tasks)
-    patches_b64 = base64.b64encode(patches_csv.encode("utf-8")).decode("ascii")
-    plan_b64 = base64.b64encode(plan_csv.encode("utf-8")).decode("ascii")
-
-    return {
-        "html_base64": html_b64,
-        "patches_csv_base64": patches_b64,
-        "plan_csv_base64": plan_b64
-    }
+@app.get("/report/aeo/faq.md")
+def report_faq_md(url: str = Query(...)):
+    section = aeo_faq_only(url)
+    md = render_aeo_markdown(section)
+    return PlainTextResponse(md, media_type="text/markdown; charset=utf-8")
