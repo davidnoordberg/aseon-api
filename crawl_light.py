@@ -1,11 +1,10 @@
-# crawl_light.py — Robust crawler met volledige FAQ-extractie (DOM + JSON-LD)
+# crawl_light.py — Robust crawler with Webflow FAQ extraction + JSON-LD + DOM pairing
 # Public API: crawl_site(start_url: str, max_pages: int = 40, ua: Optional[str] = None) -> dict
 
 import os
 import re
 import gc
 import json
-import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -66,16 +65,26 @@ def _text_of(node: Tag) -> str:
         bad.decompose()
     return _clean(node.get_text(separator=" "))
 
+def _normalize_punct(s: str) -> str:
+    t = (s or "")
+    repl = {
+        "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
+        "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00A0": " "
+    }
+    for k,v in repl.items():
+        t = t.replace(k, v)
+    return t
+
 def _looks_like_question(text: str) -> bool:
     if not text:
         return False
-    t = text.strip()
+    t = _normalize_punct(text.strip())
     low = t.lower()
     if "?" in t:
         return True
     if any(low.startswith(p) for p in QUESTION_PREFIXES):
         return True
-    if re.match(r"^(q|vraag)\s*[:\-–]\s*\S", low):
+    if re.match(r"^(q|vraag)\s*[:\-–]\s+\S", low):
         return True
     return False
 
@@ -86,10 +95,13 @@ def _is_empty_answer(text: str) -> bool:
 
 def _collect_dom_blocks(soup: BeautifulSoup) -> List[Dict[str, str]]:
     blocks: List[Dict[str,str]] = []
-    TAGS = ["h1","h2","h3","h4","h5","h6","p","li","dt","dd","summary","button","a"]
+    TAGS = ["h1","h2","h3","h4","h5","h6","p","li","dt","dd","summary","button","a","div","span"]
     walker = soup.body or soup
     for el in walker.descendants:
         if isinstance(el, Tag) and el.name in TAGS:
+            # skip invisible utility nodes
+            if el.has_attr("aria-hidden") and str(el["aria-hidden"]).lower() == "true":
+                continue
             txt = _text_of(el)
             if txt:
                 blocks.append({"tag": el.name, "text": txt})
@@ -110,7 +122,7 @@ def _pair_dom_qas(dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
         if not _looks_like_question(qtxt):
             continue
         ans_parts: List[str] = []
-        for j in range(i+1, min(i+30, N)):
+        for j in range(i+1, min(i+40, N)):
             if j in used_idx:
                 continue
             cand = dom_blocks[j].get("text","")
@@ -121,13 +133,13 @@ def _pair_dom_qas(dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
                     continue
                 else:
                     break
-            if sum(len(x) for x in ans_parts)+len(cand) > 1200:
+            if sum(len(x) for x in ans_parts)+len(cand) > 1500:
                 break
             ans_parts.append(cand)
         ans = _clean(" ".join(ans_parts))
         if not _is_empty_answer(ans):
             used_idx.add(i)
-            qas.append({"q": qtxt if qtxt.endswith("?") else (qtxt.rstrip(".! ")+"?"), "a": ans})
+            qas.append({"q": qtxt if qtxt.endswith("?") else (qtxt.rstrip(".! ")+"?"), "a": _normalize_punct(ans)})
     return _dedupe_qas(qas)
 
 def _dl_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
@@ -140,7 +152,7 @@ def _dl_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
                 q = _text_of(dt)
                 a = _text_of(dds[i]) if i < len(dds) else ""
                 if _looks_like_question(q) and not _is_empty_answer(a):
-                    out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+                    out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
     return out
 
 def _details_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
@@ -153,7 +165,7 @@ def _details_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
                 s.decompose()
             a = _text_of(det)
             if _looks_like_question(q) and not _is_empty_answer(a):
-                out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+                out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
     return out
 
 def _aria_accordion_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
@@ -167,7 +179,36 @@ def _aria_accordion_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
             if tgt:
                 a = _text_of(tgt)
         if _looks_like_question(q) and not _is_empty_answer(a):
-            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
+    return out
+
+def _webflow_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
+    out: List[Dict[str,str]] = []
+    # Webflow dropdown/accordion patterns
+    # Pattern A: .w-dropdown > .w-dropdown-toggle (Q) + .w-dropdown-list (A)
+    for dd in soup.select(".w-dropdown"):
+        toggle = dd.select_one(".w-dropdown-toggle")
+        panel = dd.select_one(".w-dropdown-list")
+        q = _text_of(toggle) if toggle else ""
+        a = _text_of(panel) if panel else ""
+        if _looks_like_question(q) and not _is_empty_answer(a):
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
+    # Pattern B: .w-accordion-item > .w-accordion-title (Q) + .w-accordion-content (A)
+    for item in soup.select(".w-accordion-item"):
+        q_el = item.select_one(".w-accordion-title") or item.select_one(".w-accordion-header")
+        a_el = item.select_one(".w-accordion-content") or item.select_one(".w-accordion-pane") or item.select_one(".w-accordion-body")
+        q = _text_of(q_el) if q_el else ""
+        a = _text_of(a_el) if a_el else ""
+        if _looks_like_question(q) and not _is_empty_answer(a):
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
+    # Pattern C: generic .faq-item/.faq-question/.faq-answer
+    for item in soup.select(".faq-item, .faq, .faq_block, .accordion, .accordion-item"):
+        q_el = item.select_one(".faq-question, .question, .q, .accordion-title, .accordion-header, .accordion-button, h3, h4, summary, button")
+        a_el = item.select_one(".faq-answer, .answer, .a, .accordion-content, .accordion-panel, .accordion-body, .w-richtext, p, div")
+        q = _text_of(q_el) if q_el else ""
+        a = _text_of(a_el) if a_el else ""
+        if _looks_like_question(q) and not _is_empty_answer(a):
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
     return out
 
 def _class_based_faq_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
@@ -188,7 +229,7 @@ def _class_based_faq_qas(soup: BeautifulSoup) -> List[Dict[str,str]]:
             pass
         a = _text_of(container)
         if _looks_like_question(q) and not _is_empty_answer(a):
-            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": a})
+            out.append({"q": q if q.endswith("?") else (q.rstrip(".! ")+"?"), "a": _normalize_punct(a)})
     return out
 
 def _dedupe_qas(qas: List[Dict[str,str]]) -> List[Dict[str,str]]:
@@ -199,7 +240,7 @@ def _dedupe_qas(qas: List[Dict[str,str]]) -> List[Dict[str,str]]:
         a = _clean(qa.get("a",""))
         if not q or not a:
             continue
-        key = (q.lower(), a[:160].lower())
+        key = (q.lower(), a[:200].lower())
         if key in seen:
             continue
         seen.add(key)
@@ -210,26 +251,33 @@ def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[Any], List[Any]]:
     raw_blocks: List[Any] = []
     faq_blocks: List[Any] = []
     for sc in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
-        try:
-            txt = sc.string or sc.get_text() or ""
-            txt = txt.strip()
-            if not txt:
-                continue
-            obj = json.loads(txt)
-            raw_blocks.append(obj)
-            def walk(o):
-                if isinstance(o, dict):
-                    t = str(o.get("@type","")).lower()
-                    if t == "faqpage" or "mainEntity" in o or "@graph" in o:
-                        faq_blocks.append(o)
-                    for v in o.values():
-                        walk(v)
-                elif isinstance(o, list):
-                    for v in o:
-                        walk(v)
-            walk(obj)
-        except Exception:
+        txt = (sc.string or sc.get_text() or "").strip()
+        if not txt:
             continue
+        # strip HTML comments if present
+        txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            # relaxed: remove JS-style comments and retry
+            txt_relaxed = re.sub(r"/\*.*?\*/", "", txt, flags=re.S)
+            txt_relaxed = re.sub(r"(^|\s)//.*?$", "", txt_relaxed, flags=re.M)
+            try:
+                obj = json.loads(txt_relaxed)
+            except Exception:
+                continue
+        raw_blocks.append(obj)
+        def walk(o):
+            if isinstance(o, dict):
+                t = str(o.get("@type","")).lower()
+                if t == "faqpage" or "mainEntity" in o or "@graph" in o:
+                    faq_blocks.append(o)
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(obj)
     return raw_blocks, faq_blocks
 
 def _meta(soup: BeautifulSoup, name: str) -> str:
@@ -253,6 +301,7 @@ def _robots_meta(soup: BeautifulSoup) -> Tuple[bool,bool]:
 
 def _extract_faq_visible(soup: BeautifulSoup, dom_blocks: List[Dict[str,str]]) -> List[Dict[str,str]]:
     qas: List[Dict[str,str]] = []
+    qas += _webflow_qas(soup)
     qas += _dl_qas(soup)
     qas += _details_qas(soup)
     qas += _aria_accordion_qas(soup)
@@ -279,7 +328,7 @@ def _extract_links(soup: BeautifulSoup, base: str) -> List[str]:
     return deduped
 
 def _fetch(url: str, ua: Optional[str]) -> Tuple[int, str, str, bool]:
-    headers = {"User-Agent": ua or "AseonBot/0.5 (+https://aseon.ai)"}
+    headers = {"User-Agent": ua or "AseonBot/0.6 (+https://aseon.ai)"}
     resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
     resp.raise_for_status()
     html = resp.text if isinstance(resp.text, str) else ""
@@ -293,7 +342,6 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
     start_url = _norm_url(start_url)
     if not start_url:
         raise ValueError("Invalid start_url")
-    host = urlparse(start_url).netloc.lower()
 
     visited = set()
     queue: List[str] = [start_url]
@@ -313,7 +361,6 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
             continue
 
         visited.add(url)
-
         soup = BeautifulSoup(html or "", "html.parser") if is_html else BeautifulSoup("", "html.parser")
 
         title = _clean(soup.title.get_text()) if soup.title else ""
@@ -350,9 +397,7 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
             "dom_blocks": dom_blocks,
             "faq_visible": faq_visible,
             "faq_jsonld": faq_ld,
-            "metrics": {
-                "has_faq_schema": has_faq_schema
-            },
+            "metrics": {"has_faq_schema": has_faq_schema},
             "meta": {
                 "description": _meta(soup, "description"),
                 "og:title": _meta_prop(soup, "og:title"),
@@ -376,12 +421,7 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
             gc.collect()
 
     title_lengths = [len((p.get("title") or "")) for p in pages]
-    missing_meta_desc = [p for p in pages if not (p.get("meta") or {}).get("description")]
-    missing_h1 = [p for p in pages if not p.get("h1")]
-    canonical_differs = [
-        p for p in pages
-        if p.get("canonical") and _norm_url(p["canonical"]) != p["url"]
-    ]
+    canonical_differs = [p for p in pages if p.get("canonical") and _norm_url(p["canonical"]) != p["url"]]
     summary = {
         "page_count": len(pages),
         "avg_title_len": (sum(title_lengths)/len(title_lengths)) if title_lengths else 0,
@@ -389,10 +429,6 @@ def crawl_site(start_url: str, max_pages: int = MAX_PAGES, ua: Optional[str] = N
         "has_faq_schema_count": sum(1 for p in pages if bool((p.get("metrics") or {}).get("has_faq_schema"))),
     }
     quick_wins = []
-    if missing_meta_desc:
-        quick_wins.append({"type": "missing_meta_description"})
-    if missing_h1:
-        quick_wins.append({"type": "missing_h1"})
     if canonical_differs:
         quick_wins.append({"type": "canonical_differs"})
 
