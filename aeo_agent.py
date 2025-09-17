@@ -1,14 +1,12 @@
-# aeo_agent.py
 import os
 import re
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlsplit, urlunsplit
 from html import unescape as html_unescape
 from psycopg.rows import dict_row
 
-MAX_ANS_WORDS = 80
-MIN_QA_ON_FAQ_PAGE = 3
+OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 def _fetch_latest_job(conn, site_id: str, jtype: str):
     with conn.cursor(row_factory=dict_row) as cur:
@@ -38,90 +36,22 @@ def _fetch_site_meta(conn, site_id: str) -> Dict[str, Any]:
         )
         return cur.fetchone() or {}
 
-def _json_obj(x: Any) -> Dict[str, Any]:
-    if x is None:
-        return {}
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, str):
-        try:
-            v = json.loads(x)
-            return v if isinstance(v, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-def _json_arr(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        try:
-            v = json.loads(x)
-            return v if isinstance(v, list) else []
-        except Exception:
-            return []
-    return []
-
 def _norm_url(u: str) -> str:
     if not u:
         return ""
     p = urlsplit(u)
     scheme = p.scheme or "https"
-    host = (p.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = p.hostname or ""
     path = (p.path or "/")
+    if not path:
+        path = "/"
     if not path.startswith("/"):
         path = "/" + path
     if path != "/" and path.endswith("/"):
         path = path[:-1]
     return urlunsplit((scheme, host, path, "", ""))
 
-def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    bucket: Dict[str, Dict[str, Any]] = {}
-    def _score(pp: Dict[str, Any]) -> Tuple[int, int]:
-        return (1 if (pp.get("status") == 200) else 0, int(pp.get("word_count") or 0))
-    for p in pages or []:
-        if not isinstance(p, dict):
-            continue
-        u = _norm_url(p.get("final_url") or p.get("url") or "")
-        if not u:
-            continue
-        cur = bucket.get(u)
-        if (cur is None) or (_score(p) > _score(cur)):
-            bucket[u] = p
-    return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
-
-_NL_HINTS = [" de ", " het ", " een ", " en ", " voor ", " met ", " jouw ", " je ", " wij ", " onze "]
-_EN_HINTS = [" the ", " and ", " for ", " with ", " your ", " we ", " our ", " to ", " of "]
-
-def _detect_lang(texts: List[str], site_lang: Optional[str]) -> str:
-    site = (site_lang or "").lower()
-    default = "nl" if site.startswith("nl") else "en"
-    sample = (" ".join([t for t in texts if t])[:800] + " ").lower()
-    nl_score = sum(1 for w in _NL_HINTS if w in sample)
-    en_score = sum(1 for w in _EN_HINTS if w in sample)
-    if nl_score > en_score:
-        return "nl"
-    if en_score > nl_score:
-        return "en"
-    return default
-
-def _classify_page_type(url: str, title: str, h1: str) -> str:
-    u = url.lower()
-    path = urlsplit(u).path or "/"
-    t = (title or "").lower()
-    h = (h1 or "").lower()
-    def has(*keys: str) -> bool:
-        return any(k in path or k in t or k in h for k in keys)
-    if has("/faq", " faq", "/veelgestelde-vragen"):
-        return "faq"
-    return "other"
-
 _TAG_RE = re.compile(r"<[^>]+>")
-
 def _strip_html(s: str) -> str:
     if not s:
         return ""
@@ -130,27 +60,70 @@ def _strip_html(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _trim_words(s: str, limit: int = MAX_ANS_WORDS) -> Tuple[str, bool]:
+def _json_obj(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str) and x.strip():
+        try:
+            v = json.loads(x)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+def _json_arr(x: Any) -> List[Any]:
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str) and x.strip():
+        try:
+            v = json.loads(x)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+    return []
+
+def _detect_lang(texts: List[str], site_lang: Optional[str]) -> str:
+    site = (site_lang or "").lower()
+    default = "nl" if site.startswith("nl") else "en"
+    sample = (" ".join([t for t in texts if t])[:800] + " ").lower()
+    nl_score = sum(1 for w in [" de "," het "," een "," en "," voor "," met "," jouw "," je "," wij "," onze "] if w in sample)
+    en_score = sum(1 for w in [" the "," and "," for "," with "," your "," we "," our "," to "," of "] if w in sample)
+    if nl_score > en_score:
+        return "nl"
+    if en_score > nl_score:
+        return "en"
+    return default
+
+QUESTION_PREFIXES = (
+    "what ","how ","why ","when ","can ","does ","do ","is ","are ","should ","will ","where ","who ",
+    "wat ","hoe ","waarom ","wanneer ","kan ","doet ","doen ","is ","zijn ","moet ","zal ","waar ","wie "
+)
+
+def _looks_like_question(s: str) -> bool:
+    t = (s or "").strip().lower()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    return any(t.startswith(p) for p in QUESTION_PREFIXES) and len(t.split()) >= 2
+
+def _normalize_question(q: str) -> str:
+    t = (q or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    if t and not t.endswith("?"):
+        if any(t.lower().startswith(p) for p in QUESTION_PREFIXES):
+            t = t.rstrip(".! ") + "?"
+    return t
+
+def _trim_words(s: str, limit: int = 80) -> Tuple[str, bool]:
     words = (s or "").split()
     if len(words) <= limit:
         return " ".join(words), False
     return " ".join(words[:limit]) + "…", True
 
-def _normalize_question(q: str) -> str:
-    q = _strip_html(q)
-    q = re.sub(r"\s+", " ", q).strip()
-    if q and not q.endswith("?"):
-        q = q + "?"
-    return q
-
-def _qas_from_jsonld_any(faq_jsonld: Any) -> List[Dict[str, str]]:
-    obj = faq_jsonld
-    if isinstance(faq_jsonld, str):
-        try:
-            obj = json.loads(faq_jsonld)
-        except Exception:
-            obj = {}
+def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
+
     def _handle_entity(entity):
         if not isinstance(entity, dict):
             return
@@ -161,34 +134,39 @@ def _qas_from_jsonld_any(faq_jsonld: Any) -> List[Dict[str, str]]:
             ans = ans[0]
         if isinstance(ans, dict):
             a_text = ans.get("text") or ans.get("answer") or ""
-        q = _normalize_question(q)
+        q = _strip_html(q)
         a_text = _strip_html(a_text)
         if q and a_text:
-            out.append({"q": q, "a": a_text})
-    def _handle_root(obj2):
-        if not isinstance(obj2, dict):
+            out.append({"q": _normalize_question(q), "a": a_text})
+
+    def _handle_root(obj):
+        if not isinstance(obj, dict):
             return
-        if "@graph" in obj2 and isinstance(obj2["@graph"], list):
-            for node in obj2["@graph"]:
-                if isinstance(node, dict) and str(node.get("@type", "")).lower() in ("faqpage", "question", "faq"):
+        if "@graph" in obj and isinstance(obj["@graph"], list):
+            for node in obj["@graph"]:
+                if isinstance(node, dict) and str(node.get("@type", "")).lower() == "faqpage":
                     main = node.get("mainEntity") or node.get("main_entity") or []
                     if isinstance(main, list):
                         for ent in main:
                             _handle_entity(ent)
                     else:
                         _handle_entity(main)
-        main = obj2.get("mainEntity") or obj2.get("main_entity") or []
+        main = obj.get("mainEntity") or obj.get("main_entity") or []
         if isinstance(main, list):
             for ent in main:
                 _handle_entity(ent)
         else:
             _handle_entity(main)
-    if isinstance(obj, list):
-        for item in obj:
+
+    if isinstance(faq_jsonld, list):
+        for item in faq_jsonld:
             if isinstance(item, dict):
-                _handle_root(item)
-    elif isinstance(obj, dict):
-        _handle_root(obj)
+                t = str(item.get("@type", "")).lower()
+                if t == "faqpage" or "mainEntity" in item or "@graph" in item:
+                    _handle_root(item)
+    elif isinstance(faq_jsonld, dict):
+        _handle_root(faq_jsonld)
+
     seen = set()
     deduped: List[Dict[str, str]] = []
     for qa in out:
@@ -199,60 +177,34 @@ def _qas_from_jsonld_any(faq_jsonld: Any) -> List[Dict[str, str]]:
         deduped.append(qa)
     return deduped
 
-def _collect_jsonld_qas(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    primary = page.get("faq_jsonld")
-    if primary:
-        out.extend(_qas_from_jsonld_any(primary))
-    for key in ("jsonld", "json_ld", "ld_json"):
-        arr = page.get(key)
-        if arr:
-            qas = _qas_from_jsonld_any(arr)
-            if qas:
-                out.extend(qas)
-    # dedupe
-    seen = set()
-    deduped: List[Dict[str, str]] = []
-    for qa in out:
-        k = qa["q"].strip().lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        deduped.append(qa)
-    return deduped
-
 def _qas_from_visible(page: Dict[str, Any]) -> List[Dict[str, str]]:
-    qas: List[Dict[str, str]] = []
-    paras: List[str] = page.get("paragraphs") or []
-    heads = (page.get("h3") or []) + (page.get("h2") or [])
-    heads_q = [h for h in heads if isinstance(h, str) and h.strip().endswith("?")]
-    for qh in heads_q:
-        q = _normalize_question(qh)
-        a = ""
-        for cand in paras:
-            t = _strip_html(cand)
-            if not t or t.endswith("?") or len(t.split()) < 6:
-                continue
-            a = t
-            break
-        if a:
-            qas.append({"q": q, "a": a})
-    # fallback: detect Q? in paragraphs and next paragraph as A
-    for i, p in enumerate(paras):
-        q = _strip_html(p)
-        if not q or len(q) > 200 or not q.endswith("?"):
+    blocks: List[str] = []
+    for key in ("h2","h3","dt","summary","buttons","paragraphs","li"):
+        arr = page.get(key) or []
+        if isinstance(arr, list):
+            blocks.extend([_strip_html(x) for x in arr if isinstance(x, str)])
+    blocks = [b for b in blocks if b]
+    used = set()
+    qas: List[Dict[str,str]] = []
+    for i, blk in enumerate(blocks):
+        if not _looks_like_question(blk):
             continue
         a = ""
-        for j in range(i + 1, min(i + 4, len(paras))):
-            cand = _strip_html(paras[j])
-            if not cand or cand.endswith("?") or len(cand.split()) < 6:
+        for j in range(i+1, min(i+6, len(blocks))):
+            if j in used:
+                continue
+            cand = blocks[j]
+            if _looks_like_question(cand):
+                break
+            if len(cand.split()) < 6:
                 continue
             a = cand
+            used.add(j)
             break
         if a:
-            qas.append({"q": _normalize_question(q), "a": a})
+            qas.append({"q": _normalize_question(blk), "a": a})
     seen = set()
-    out: List[Dict[str, str]] = []
+    out = []
     for qa in qas:
         k = (qa["q"].strip().lower(), qa["a"][:80].strip().lower())
         if k in seen:
@@ -261,347 +213,245 @@ def _qas_from_visible(page: Dict[str, Any]) -> List[Dict[str, str]]:
         out.append(qa)
     return out
 
-def _review_and_improve_qas(qas: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], Dict[str, int]]:
-    reviews: List[Dict[str, Any]] = []
-    improved: List[Dict[str, str]] = []
-    seen_q = set()
-    seen_a = set()
-    dup_q = 0
-    dup_a = 0
-    over = 0
-    ok = 0
-    for qa in qas:
-        if not isinstance(qa, dict):
-            continue
-        q = _normalize_question(qa.get("q") or "")
-        a = _strip_html(qa.get("a") or "")
-        if not q or not a:
-            continue
-        status = "ok"
-        issues = []
-        kq = q.strip().lower()
-        if kq in seen_q:
-            dup_q += 1
-            status = "improve"
-            issues.append("Duplicate question")
-        else:
-            seen_q.add(kq)
-        trimmed, was_trimmed = _trim_words(a, MAX_ANS_WORDS)
-        if was_trimmed:
-            over += 1
-            status = "improve"
-            issues.append(f"Answer >{MAX_ANS_WORDS} words")
-        ka = trimmed.strip().lower()
-        if ka in seen_a:
-            dup_a += 1
-            status = "improve"
-            issues.append("Duplicate answer text")
-        else:
-            seen_a.add(ka)
-        reviews.append({
-            "status": status,
-            "issues": issues or ["OK"],
-            "current_q": q,
-            "current_a": a,
-            "suggested_q": q,
-            "suggested_a": trimmed
-        })
-        improved.append({"q": q, "a": trimmed})
-        if status == "ok":
-            ok += 1
-    metrics = {
-        "qas_total": len(qas),
-        "qas_unique": len(seen_q),
-        "answers_over_80w": over,
-        "answers_leq_80w": max(0, len(improved) - over),
-        "dup_questions": dup_q,
-        "dup_answers": dup_a,
-        "qas_ok": ok
-    }
-    return improved, reviews, metrics
-
-def _faq_html_block(qas: List[Dict[str, str]], lang: str) -> str:
-    label = "Veelgestelde vragen" if lang == "nl" else "Frequently asked questions"
-    lis = []
-    for qa in qas:
-        q = _normalize_question(qa["q"])
-        a = _strip_html(qa["a"])
-        lis.append(
-            f"""<li class="faq-item">
-  <h3 class="faq-q">{q}</h3>
-  <p class="faq-a">{a}</p>
-</li>"""
-        )
-    return f"""<section id="faq" aria-labelledby="faq-title">
-  <h2 id="faq-title">{label}</h2>
-  <ul class="faq-list">
-    {''.join(lis)}
-  </ul>
-</section>"""
-
-def _faq_jsonld(qas: List[Dict[str, str]]) -> Dict[str, Any]:
-    items = []
-    for qa in qas:
-        items.append(
-            {
-                "@type": "Question",
-                "name": _normalize_question(qa["q"]),
-                "acceptedAnswer": {"@type": "Answer", "text": _strip_html(qa["a"])},
-            }
-        )
-    return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": items}
-
-def _score_page(ptype: str, has_faq_schema: bool, qas_n: int, answers_leq_80w: int, dup_q: int, dup_a: int, parity_ok: Optional[bool], had_schema_but_no_qas: bool) -> Tuple[int, List[str]]:
-    issues: List[str] = []
-    if ptype == "faq":
-        score = 40
-        if qas_n >= MIN_QA_ON_FAQ_PAGE:
-            score += 20
-        else:
-            issues.append("Too few Q&A (min 3).")
-        if has_faq_schema:
-            score += 20
-        else:
-            issues.append("No FAQPage JSON-LD.")
-        if qas_n > 0:
-            frac = answers_leq_80w / max(1, qas_n)
-            score += int(15 * frac)
-            if answers_leq_80w < qas_n:
-                issues.append("Overlong answers present.")
-        elif had_schema_but_no_qas:
-            issues.append("FAQ schema present but Q&A could not be parsed.")
-        else:
-            issues.append("No Q&A detected.")
-        if dup_q > 0:
-            issues.append("Duplicate questions present.")
-        if dup_a > 0:
-            issues.append("Duplicate answers present.")
-        if parity_ok is False:
-            issues.append("Schema/text parity mismatch.")
-        score = max(0, min(100, score))
-    else:
-        score = 15 if qas_n == 0 else 30
-        if qas_n == 0:
-            issues.append("No Q&A section on page.")
-    return score, issues
-
-def _parity_ok(visible: List[Dict[str, str]], jsonld_qas: List[Dict[str, str]]) -> Optional[bool]:
-    if not jsonld_qas:
-        return None
-    if not visible:
-        return False
-    vis_qs = {qa["q"].strip().lower() for qa in visible if isinstance(qa, dict) and qa.get("q")}
-    ld_qs = {qa["q"].strip().lower() for qa in jsonld_qas if isinstance(qa, dict) and qa.get("q")}
-    inter = vis_qs.intersection(ld_qs)
-    ratio = len(inter) / max(1, len(vis_qs))
-    return ratio >= 0.6
-
 def _index_faq_job(faq_job_raw: Any) -> Tuple[Dict[str, List[Dict[str, str]]], Dict[str, bool]]:
     by_url: Dict[str, List[Dict[str, str]]] = {}
     schema_flags: Dict[str, bool] = {}
     job = _json_obj(faq_job_raw)
-    if not job:
-        return by_url, schema_flags
-    faqs_arr = job.get("faqs")
-    if isinstance(faqs_arr, str):
-        faqs_arr = _json_arr(faqs_arr)
-    if isinstance(faqs_arr, list):
-        for item in faqs_arr:
-            if not isinstance(item, dict):
+    arr = job.get("faqs")
+    if isinstance(arr, str):
+        arr = _json_arr(arr)
+    if isinstance(arr, list):
+        for it in arr:
+            if not isinstance(it, dict):
                 continue
-            src = item.get("url") or item.get("page") or item.get("source") or ""
-            u = _norm_url(src)
+            u = _norm_url(it.get("url") or it.get("page") or it.get("source") or "")
             if not u:
                 continue
-            q = _normalize_question(item.get("q") or item.get("question") or "")
-            a = _strip_html(item.get("a") or item.get("answer") or "")
+            q = it.get("q") or it.get("question")
+            a = it.get("a") or it.get("answer")
             if q and a:
-                by_url.setdefault(u, []).append({"q": q, "a": a})
-            if isinstance(item.get("has_faq_schema"), bool):
-                schema_flags[u] = schema_flags.get(u, False) or bool(item["has_faq_schema"])
-    pages_like = job.get("pages")
-    if isinstance(pages_like, str):
-        pages_like = _json_arr(pages_like)
-    if isinstance(pages_like, list):
-        for page in pages_like:
-            if not isinstance(page, dict):
-                continue
-            u = _norm_url(page.get("url") or page.get("final_url") or "")
-            if not u:
-                continue
-            qas = page.get("qas") or []
-            if isinstance(qas, str):
-                qas = _json_arr(qas)
-            for qa in qas or []:
-                if not isinstance(qa, dict):
-                    continue
-                q = _normalize_question(qa.get("q") or qa.get("question") or "")
-                a = _strip_html(qa.get("a") or qa.get("answer") or "")
-                if q and a:
-                    by_url.setdefault(u, []).append({"q": q, "a": a})
-            types = [str(t).lower() for t in (page.get("jsonld_types") or [])]
-            if any(t == "faqpage" for t in types):
-                schema_flags[u] = True
+                by_url.setdefault(u, []).append({"q": _normalize_question(q), "a": _strip_html(a)})
+            if isinstance(it.get("has_faq_schema"), bool):
+                schema_flags[u] = schema_flags.get(u, False) or bool(it["has_faq_schema"])
+            qas_list = it.get("qas")
+            if isinstance(qas_list, list):
+                for qa in qas_list:
+                    if not isinstance(qa, dict):
+                        continue
+                    q2 = qa.get("q") or qa.get("question")
+                    a2 = qa.get("a") or qa.get("answer")
+                    if q2 and a2:
+                        by_url.setdefault(u, []).append({"q": _normalize_question(q2), "a": _strip_html(a2)})
     return by_url, schema_flags
+
+def _is_likely_faq_url(u: str) -> bool:
+    p = urlsplit(u)
+    path = (p.path or "").lower()
+    frag = (p.fragment or "").lower()
+    joined = path + ("#" + frag if frag else "")
+    for hint in ("/faq", "/faqs", "/veelgestelde-vragen", "#faq"):
+        if hint in joined:
+            return True
+    return False
+
+def _infer_ptype(url: str, page: Dict[str, Any]) -> str:
+    given = (page.get("type") or "").lower().strip()
+    if given == "faq":
+        return "faq"
+    if page.get("faq_jsonld"):
+        return "faq"
+    metrics = page.get("metrics") or {}
+    if bool(metrics.get("has_faq_schema")):
+        return "faq"
+    if _is_likely_faq_url(url):
+        return "faq"
+    return "other"
+
+def _score_and_issues(ptype: str, counts: Dict[str, Any], has_faq_schema: bool, dup_q: int, dup_a: int, parity_ok: bool) -> Tuple[int, List[str]]:
+    issues: List[str] = []
+    score = 100
+    qas = int(counts.get("merged", 0))
+    gt80 = int(counts.get("answers_gt_80w", 0))
+    if qas == 0:
+        issues.append("No Q&A section on page.")
+        score -= 85
+    if ptype == "faq" and qas > 0 and qas < 3:
+        issues.append("Too few Q&A (min 3).")
+        score -= 20
+    if qas > 0 and not has_faq_schema:
+        issues.append("No FAQPage JSON-LD.")
+        score -= 15
+    if gt80 > 0:
+        issues.append("Overlong answers (>80 words).")
+        score -= min(20, gt80 * 5)
+    if dup_q > 0:
+        issues.append("Duplicate questions across sources.")
+        score -= min(15, dup_q * 3)
+    if dup_a > 0:
+        issues.append("Duplicate answers across sources.")
+        score -= min(10, dup_a * 2)
+    if qas > 0 and not parity_ok:
+        issues.append("Schema/text parity mismatch.")
+        score -= 10
+    score = max(0, min(100, score))
+    return score, issues
+
+def _merge_qas(q_jsonld: List[Dict[str, str]], q_faqjob: List[Dict[str, str]], q_visible: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Dict[str, int], int, int]:
+    src_tagged: List[Tuple[str, Dict[str,str]]] = []
+    for qa in q_jsonld:
+        src_tagged.append(("jsonld", qa))
+    for qa in q_faqjob:
+        src_tagged.append(("faq_job", qa))
+    for qa in q_visible:
+        src_tagged.append(("visible", qa))
+    src_counts = {"jsonld": len(q_jsonld), "faq_job": len(q_faqjob), "visible": len(q_visible)}
+    seen_q = {}
+    seen_a = {}
+    dup_q = 0
+    dup_a = 0
+    merged: List[Dict[str, str]] = []
+    for src, qa in src_tagged:
+        q = (qa.get("q") or "").strip()
+        a = _strip_html(qa.get("a") or "")
+        if not q or not a:
+            continue
+        qk = q.lower()
+        ak = a[:160].strip().lower()
+        if qk in seen_q:
+            dup_q += 1
+            continue
+        if ak in seen_a:
+            dup_a += 1
+            continue
+        seen_q[qk] = True
+        seen_a[ak] = True
+        merged.append({"q": q, "a": a})
+    return merged, src_counts, dup_q, dup_a
+
+def _answers_count(qa_list: List[Dict[str, str]]) -> Tuple[int, int]:
+    gt = 0
+    le = 0
+    for qa in qa_list:
+        w = len((qa.get("a") or "").split())
+        if w > 80:
+            gt += 1
+        else:
+            le += 1
+    return gt, le
+
+def _limit_qas(qas: List[Dict[str, str]], limit: Optional[int]) -> List[Dict[str, str]]:
+    if not limit or limit <= 0:
+        return qas
+    return qas[: int(limit)]
 
 def generate_aeo(conn, job):
     site_id = job["site_id"]
+    payload = job.get("payload") or {}
+    max_pages = int(payload.get("max_pages") or 30)
+    qas_per_page = int(payload.get("qas_per_page") or 20)
     site_meta = _fetch_site_meta(conn, site_id)
-    crawl_raw = _fetch_latest_job(conn, site_id, "crawl")
-    faq_job_raw = _fetch_latest_job(conn, site_id, "faq")
+    crawl = _fetch_latest_job(conn, site_id, "crawl")
+    faq_job = _fetch_latest_job(conn, site_id, "faq")
+    if not crawl:
+        return {"site": site_meta, "pages": []}
 
-    crawl = _json_obj(crawl_raw)
-    pages_in = crawl.get("pages")
-    if isinstance(pages_in, str):
-        pages_in = _json_arr(pages_in)
-    if not isinstance(pages_in, list):
-        pages_in = []
-    pages_in = [p for p in pages_in if isinstance(p, dict)]
-    pages = _unique_pages(pages_in)
+    pages_in = crawl.get("pages") or []
+    pages: List[Dict[str, Any]] = []
 
-    faq_index, faq_schema_flags = _index_faq_job(faq_job_raw)
+    faq_by_url, faq_schema_flags = _index_faq_job(faq_job)
 
-    pages_out: List[Dict[str, Any]] = []
-    for p in pages:
+    for p in pages_in:
         url = _norm_url(p.get("final_url") or p.get("url") or "")
-        title = (p.get("title") or "").strip()
-        h1 = (p.get("h1") or "").strip()
-        page_lang = _detect_lang([title, h1] + (p.get("paragraphs") or []), site_meta.get("language"))
-        ptype = _classify_page_type(url, title, h1)
-        jsonld_types = [str(t).lower() for t in (p.get("jsonld_types") or [])]
-        has_faq_schema_crawl = any(t == "faqpage" for t in jsonld_types)
+        if not url:
+            continue
+        pages.append({**p, "url": url})
 
-        qas_visible = _qas_from_visible(p)
-        qas_jsonld = _collect_jsonld_qas(p)
-        qas_from_faqjob = faq_index.get(url, [])
+    seen_urls = set()
+    unique_pages: List[Dict[str, Any]] = []
+    for p in pages:
+        u = p["url"]
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        unique_pages.append(p)
 
-        merged_map: Dict[str, Dict[str, str]] = {}
-        src_counts = {"faq_job": 0, "jsonld": 0, "visible": 0}
+    unique_pages = unique_pages[:max_pages]
 
-        for qa in (qas_from_faqjob or []):
-            if not isinstance(qa, dict):
-                continue
-            key = _normalize_question(qa.get("q") or "").strip().lower()
-            if key and key not in merged_map:
-                merged_map[key] = {"q": _normalize_question(qa.get("q") or ""), "a": _strip_html(qa.get("a") or "")}
-                src_counts["faq_job"] += 1
+    out_pages: List[Dict[str, Any]] = []
+    for p in unique_pages:
+        url = p["url"]
+        lang = p.get("lang") or _detect_lang([(p.get("title") or ""), (p.get("h1") or "")] + (p.get("paragraphs") or []), site_meta.get("language"))
+        ptype = _infer_ptype(url, p)
 
-        if not merged_map:
-            for qa in (qas_jsonld or []):
-                if not isinstance(qa, dict):
-                    continue
-                key = _normalize_question(qa.get("q") or "").strip().lower()
-                if key and key not in merged_map:
-                    merged_map[key] = {"q": _normalize_question(qa.get("q") or ""), "a": _strip_html(qa.get("a") or "")}
-                    src_counts["jsonld"] += 1
+        faq_jsonld_raw = p.get("faq_jsonld")
+        if isinstance(faq_jsonld_raw, str):
+            try:
+                faq_jsonld = json.loads(faq_jsonld_raw)
+            except Exception:
+                faq_jsonld = {}
+        else:
+            faq_jsonld = faq_jsonld_raw or {}
 
-        if not merged_map:
-            for qa in (qas_visible or []):
-                if not isinstance(qa, dict):
-                    continue
-                key = _normalize_question(qa.get("q") or "").strip().lower()
-                if key and key not in merged_map:
-                    merged_map[key] = {"q": _normalize_question(qa.get("q") or ""), "a": _strip_html(qa.get("a") or "")}
-                    src_counts["visible"] += 1
+        q_jsonld = _qas_from_jsonld(faq_jsonld)
+        q_faqjob = faq_by_url.get(url, [])
+        q_visible = _qas_from_visible(p)
 
-        merged_qas = list(merged_map.values())
-        improved_qas, reviews, qa_metrics = _review_and_improve_qas(merged_qas)
+        merged, src_counts, dup_q, dup_a = _merge_qas(q_jsonld, q_faqjob, q_visible)
+        gt80, le80 = _answers_count(merged)
+        has_faq_schema = False
+        types = [str(t).lower() for t in (p.get("jsonld_types") or [])]
+        if "faqpage" in types:
+            has_faq_schema = True
+        if faq_jsonld:
+            has_faq_schema = True
+        if url in faq_schema_flags and faq_schema_flags[url]:
+            has_faq_schema = True
 
-        has_faq_schema_any = bool(has_faq_schema_crawl or faq_schema_flags.get(url, False) or bool(qas_jsonld))
-        parity = _parity_ok(qas_visible, qas_jsonld) if qas_jsonld else (None if not qas_visible else False)
-        had_schema_but_no_qas = bool(has_faq_schema_any and len(improved_qas) == 0)
+        parity_ok = True
+        if (src_counts["visible"] > 0 and src_counts["jsonld"] == 0) or (src_counts["jsonld"] > 0 and src_counts["visible"] == 0):
+            parity_ok = False
 
-        score, issues = _score_page(
-            ptype=ptype,
-            has_faq_schema=has_faq_schema_any,
-            qas_n=len(improved_qas),
-            answers_leq_80w=qa_metrics.get("answers_leq_80w", 0),
-            dup_q=qa_metrics.get("dup_questions", 0),
-            dup_a=qa_metrics.get("dup_answers", 0),
-            parity_ok=parity,
-            had_schema_but_no_qas=had_schema_but_no_qas,
-        )
+        counts = {
+            "merged": len(merged),
+            "answers_gt_80w": gt80,
+            "answers_leq_80w": le80
+        }
+        score, issues = _score_and_issues(ptype, counts, has_faq_schema, dup_q, dup_a, parity_ok)
 
-        content_patches: List[Dict[str, Any]] = []
-        qas_for_output = []
-        faq_ld_obj: Dict[str, Any] = {}
+        limited_qas = _limit_qas(merged, qas_per_page)
+        qas_trimmed: List[Dict[str, str]] = []
+        for qa in limited_qas:
+            a_trim, _ = _trim_words(qa["a"], 80)
+            qas_trimmed.append({"q": qa["q"], "a": a_trim})
 
-        if ptype == "faq":
-            qas_for_output = improved_qas
-            if improved_qas:
-                html_block = _faq_html_block(improved_qas, page_lang)
-                faq_ld_obj = _faq_jsonld(improved_qas)
-                content_patches.append({
-                    "url": url,
-                    "field": "faq_html_block",
-                    "category": "body",
-                    "problem": "Improve/align FAQ block (≤80w; dedupe; parity)",
-                    "current": "(existing or partial FAQ)",
-                    "proposed": "Replace or align with cleaned FAQ Q&A.",
-                    "html_patch": html_block,
-                    "severity": 2,
-                    "impact": 5,
-                    "effort": 2,
-                    "priority": 6.0,
-                    "patchable": True,
-                })
-                content_patches.append({
-                    "url": url,
-                    "field": "faq_jsonld",
-                    "category": "head",
-                    "problem": "Add/refresh FAQPage JSON-LD to mirror visible FAQ.",
-                    "current": "(present or missing)",
-                    "proposed": "Inject <script type='application/ld+json'>…</script> matching on-page Q&A.",
-                    "html_patch": "<script type=\"application/ld+json\">" + json.dumps(faq_ld_obj, ensure_ascii=False) + "</script>",
-                    "severity": 2,
-                    "impact": 4,
-                    "effort": 1,
-                    "priority": 6.0,
-                    "patchable": True,
-                })
+        metrics = {
+            "qas_detected": len(merged),
+            "answers_gt_80w": gt80,
+            "answers_leq_80w": le80,
+            "has_faq_schema_detected": bool(has_faq_schema),
+            "src_counts": src_counts,
+            "dup_questions": dup_q,
+            "dup_answers": dup_a,
+            "parity_ok": parity_ok
+        }
 
-            for r in reviews:
-                if r.get("status") == "improve":
-                    html_patch = f"<h3>{r['suggested_q']}</h3>\n<p>{r['suggested_a']}</p>"
-                    content_patches.append({
-                        "url": url,
-                        "field": "faq_item",
-                        "category": "body",
-                        "problem": "; ".join(r.get("issues", [])) or "Improve FAQ item",
-                        "current": f"Q: {r['current_q']}\nA: {r['current_a']}",
-                        "proposed": f"Q: {r['suggested_q']}\nA: {r['suggested_a']}",
-                        "html_patch": html_patch,
-                        "severity": 1,
-                        "impact": 4,
-                        "effort": 1,
-                        "priority": 5.0,
-                        "patchable": True,
-                    })
+        out_pages.append({
+            "url": url,
+            "lang": lang,
+            "type": ptype,
+            "score": score,
+            "issues": issues,
+            "metrics": metrics,
+            "qas": qas_trimmed,
+            "faq_jsonld": faq_jsonld if faq_jsonld else None
+        })
 
-        pages_out.append(
-            {
-                "url": url,
-                "lang": page_lang,
-                "type": ptype,
-                "qas": qas_for_output,
-                "qas_review": reviews if ptype == "faq" else [],
-                "faq_jsonld": faq_ld_obj if ptype == "faq" else {},
-                "content_patches": content_patches,
-                "score": score,
-                "issues": issues if issues else ["OK"],
-                "metrics": {
-                    "qas": len(improved_qas),
-                    "has_faq_schema": 1 if has_faq_schema_any else 0,
-                    "answers_leq_80w": qa_metrics.get("answers_leq_80w", 0),
-                    "answers_gt_80w": qa_metrics.get("answers_over_80w", 0),
-                    "dup_questions": qa_metrics.get("dup_questions", 0),
-                    "dup_answers": qa_metrics.get("dup_answers", 0),
-                    "qas_detected": len(improved_qas),
-                    "has_faq_schema_detected": True if has_faq_schema_any else False,
-                    "parity_ok": parity if parity is not None else "",
-                    "src_counts": src_counts,
-                },
-            }
-        )
-
-    return {"pages": pages_out}
+    return {
+        "site": {
+            "url": site_meta.get("url"),
+            "language": site_meta.get("language"),
+            "country": site_meta.get("country"),
+            "account_name": site_meta.get("account_name"),
+        },
+        "pages": out_pages
+    }
