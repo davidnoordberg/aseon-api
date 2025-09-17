@@ -136,6 +136,7 @@ def _clean_answer(a: str) -> str:
     a0 = re.sub(r'\s+', ' ', a0).strip()
     return a0
 
+# -------- JSON-LD -> Q/A --------
 def _qas_from_jsonld(faq_jsonld_any: Any) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
 
@@ -186,8 +187,10 @@ def _qas_from_jsonld(faq_jsonld_any: Any) -> List[Dict[str, str]]:
         deduped.append(qa)
     return deduped
 
+# -------- Zichtbaar -> Q/A (DOM-volgorde eerst) --------
 def _extract_visible_from_page(p: Dict[str, Any]) -> List[Dict[str, str]]:
-    if isinstance(p.get("faq_visible"), list):
+    # 0) Als de crawler al Q/A-paren levert (faq_visible), gebruik die eerst.
+    if isinstance(p.get("faq_visible"), list) and p["faq_visible"]:
         out = []
         for item in p["faq_visible"]:
             if not isinstance(item, dict):
@@ -196,21 +199,37 @@ def _extract_visible_from_page(p: Dict[str, Any]) -> List[Dict[str, str]]:
             a = _clean_answer(item.get("a") or "")
             if q and a:
                 out.append({"q": _normalize_question(q), "a": a, "source": "visible"})
-        return out
+        if out:
+            return out
 
-    blocks: List[str] = []
-    for key in ("h2","h3","dt","summary","buttons","paragraphs","li"):
-        arr = p.get(key) or []
-        if isinstance(arr, list):
-            blocks.extend([_strip_html(x) for x in arr if isinstance(x, str)])
-    blocks = [b for b in blocks if b]
+    # 1) DOM-volgorde gebruiken als er dom_blocks is
+    dom = p.get("dom_blocks")
+    if isinstance(dom, list) and dom:
+        blocks = []
+        for b in dom:
+            # zowel {tag,text} als plain tekst ondersteunen
+            if isinstance(b, dict):
+                txt = _strip_html(b.get("text") or "")
+            else:
+                txt = _strip_html(str(b))
+            if txt:
+                blocks.append(txt)
+    else:
+        # 2) Fallback: verzamel losse lijsten (geen volgorde-garantie)
+        blocks = []
+        for key in ("h2","h3","dt","dd","summary","buttons","paragraphs","li"):
+            arr = p.get(key) or []
+            if isinstance(arr, list):
+                blocks.extend([_strip_html(x) for x in arr if isinstance(x, str)])
+        blocks = [b for b in blocks if b]
+
     used = set()
     qas: List[Dict[str,str]] = []
     for i, blk in enumerate(blocks):
         if not _looks_like_question(blk):
             continue
         a = ""
-        for j in range(i+1, min(i+6, len(blocks))):
+        for j in range(i+1, min(i+10, len(blocks))):
             if j in used:
                 continue
             cand = blocks[j]
@@ -226,13 +245,14 @@ def _extract_visible_from_page(p: Dict[str, Any]) -> List[Dict[str, str]]:
     seen = set()
     out = []
     for qa in qas:
-        k = (qa["q"].strip().lower(), qa["a"][:80].strip().lower())
+        k = (qa["q"].strip().lower(), qa["a"][:120].strip().lower())
         if k in seen:
             continue
         seen.add(k)
         out.append(qa)
     return out
 
+# -------- FAQ job aggregatie --------
 def _index_faq_job(faq_job_raw: Any) -> Tuple[Dict[str, List[Dict[str, str]]], Dict[str, bool]]:
     by_url: Dict[str, List[Dict[str, str]]] = {}
     schema_flags: Dict[str, bool] = {}
@@ -287,6 +307,7 @@ def _infer_ptype(url: str, page: Dict[str, Any]) -> str:
         return "faq"
     return "other"
 
+# -------- Q/A merge + audit --------
 def _merge_qas(q_jsonld: List[Dict[str, str]], q_faqjob: List[Dict[str, str]], q_visible: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Dict[str, int], int, int, List[Dict[str,str]]]:
     all_src = q_jsonld + q_visible + q_faqjob
     src_counts = {"jsonld": len(q_jsonld), "faq_job": len(q_faqjob), "visible": len(q_visible)}
@@ -419,6 +440,7 @@ def _score_and_issues(ptype: str, counts: Dict[str, Any], has_faq_schema: bool, 
     score = max(0, min(100, score))
     return score, issues
 
+# -------- main job --------
 def generate_aeo(conn, job):
     site_id = job["site_id"]
     payload = job.get("payload") or {}
