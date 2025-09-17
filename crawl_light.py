@@ -4,7 +4,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 DEFAULT_TIMEOUT = 10
-MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "900000"))  # iets ruimer
+MAX_HTML_BYTES = int(os.getenv("CRAWL_MAX_HTML_BYTES", "900000"))
 HEADERS_TEMPLATE = lambda ua: {"User-Agent": ua or "AseonBot/0.4 (+https://aseon.ai)"}
 
 _SKIP_EXT = {
@@ -81,7 +81,7 @@ def _extract_tag_once(html: str, tag: str):
 
 def _extract_multi(html: str, tag: str, maxn=50, max_chars=600):
     out = []
-    for m in re.finditer(rf'<{tag}[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S):
+    for m in re.finditer(rf'<{tag}\b[^>]*>(.*?)</{tag}>', html, flags=re.I|re.S):
         t = _clean_text(m.group(1))
         if not t: continue
         if len(t) > max_chars: t = t[:max_chars]
@@ -89,7 +89,7 @@ def _extract_multi(html: str, tag: str, maxn=50, max_chars=600):
         if len(out) >= maxn: break
     return out
 
-def _extract_dom_blocks(html: str, maxn=400, max_chars=700):
+def _extract_dom_blocks(html: str, maxn=800, max_chars=700):
     """
     Preserveert DOM-volgorde van relevante elementen voor Q/A-detectie.
     """
@@ -104,7 +104,7 @@ def _extract_dom_blocks(html: str, maxn=400, max_chars=700):
         if len(out) >= maxn: break
     return out
 
-def _extract_paragraphs(html: str, maxn=200, max_chars=600):
+def _extract_paragraphs(html: str, maxn=300, max_chars=600):
     return _extract_multi(html, "p", maxn=maxn, max_chars=max_chars)
 
 def _extract_jsonld_blocks(html: str):
@@ -146,7 +146,7 @@ def _meta_prop(html: str, prop: str):
     return m.group(1).strip() if m else None
 
 def _robots_meta(html: str):
-    m = re.search(r'<meta[^>]+name=["\']robots["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re.S)
+    m = re.search(r'<meta[^>]+name=["\']robots["\'][^>]*content=["\'](.*?)["\']', html, flags=re.I|re/S)
     if not m: return (False, False)
     c = m.group(1).lower()
     return ("noindex" in c, "nofollow" in c)
@@ -161,6 +161,56 @@ def _extract_links(html: str, base_url: str):
         if abs_url.startswith("http") and not _seems_asset(abs_url):
             links.append(abs_url)
     return links
+
+# Q-detectie voor DOM-parsing (lichte heuristiek)
+QUESTION_PREFIXES = (
+    "what ","how ","why ","when ","can ","does ","do ","is ","are ","should ","will ","where ","who ",
+    "wat ","hoe ","waarom ","wanneer ","kan ","doet ","doen ","is ","zijn ","moet ","zal ","waar ","wie "
+)
+def _looks_like_question(s: str) -> bool:
+    if not s: return False
+    t = s.strip().lower()
+    if t.endswith("?"): return True
+    return any(t.startswith(p) for p in QUESTION_PREFIXES) and len(t.split()) >= 2
+
+def _pair_dom_qas(dom_blocks):
+    """Vorm Q/A-paren uit DOM-volgorde (summary/button/dt/h2/h3 als Q; p/dd/li als A)."""
+    if not isinstance(dom_blocks, list): return []
+    blocks = [{"tag": b.get("tag",""), "text": (b.get("text") or "").strip()} for b in dom_blocks if isinstance(b, dict)]
+    out = []
+    used = set()
+    for i, b in enumerate(blocks):
+        tag = b["tag"]
+        txt = b["text"]
+        if not txt: continue
+        if tag in ("summary","button","dt","h2","h3") or _looks_like_question(txt):
+            # zoek antwoord in de volgende blokken
+            a = ""
+            for j in range(i+1, min(i+12, len(blocks))):
+                if j in used: continue
+                t2 = blocks[j]["text"]
+                tag2 = blocks[j]["tag"]
+                if _looks_like_question(t2): break
+                if tag2 not in ("p","dd","li"): 
+                    # toch toestaan als het lang genoeg is
+                    if len(t2.split()) < 6: 
+                        continue
+                else:
+                    if len(t2.split()) < 6:
+                        continue
+                a = t2
+                used.add(j)
+                break
+            if a:
+                out.append({"q": txt, "a": a})
+    # dedupe op vraag
+    seen = set(); dedup = []
+    for qa in out:
+        key = qa["q"].strip().lower()
+        if key in seen: continue
+        seen.add(key)
+        dedup.append(qa)
+    return dedup[:200]
 
 # ---------- main ----------
 def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
@@ -192,22 +242,26 @@ def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
         h2 = []; h3 = []; paragraphs = []; lis = []; summaries = []; buttons = []; dts = []; dds = []
         outlinks = []
         faq_jsonld = None
+        faq_visible = []
         word_count = 0
 
         if is_html and html:
             title = _extract_title(html)
             h1 = _extract_tag_once(html, "h1")
-            h2 = _extract_multi(html, "h2", maxn=50)
-            h3 = _extract_multi(html, "h3", maxn=50)
-            paragraphs = _extract_paragraphs(html, maxn=250)
-            lis = _extract_multi(html, "li", maxn=250)
-            summaries = _extract_multi(html, "summary", maxn=250)
-            buttons = _extract_multi(html, "button", maxn=250)
-            dts = _extract_multi(html, "dt", maxn=250)
-            dds = _extract_multi(html, "dd", maxn=250)
+            h2 = _extract_multi(html, "h2", maxn=80)
+            h3 = _extract_multi(html, "h3", maxn=80)
+            paragraphs = _extract_paragraphs(html, maxn=400)
+            lis = _extract_multi(html, "li", maxn=400)
+            summaries = _extract_multi(html, "summary", maxn=400)
+            buttons = _extract_multi(html, "button", maxn=400)
+            dts = _extract_multi(html, "dt", maxn=400)
+            dds = _extract_multi(html, "dd", maxn=400)
 
-            dom_blocks_tagged = _extract_dom_blocks(html, maxn=600)
-            dom_blocks = [x["text"] for x in dom_blocks_tagged]
+            dom_blocks_tagged = _extract_dom_blocks(html, maxn=1000)
+            dom_blocks = dom_blocks_tagged  # lijst van {tag,text}
+
+            # Q/A uit DOM-volgorde
+            faq_visible = _pair_dom_qas(dom_blocks_tagged)
 
             meta_desc = _meta_name(html, "description")
             og_title = _meta_prop(html, "og:title")
@@ -224,7 +278,7 @@ def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
                     all_types.add(t)
             jsonld_types = sorted(all_types)
 
-            # only FAQ-relevante blokken meesturen
+            # FAQ JSON-LD kandidaten
             faq_candidates = []
             def looks_like_faq(obj):
                 if isinstance(obj, dict):
@@ -241,17 +295,13 @@ def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
                             faq_candidates.append(node)
             if faq_candidates:
                 try:
-                    faq_jsonld = json.dumps(faq_candidates)  # als string opslaan
+                    faq_jsonld = json.dumps(faq_candidates)
                 except Exception:
                     faq_jsonld = None
 
-            # links
             outlinks = [l for l in _extract_links(html, final_url) if _same_host(start_host, l)]
-
-            # zichtbare woorden
             word_count = len(_clean_text(html).split())
 
-            # issues
             if not meta_desc: issues.append("missing_meta_description")
             if not h1: issues.append("missing_h1")
             if canon:
@@ -275,13 +325,14 @@ def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
             "h1": h1,
             "h2": h2,
             "h3": h3,
-            "paragraphs": paragraphs,      # nu ALLE p's (tot 250)
+            "paragraphs": paragraphs,
             "li": lis,
             "summary": summaries,
             "buttons": buttons,
             "dt": dts,
             "dd": dds,
-            "dom_blocks": dom_blocks,      # cruciaal: DOM-volgorde
+            "dom_blocks": dom_blocks,         # lijst van {tag,text}
+            "faq_visible": faq_visible,       # lijst van {q,a} uit DOM
             "meta_description": meta_desc,
             "og_title": og_title,
             "og_description": og_desc,
@@ -290,7 +341,7 @@ def crawl_site(start_url: str, max_pages: int = 12, ua: str = None) -> dict:
             "noindex": noindex,
             "nofollow": nofollow,
             "jsonld_types": jsonld_types,
-            "faq_jsonld": faq_jsonld,      # stringified JSON
+            "faq_jsonld": faq_jsonld,         # stringified JSON
             "links": outlinks,
             "word_count": word_count,
             "issues": issues
