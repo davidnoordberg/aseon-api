@@ -1,4 +1,5 @@
-# report_agent.py
+# report_agent.py  —  HTML-only report (no ReportLab)
+# Generates a single self-contained HTML report string (base64-encoded) + CSV exports.
 
 import os
 import io
@@ -9,26 +10,9 @@ import base64
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
-from html import unescape as html_unescape
+from html import escape as html_escape, unescape as html_unescape
 
 from psycopg.rows import dict_row
-
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    PageBreak,
-    Table,
-    TableStyle,
-    XPreformatted,
-    KeepTogether,
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from xml.sax.saxutils import escape as xml_escape
-
 from openai import OpenAI
 
 OPENAI_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -90,67 +74,54 @@ def _norm_url(u: str) -> str:
 
 
 # -----------------------------------------------------
-# PDF helpers
+# HTML helpers
 # -----------------------------------------------------
-def _styles():
-    styles = getSampleStyleSheet()
-    if "Small" not in styles.byName:
-        styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12))
-    if "Tiny" not in styles.byName:
-        styles.add(ParagraphStyle(name="Tiny", fontSize=8, leading=10))
-    if "MonoSmall" not in styles.byName:
-        styles.add(ParagraphStyle(name="MonoSmall", fontName="Courier", fontSize=8, leading=10))
-    if "H3tight" not in styles.byName:
-        styles.add(ParagraphStyle(name="H3tight", parent=styles["Heading3"], spaceBefore=6, spaceAfter=4))
-    return styles
-
-
-def P(text: str, style_name: str = "Small") -> Paragraph:
-    """ALTIJD veilig: escapen + <br/> voor regeleinden."""
-    s = _styles()
-    safe = xml_escape(str(text or "")).replace("\n", "<br/>")
-    return Paragraph(safe, s[style_name])
-
-
-def Code(text: str) -> XPreformatted:
-    s = _styles()
-    return XPreformatted(text or "", s["MonoSmall"])
-
-
-def _make_table(data: List[List[Any]], col_widths: List[float]) -> Table:
-    """Wrap alle stringcellen in P() zodat ReportLab nooit HTML gaat parsen."""
-    safe_data: List[List[Any]] = []
-    for row in data:
-        safe_row: List[Any] = []
-        for cell in row:
-            if isinstance(cell, str):
-                cell = P(cell, "Small")
-            safe_row.append(cell)
-        safe_data.append(safe_row)
-    t = Table(safe_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#C8C8C8")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ]
-        )
-    )
-    return t
-
+def _h(s: Any) -> str:
+    return html_escape(str(s or ""))
 
 def _shorten(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     return (s[: max_chars - 1] + "…") if len(s) > max_chars else s
 
-
 def _attr_escape(s: str) -> str:
-    return xml_escape(s or "").replace('"', "&quot;")
+    return html_escape(s or "", quote=True)
+
+def _html_section(title: str, inner_html: str, anchor: Optional[str] = None) -> str:
+    aid = f' id="{anchor}"' if anchor else ""
+    return f"""
+<section{aid}>
+  <h2>{_h(title)}</h2>
+  {inner_html}
+</section>
+"""
+
+def _html_table(headers: List[str], rows: List[List[str]], col_styles: Optional[List[str]] = None) -> str:
+    thead = "<tr>" + "".join(f"<th>{_h(h)}</th>" for h in headers) + "</tr>"
+    body_rows = []
+    for r in rows:
+        tds = []
+        for i, cell in enumerate(r):
+            style = (col_styles[i] if col_styles and i < len(col_styles) else "")
+            if style:
+                tds.append(f'<td style="{style}">{cell}</td>')
+            else:
+                tds.append(f"<td>{cell}</td>")
+        body_rows.append("<tr>" + "".join(tds) + "</tr>")
+    return f"""
+<table class="grid">
+  <thead>{thead}</thead>
+  <tbody>
+    {''.join(body_rows)}
+  </tbody>
+</table>
+"""
+
+def _html_code_block(text: str) -> str:
+    # Show literal HTML/JSON in a code block (escaped)
+    return f"<pre class=\"code\"><code>{_h(text)}</code></pre>"
+
+def _download_link(data_b64: str, filename: str, mime: str = "text/csv") -> str:
+    return f'<a class="download" download="{_h(filename)}" href="data:{mime};base64,{data_b64}">{_h(filename)}</a>'
 
 
 # -----------------------------------------------------
@@ -170,51 +141,6 @@ def _detect_lang(texts: List[str], site_lang: Optional[str]) -> str:
     if en_score > nl_score:
         return "en"
     return default
-
-
-# -----------------------------------------------------
-# Core helpers (unique pages, duplicates, proposals)
-# -----------------------------------------------------
-def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    bucket: Dict[str, Dict[str, Any]] = {}
-
-    def _score(pp: Dict[str, Any]) -> Tuple[int, int]:
-        return (1 if (pp.get("status") == 200) else 0, int(pp.get("word_count") or 0))
-
-    for p in pages or []:
-        u = _norm_url(p.get("final_url") or p.get("url") or "")
-        if not u:
-            continue
-        cur = bucket.get(u)
-        if (cur is None) or (_score(p) > _score(cur)):
-            bucket[u] = p
-    return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
-
-
-def _dup_map(values: List[Optional[str]]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for v in values:
-        if not v:
-            continue
-        k = v.strip().lower()
-        if not k:
-            continue
-        counts[k] = counts.get(k, 0) + 1
-    return counts
-
-
-def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
-    inlinks: Dict[str, int] = {}
-    url_index = {}
-    for p in pages:
-        u = _norm_url(p.get("final_url") or p.get("url") or "")
-        url_index[u] = True
-    for p in pages:
-        for l in (p.get("links") or []):
-            tgt = _norm_url(l)
-            if tgt in url_index:
-                inlinks[tgt] = inlinks.get(tgt, 0) + 1
-    return inlinks
 
 
 # -----------------------------------------------------
@@ -321,6 +247,47 @@ _TEXT_FINDINGS_ALL = {
 
 _PATCHABLE_FINDINGS = {"Missing canonical", "Canonical differs from page URL", "Missing Open Graph tags"}
 
+def _dup_map(values: List[Optional[str]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for v in values:
+        if not v:
+            continue
+        k = v.strip().lower()
+        if not k:
+            continue
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _unique_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    bucket: Dict[str, Dict[str, Any]] = {}
+
+    def _score(pp: Dict[str, Any]) -> Tuple[int, int]:
+        return (1 if (pp.get("status") == 200) else 0, int(pp.get("word_count") or 0))
+
+    for p in pages or []:
+        u = _norm_url(p.get("final_url") or p.get("url") or "")
+        if not u:
+            continue
+        cur = bucket.get(u)
+        if (cur is None) or (_score(p) > _score(cur)):
+            bucket[u] = p
+    return [{**v, "final_url": u, "url": u} for u, v in bucket.items()]
+
+
+def _build_link_graph(pages: List[Dict[str, Any]]) -> Dict[str, int]:
+    inlinks: Dict[str, int] = {}
+    url_index = {}
+    for p in pages:
+        u = _norm_url(p.get("final_url") or p.get("url") or "")
+        url_index[u] = True
+    for p in pages:
+        for l in (p.get("links") or []):
+            tgt = _norm_url(l)
+            if tgt in url_index:
+                inlinks[tgt] = inlinks.get(tgt, 0) + 1
+    return inlinks
+
 
 def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[str]) -> List[Dict[str, Any]]:
     if not crawl:
@@ -368,7 +335,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
                     "problem": ", ".join(reason),
                     "current": title or ("(empty)" if lang != "nl" else "(leeg)"),
                     "proposed": prop["title"],
-                    "html_patch": f"<title>{xml_escape(prop['title'])}</title>",
+                    "html_patch": f"<title>{_attr_escape(prop['title'])}</title>",
                     "lang": lang,
                 }
             )
@@ -403,7 +370,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
                     "problem": "H1 duplicates title" if lang != "nl" else "H1 is identiek aan title",
                     "current": h1,
                     "proposed": h1_alt,
-                    "html_patch": f"<h1>{xml_escape(h1_alt)}</h1>",
+                    "html_patch": f"<h1>{_attr_escape(h1_alt)}</h1>",
                     "lang": lang,
                 }
             )
@@ -417,7 +384,7 @@ def _build_text_findings(crawl: Optional[Dict[str, Any]], site_lang: Optional[st
                     "problem": "low visible text (<250 words)" if lang != "nl" else "weinig zichtbare tekst (<250 woorden)",
                     "current": (paras[0] if paras else ("(no visible paragraph)" if lang != "nl" else "(geen tekst)")),
                     "proposed": intro,
-                    "html_patch": f"<p>{xml_escape(intro)}</p>",
+                    "html_patch": f"<p>{_attr_escape(intro)}</p>",
                     "lang": lang,
                 }
             )
@@ -568,6 +535,7 @@ def _build_seo_findings(crawl: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str,
 # AEO helpers (normalize, parse, heuristics)
 # -----------------------------------------------------
 _FAQ_URL_HINTS = ("/faq", "/faqs", "/veelgestelde-vragen", "#faq")
+_TAG_RE = re.compile(r"<[^>]+>")
 
 def _is_likely_faq_url(u: str) -> bool:
     p = urlsplit(u)
@@ -575,8 +543,6 @@ def _is_likely_faq_url(u: str) -> bool:
     frag = (p.fragment or "").lower()
     joined = path + ("#" + frag if frag else "")
     return any(h in joined for h in _FAQ_URL_HINTS)
-
-_TAG_RE = re.compile(r"<[^>]+>")
 
 def _strip_html(s: str) -> str:
     if not s:
@@ -593,10 +559,6 @@ def _trim_words(s: str, limit: int = 80) -> Tuple[str, bool]:
     return " ".join(words[:limit]) + "…", True
 
 def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
-    """
-    Extract Q/A pairs from a FAQPage JSON-LD object.
-    Handles dict, list, minimal structure.
-    """
     out: List[Dict[str, str]] = []
 
     def _handle_entity(entity):
@@ -609,15 +571,14 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
             ans = ans[0]
         if isinstance(ans, dict):
             a_text = ans.get("text") or ans.get("answer") or ""
-        q = _strip_html(q)
-        a_text = _strip_html(a_text)
-        if q and a_text:
-            out.append({"q": q, "a": a_text})
+        q_local = _strip_html(q)
+        a_local = _strip_html(a_text)
+        if q_local and a_local:
+            out.append({"q": q_local, "a": a_local})
 
     def _handle_root(obj):
         if not isinstance(obj, dict):
             return
-        # If it's a graph array wrapped in @graph
         if "@graph" in obj and isinstance(obj["@graph"], list):
             for node in obj["@graph"]:
                 if isinstance(node, dict) and str(node.get("@type", "")).lower() == "faqpage":
@@ -627,7 +588,6 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
                             _handle_entity(ent)
                     else:
                         _handle_entity(main)
-        # Plain FAQPage object
         main = obj.get("mainEntity") or obj.get("main_entity") or []
         if isinstance(main, list):
             for ent in main:
@@ -655,12 +615,10 @@ def _qas_from_jsonld(faq_jsonld: Any) -> List[Dict[str, str]]:
         deduped.append(qa)
     return deduped
 
-
 def _infer_ptype(url: str, page: Dict[str, Any]) -> str:
     given = (page.get("type") or "").lower().strip()
     if given == "faq":
         return "faq"
-    # Heuristics
     if page.get("faq_jsonld"):
         return "faq"
     metrics = page.get("metrics") or {}
@@ -672,7 +630,7 @@ def _infer_ptype(url: str, page: Dict[str, Any]) -> str:
 
 
 # -----------------------------------------------------
-# AEO (quality heuristics from FAQ job)
+# AEO findings (from jobs)
 # -----------------------------------------------------
 def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -721,9 +679,6 @@ def _aeo_findings_from_faq(faq: Optional[Dict[str, Any]], crawl: Optional[Dict[s
     return out
 
 
-# -----------------------------------------------------
-# AEO (from AEO job: scorecards/issues -> findings)
-# -----------------------------------------------------
 def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not aeo_concrete:
@@ -760,7 +715,6 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
                     "fix": "Add valid FAQPage JSON-LD matching on-page Q&A.",
                     "accept": ["Rich Results Test: valid FAQPage", "JSON-LD matches visible questions/answers"],
                 })
-            # Overlong answers (if provided in metrics)
             if int(metrics.get("answers_gt_80w") or 0) > 0:
                 out.append({
                     "url": url,
@@ -773,10 +727,11 @@ def _aeo_findings_from_aeo_job(aeo_concrete: Dict[str, Any]) -> List[Dict[str, A
 
 
 # -----------------------------------------------------
-# AEO concrete (from aeo job) -> scorecards, Q&A rows, patches, plan_items
+# AEO concrete (from aeo job) -> scorecards, Q&A, patches, plan_items
 # -----------------------------------------------------
 def _task_texts_for_content(field: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
+    f = (field or "").lower()
     mapping = {
         "hero": ("Hero section", "Answer-first headline + subhead + primary CTA."),
         "subhead": ("Subhead", "Clarify value in one sentence."),
@@ -796,7 +751,7 @@ def _task_texts_for_content(field: str, lang: str) -> Tuple[str, str]:
             "ctas": ("CTA’s", "Primaire/secundaire vervolgstappen."),
             "intro_paragraph": ("Intro-alinea", "Korte, antwoord-first intro."),
         }
-    label, why = mapping.get((field or "").lower(), (("Content patch", "Improve clarity and conversion.") if not nl else ("Content patch", "Verbeter duidelijkheid en conversie.")))
+    label, why = mapping.get(f, (("Content patch", "Improve clarity and conversion.") if not nl else ("Content patch", "Verbeter duidelijkheid en conversie.")))
     return label, why
 
 
@@ -814,12 +769,10 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         lang = page.get("lang") or "en"
         ptype = _infer_ptype(url, page)
 
-        # Collect Q&A from job + JSON-LD
         qas_job = page.get("qas") or []
         qas_ld = _qas_from_jsonld(page.get("faq_jsonld") or {})
         merged_qas: List[Dict[str, str]] = []
 
-        # Merge & dedupe by question
         seen = set()
         for src in (qas_job, qas_ld):
             for qa in src:
@@ -833,16 +786,13 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 seen.add(k)
                 merged_qas.append({"q": q, "a": a})
 
-        # Count overlong answers before trimming
         answers_gt_80w = sum(1 for qa in merged_qas if len((qa["a"] or "").split()) > 80)
 
-        # Build Q&A rows for the report (trim to ≤80 words)
         if ptype == "faq" and merged_qas:
             for qa in merged_qas:
                 trimmed, _ = _trim_words(qa["a"], 80)
                 rows.append({"url": url, "q": qa["q"], "a": trimmed, "gaps": ", ".join(page.get("issues") or []) or "OK"})
 
-        # Prepare patches for FAQ (only if relevant)
         faq_html = page.get("faq_html") or ""
         faq_jsonld = page.get("faq_jsonld") or {}
 
@@ -891,7 +841,6 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "lang": lang
             })
 
-        # Content patches for non-FAQ (optional from AEO agent)
         for cp in (page.get("content_patches") or []):
             field = cp.get("field") or "content"
             html_patch = cp.get("html_patch") or ""
@@ -936,10 +885,8 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "lang": lang
             })
 
-        # Scorecard (issues corrected by our detection)
         score = int(page.get("score") or 0)
         issues = [str(i) for i in (page.get("issues") or [])]
-        # remove false positives
         if ptype == "faq":
             if merged_qas and len(merged_qas) >= 3:
                 issues = [i for i in issues if "too few q&a" not in i.lower()]
@@ -947,7 +894,7 @@ def _aeo_from_job(aeo: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 issues = [i for i in issues if "no faqpage json-ld" not in i.lower()]
 
         metrics_in = page.get("metrics") or {}
-        metrics = dict(metrics_in)  # copy
+        metrics = dict(metrics_in)
         metrics["qas_detected"] = len(merged_qas)
         metrics["answers_gt_80w"] = answers_gt_80w
         metrics["answers_leq_80w"] = max(0, len(merged_qas) - answers_gt_80w)
@@ -1063,7 +1010,8 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
                     "category": "open_graph",
                     "problem": "missing og:title/og:description" if (not og_title and not og_desc) else ("missing og:title" if not og_title else "missing og:description"),
                     "current": f"og:title={'present' if og_title else 'missing'}, og:description={'present' if og_desc else 'missing'}",
-                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n" f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
+                    "html_patch": (f"<meta property=\"og:title\" content=\"{_attr_escape(ogt)}\">\n"
+                                   f"<meta property=\"og:description\" content=\"{_attr_escape(ogd)}\">"),
                 }
             )
 
@@ -1071,16 +1019,14 @@ def _build_canonical_og_patches(crawl: Optional[Dict[str, Any]], text_rows: List
 
 
 # -----------------------------------------------------
-# Implementatieplan — scoring & builders
+# Implementation plan helpers
 # -----------------------------------------------------
 def _sev_num(sev: str) -> int:
     s = (sev or "").lower()
     return 3 if s == "high" else (2 if s == "medium" else 1)
 
-
 def _effort_label(n: int) -> str:
     return {1: "S", 2: "M", 3: "L"}.get(int(n or 1), "S")
-
 
 def _impact_effort_for_text(field: str) -> Tuple[int, int]:
     f = (field or "").lower()
@@ -1094,7 +1040,6 @@ def _impact_effort_for_text(field: str) -> Tuple[int, int]:
         return 3, 2
     return 2, 2
 
-
 def _impact_effort_for_patch(category: str, problem: str) -> Tuple[int, int]:
     c = (category or "").lower()
     if c == "canonical":
@@ -1102,7 +1047,6 @@ def _impact_effort_for_patch(category: str, problem: str) -> Tuple[int, int]:
     if c == "open_graph":
         return 2, 1
     return 2, 2
-
 
 def _impact_effort_for_finding(finding: str) -> Tuple[int, int]:
     f = (finding or "").lower()
@@ -1115,7 +1059,6 @@ def _impact_effort_for_finding(finding: str) -> Tuple[int, int]:
     if f == "missing h1":
         return 3, 1
     return 2, 2
-
 
 def _task_texts_for_text(field: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
@@ -1134,7 +1077,6 @@ def _task_texts_for_text(field: str, lang: str) -> Tuple[str, str]:
                 "≥250 woorden, antwoord-first; versterkt topical authority." if nl else "≥250 words, answer-first; strengthens topical authority.")
     return ("Tekstoptimalisatie", "Contentverbetering") if nl else ("Text optimisation", "Content improvement")
 
-
 def _task_texts_for_patch(category: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
     c = (category or "").lower()
@@ -1143,7 +1085,6 @@ def _task_texts_for_patch(category: str, lang: str) -> Tuple[str, str]:
     if c == "open_graph":
         return ("Open Graph instellen", "Nettere previews op social/AI; indirecte CTR.") if nl else ("Set up Open Graph", "Cleaner social/AI previews; indirect CTR benefits.")
     return ("Technische patch", "Verbetering in <head>") if nl else ("Technical patch", "Head improvement")
-
 
 def _task_texts_for_finding(finding: str, lang: str) -> Tuple[str, str]:
     nl = lang == "nl"
@@ -1158,14 +1099,14 @@ def _task_texts_for_finding(finding: str, lang: str) -> Tuple[str, str]:
         return ("H1 toevoegen", "Duidelijk hoofdonderwerp voor bezoekers en bots.") if nl else ("Add H1", "Clear primary topic for users and bots.")
     return (("Technische SEO-fix: " + finding), "Los dit item op.") if nl else (("Technical SEO fix: " + finding), "Resolve this issue.")
 
-
 def _plan_items(text_rows: List[Dict[str, Any]], tag_patches: List[Dict[str, Any]], technical_rows: List[Dict[str, Any]], pages: List[Dict[str, Any]], site_lang: Optional[str]) -> List[Dict[str, Any]]:
     by_url = {_norm_url(p.get("final_url") or p.get("url") or ""): p for p in (pages or [])}
     items: List[Dict[str, Any]] = []
 
     for r in text_rows:
         url = r["url"]
-        lang = r.get("lang") or _detect_lang([(by_url.get(url) or {}).get("title") or "", (by_url.get(url) or {}).get("h1") or ""] + ((by_url.get(url) or {}).get("paragraphs") or []), site_lang)
+        page = by_url.get(url) or {}
+        lang = r.get("lang") or _detect_lang([page.get("title") or "", page.get("h1") or ""] + (page.get("paragraphs") or []), site_lang)
         impact, effort = _impact_effort_for_text(r["field"])
 
         prob = (r.get("problem") or "").lower()
@@ -1275,7 +1216,11 @@ def _csv_base64(rows: List[Dict[str, Any]], columns: List[str]) -> str:
     writer = csv.writer(buff)
     writer.writerow(columns)
     for r in rows:
-        writer.writerow([r.get(c, "") if not isinstance(r.get(c, ""), (list, dict)) else json.dumps(r.get(c, "")) for c in columns])
+        def _cell(val):
+            if isinstance(val, (list, dict)):
+                return json.dumps(val, ensure_ascii=False)
+            return val
+        writer.writerow([_cell(r.get(c, "")) for c in columns])
     return base64.b64encode(buff.getvalue().encode("utf-8")).decode("utf-8")
 
 
@@ -1406,7 +1351,7 @@ def _try_llm_summary(site_meta, seo_rows, geo_rows, aeo_rows, aeo_scorecards=Non
 
 
 # -----------------------------------------------------
-# Report generation
+# Report generation (HTML)
 # -----------------------------------------------------
 def generate_report(conn, job):
     site_id = job["site_id"]
@@ -1456,225 +1401,325 @@ def generate_report(conn, job):
         else "This report lists concrete issues and recommendations across SEO, GEO and AEO with acceptance criteria."
     )
 
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
-    )
-    width = doc.width
-    elems: List[Any] = []
-    S = _styles()
+    # ---------- Build HTML ----------
+    brand = site_meta.get("account_name") or "YourBrand"
+    site_url = site_meta.get("url") or ""
+    title = f"SEO • GEO • AEO Audit — {site_url}"
+    lang_attr = "nl" if (site_meta.get("language") or "").lower().startswith("nl") else "en"
 
-    # Titel + exec summary (veilig)
-    title = f"SEO • GEO • AEO Audit — {site_meta.get('url') or ''}"
-    elems.append(P(title, "Title"))
-    elems.append(P(f"Generated: {now}", "Normal"))
-    elems.append(Spacer(1, 8))
-    elems.append(P(exec_summary, "Small"))
-    elems.append(PageBreak())
+    # Downloads
+    downloads_html = f"""
+<div class="downloads">
+  <strong>Exports:</strong>
+  {_download_link(patches_csv_b64, "patches.csv")}
+  {_download_link(plan_csv_b64, "implementation_plan.csv")}
+</div>
+"""
 
     # AEO scorecards
-    elems.append(P("AEO — Answer readiness (scorecards)", "Heading2"))
     if not aeo_scorecards:
-        elems.append(P("No AEO job output yet.", "Normal"))
+        aeo_cards_html = "<p>No AEO job output yet.</p>"
     else:
         headers = ["Page URL", "Score (0–100)", "Issues", "Metrics"]
-        colw = [0.32 * width, 0.14 * width, 0.28 * width, 0.26 * width]
-        data = [headers]
+        rows = []
         for r in aeo_scorecards:
-            metrics_txt = ", ".join([f"{k}:{v}" for k, v in (r.get("metrics") or {}).items()])
+            metrics_txt = ", ".join([f"{_h(k)}:{_h(v)}" for k, v in (r.get("metrics") or {}).items()])
             issues_txt = ", ".join(r.get("issues") or []) or "OK"
             url_txt = r.get("url") or ""
             if r.get("type"):
                 url_txt = f"{url_txt}  [{r.get('type')}]"
-            data.append([_shorten(url_txt, 120), str(r.get("score", "")), issues_txt, metrics_txt])
-        elems.append(_make_table(data, colw))
-    elems.append(Spacer(1, 8))
+            rows.append([
+                _h(_shorten(url_txt, 120)),
+                _h(str(r.get("score", ""))),
+                _h(issues_txt),
+                _h(metrics_txt),
+            ])
+        aeo_cards_html = _html_table(headers, [[c for c in row] for row in rows])
 
     # AEO Q&A
-    elems.append(P("AEO — Q&A (snippet-ready, ready-to-paste)", "Heading2"))
     if not aeo_qna_rows:
-        elems.append(P("No Q&A candidates generated (FAQ pages only).", "Normal"))
+        aeo_qna_html = "<p>No Q&A candidates generated (FAQ pages only).</p>"
     else:
         headers = ["Page URL", "Q", "Proposed answer (≤80 words)", "Gaps"]
-        colw = [0.28 * width, 0.26 * width, 0.30 * width, 0.16 * width]
-        data = [headers]
+        rows = []
         for r in aeo_qna_rows[:80]:
-            data.append([_shorten(r["url"], 120), r["q"], r["a"], r.get("gaps") or "OK"])
-        elems.append(_make_table(data, colw))
-    elems.append(PageBreak())
+            rows.append([
+                _h(_shorten(r["url"], 120)),
+                _h(r["q"]),
+                _h(r["a"]),
+                _h(r.get("gaps") or "OK"),
+            ])
+        aeo_qna_html = _html_table(headers, rows)
 
     # SEO text fixes
-    elems.append(P("SEO — Concrete text fixes (ready-to-paste)", "Heading2"))
     if not text_rows:
-        elems.append(P("No text issues found in titles/meta/H1/intro." if (site_meta.get("language") or "").lower().startswith("en") else "Geen tekstuele problemen gevonden in titels/meta/H1/intro.", "Normal"))
+        textfix_html = "<p>No text issues found in titles/meta/H1/intro.</p>"
     else:
-        headers = ["Page URL", "Field", "Issue", "Current", "Proposed (ready-to-paste)"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Veld", "Probleem", "Huidig", "Voorstel (ready-to-paste)"]
-        colw = [0.23 * width, 0.10 * width, 0.15 * width, 0.24 * width, 0.28 * width]
-        data = [headers]
+        headers = ["Page URL", "Field", "Issue", "Current", "Proposed (ready-to-paste)"]
+        rows = []
         for r in text_rows:
-            data.append(
-                [
-                    _shorten(r["url"], 120),
-                    r["field"],
-                    r["problem"],
-                    _shorten(str(r.get("current", "")), 300),
-                    _shorten(str(r.get("proposed", "")), 300),
-                ]
-            )
-        elems.append(_make_table(data, colw))
-        elems.append(Spacer(1, 6))
-        elems.append(P("HTML patches (copy & paste):" if (site_meta.get("language") or "").lower().startswith("en") else "HTML-patches (kopieer & plak):", "Small"))
+            rows.append([
+                _h(_shorten(r["url"], 120)),
+                _h(r["field"]),
+                _h(r["problem"]),
+                _h(_shorten(str(r.get("current", "")), 300)),
+                _h(_shorten(str(r.get("proposed", "")), 300)),
+            ])
+        table = _html_table(headers, rows)
+        patches_blocks = []
+        patches_blocks.append("<h3>HTML patches (copy &amp; paste):</h3>")
         for r in text_rows[:12]:
-            elems.append(KeepTogether([P(f"{r['field']} — {r['url']}", "Tiny"), Code(r["html_patch"]), Spacer(1, 4)]))
-    elems.append(PageBreak())
+            patches_blocks.append(f"<div class='patch'><div class='patch-title'>{_h(r['field'])} — {_h(r['url'])}</div>{_html_code_block(r['html_patch'])}</div>")
+        textfix_html = table + "\n" + "\n".join(patches_blocks)
 
     # Duplicate groups — titles
-    elems.append(P("Duplicate groups — titles", "Heading2"))
     if not dup_groups["title_groups"]:
-        elems.append(P("No duplicate titles found." if (site_meta.get("language") or "").lower().startswith("en") else "Geen dubbele titles gevonden.", "Normal"))
+        dupe_titles_html = "<p>No duplicate titles found.</p>"
     else:
+        blocks = []
         for g in dup_groups["title_groups"]:
-            label = f"Current title (×{g['count']}): {_shorten(g['value'], 120)}" if (site_meta.get("language") or "").lower().startswith("en") else f"Huidige title (×{g['count']}): {_shorten(g['value'], 120)}"
-            elems.append(P(label, "Small"))
-            headers = ["Page URL", "Unique proposal"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Uniek voorstel"]
-            colw = [0.55 * width, 0.45 * width]
-            data = [headers]
+            caption = f"Current title (×{g['count']}): {_h(_shorten(g['value'], 120))}"
+            headers = ["Page URL", "Unique proposal"]
+            rows = []
             for row in g["rows"]:
-                data.append([_shorten(row["url"], 90), row["proposed"]])
-            elems.append(_make_table(data, colw))
-            elems.append(Spacer(1, 6))
-    elems.append(PageBreak())
+                rows.append([_h(_shorten(row["url"], 90)), _h(row["proposed"])])
+            blocks.append(f"<h3>{caption}</h3>" + _html_table(headers, rows))
+        dupe_titles_html = "\n".join(blocks)
 
     # Duplicate groups — meta descriptions
-    elems.append(P("Duplicate groups — meta descriptions", "Heading2"))
     if not dup_groups["meta_groups"]:
-        elems.append(P("No duplicate meta descriptions found." if (site_meta.get("language") or "").lower().startswith("en") else "Geen dubbele meta descriptions gevonden.", "Normal"))
+        dupe_meta_html = "<p>No duplicate meta descriptions found.</p>"
     else:
+        blocks = []
         for g in dup_groups["meta_groups"]:
-            label = f"Current meta (×{g['count']}): {_shorten(g['value'], 180)}" if (site_meta.get("language") or "").lower().startswith("en") else f"Huidige meta (×{g['count']}): {_shorten(g['value'], 180)}"
-            elems.append(P(label, "Small"))
-            headers = ["Page URL", "Unique proposal"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Uniek voorstel"]
-            colw = [0.55 * width, 0.45 * width]
-            data = [headers]
+            caption = f"Current meta (×{g['count']}): {_h(_shorten(g['value'], 180))}"
+            headers = ["Page URL", "Unique proposal"]
+            rows = []
             for row in g["rows"]:
-                data.append([_shorten(row["url"], 90), row["proposed"]])
-            elems.append(_make_table(data, colw))
-            elems.append(Spacer(1, 6))
-    elems.append(PageBreak())
+                rows.append([_h(_shorten(row["url"], 90)), _h(row["proposed"])])
+            blocks.append(f"<h3>{caption}</h3>" + _html_table(headers, rows))
+        dupe_meta_html = "\n".join(blocks)
 
-    # Canonical & Open Graph patches — lijst + losse Code-blokken
-    elems.append(P("HTML patches — Canonical & Open Graph", "Heading2"))
+    # Canonical & Open Graph patches
     if not tag_patches:
-        elems.append(P("No patches needed." if (site_meta.get("language") or "").lower().startswith("en") else "Geen patches nodig.", "Normal"))
+        tagpatches_html = "<p>No patches needed.</p>"
     else:
-        headers = ["Page URL", "Category", "Issue, Current"] if (site_meta.get("language") or "").lower().startswith("en") else ["Page URL", "Categorie", "Probleem, Huidig"]
-        colw = [0.35 * width, 0.15 * width, 0.50 * width]
-        data = [headers]
+        headers = ["Page URL", "Category", "Issue", "Current", "Patch (copy/paste)"]
+        rows = []
         for pch in tag_patches:
-            data.append([_shorten(pch["url"], 120), pch["category"], f"{pch['problem']} — {_shorten(pch['current'], 250)}"])
-        elems.append(_make_table(data, colw))
-        elems.append(Spacer(1, 6))
-        elems.append(P("Patches (copy & paste):" if (site_meta.get("language") or "").lower().startswith("en") else "Patches (kopieer & plak):", "Small"))
-        for pch in tag_patches[:40]:
-            label = f"{pch['category']} — {pch['url']}"
-            elems.append(KeepTogether([P(_shorten(label, 140), "Tiny"), Code(pch.get("html_patch") or ""), Spacer(1, 4)]))
-    elems.append(PageBreak())
+            rows.append([
+                _h(_shorten(pch["url"], 120)),
+                _h(pch["category"]),
+                _h(pch["problem"]),
+                _h(_shorten(pch["current"], 250)),
+                _html_code_block(pch["html_patch"]),
+            ])
+        # Last column already contains code block; keep as-is.
+        # For table, we inject raw HTML for that cell, so no further escaping:
+        safe_rows = []
+        for row in rows:
+            safe_rows.append([row[0], row[1], row[2], row[3], row[4]])
+        # Build table manually to allow raw HTML in last cell:
+        head = "<tr>" + "".join(f"<th>{_h(h)}</th>" for h in headers) + "</tr>"
+        body = []
+        for row in safe_rows:
+            body.append("<tr>" +
+                        f"<td>{row[0]}</td>" +
+                        f"<td>{row[1]}</td>" +
+                        f"<td>{row[2]}</td>" +
+                        f"<td>{row[3]}</td>" +
+                        f"<td class='nowrap'>{row[4]}</td>" +
+                        "</tr>")
+        tagpatches_html = f"<table class='grid'><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
 
     # Implementation plan
-    impl_title = "Implementation plan (priority × impact × effort)" if (site_meta.get("language") or "").lower().startswith("en") else "Implementatieplan (prioriteit × impact × effort)"
-    elems.append(P(impl_title, "Heading2"))
     if not plan_items:
-        elems.append(P("No tasks generated." if (site_meta.get("language") or "").lower().startswith("en") else "Geen taken gegenereerd.", "Normal"))
+        plan_html = "<p>No tasks generated.</p>"
     else:
-        headers = ["Status", "URL", "Task", "Why/impact", "Effort", "Priority", "Patch"] if (site_meta.get("language") or "").lower().startswith("en") else ["Status", "URL", "Taak", "Waarom/impact", "Effort", "Prioriteit", "Patch"]
-        colw = [0.07 * width, 0.23 * width, 0.20 * width, 0.25 * width, 0.09 * width, 0.08 * width, 0.08 * width]
-        data = [headers]
+        headers = ["Status", "URL", "Task", "Why/impact", "Effort", "Priority", "Patch"]
+        rows = []
         for it in plan_items[:60]:
             checkbox = "☐"
             patch_note = "yes" if it.get("patchable") and it.get("html_patch") else "—"
-            if not (site_meta.get("language") or "").lower().startswith("en"):
-                patch_note = "ja" if it.get("patchable") and it.get("html_patch") else "—"
-            data.append([checkbox, _shorten(it["url"], 110), _shorten(it["task"], 120), _shorten(it["why"], 180), it["effort_label"], str(it["priority"]), patch_note])
-        elems.append(_make_table(data, colw))
-    elems.append(PageBreak())
+            rows.append([
+                _h(checkbox),
+                _h(_shorten(it["url"], 110)),
+                _h(_shorten(it["task"], 120)),
+                _h(_shorten(it["why"], 180)),
+                _h(it["effort_label"]),
+                _h(str(it["priority"])),
+                _h(patch_note),
+            ])
+        plan_html = _html_table(headers, rows)
 
     # Other technical issues
-    elems.append(P("SEO — Other technical issues", "Heading2"))
     if not technical_rows:
-        elems.append(P("No other technical issues." if (site_meta.get("language") or "").lower().startswith("en") else "Geen overige technische issues.", "Normal"))
+        other_seo_html = "<p>No other technical issues.</p>"
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
-        data = [headers]
+        rows = []
         for r in technical_rows:
-            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
-        elems.append(_make_table(data, colw))
-    elems.append(PageBreak())
+            accept_ul = "<ul>" + "".join(f"<li>{_h(x)}</li>" for x in r["accept"]) + "</ul>"
+            rows.append([
+                _h(_shorten(r["url"], 120)),
+                _h(r["finding"]),
+                _h(r["severity"].title()),
+                _h(r["fix"]),
+                accept_ul,
+            ])
+        # Allow raw HTML in last cell (UL)
+        head = "<tr>" + "".join(f"<th>{_h(h)}</th>" for h in headers) + "</tr>"
+        body = []
+        for row in rows:
+            body.append("<tr>" +
+                        f"<td>{row[0]}</td>" +
+                        f"<td>{row[1]}</td>" +
+                        f"<td>{row[2]}</td>" +
+                        f"<td>{row[3]}</td>" +
+                        f"<td>{row[4]}</td>" +
+                        "</tr>")
+        other_seo_html = f"<table class='grid'><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
 
     # GEO Recommendations
-    elems.append(P("GEO Recommendations (entity/schema)", "Heading2"))
     if not geo_rows:
-        elems.append(P("No schema/entity recommendations." if (site_meta.get("language") or "").lower().startswith("en") else "Geen schema/entity-aanbevelingen.", "Normal"))
+        geo_html = "<p>No schema/entity recommendations.</p>"
     else:
         headers = ["Page URL", "Recommendation", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
-        data = [headers]
+        rows = []
         for r in geo_rows:
-            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
-        elems.append(_make_table(data, colw))
-    elems.append(PageBreak())
+            accept_ul = "<ul>" + "".join(f"<li>{_h(x)}</li>" for x in r["accept"]) + "</ul>"
+            rows.append([
+                _h(_shorten(r["url"], 120)),
+                _h(r["finding"]),
+                _h(r["severity"].title()),
+                _h(r["fix"]),
+                accept_ul,
+            ])
+        head = "<tr>" + "".join(f"<th>{_h(h)}</th>" for h in headers) + "</tr>"
+        body = []
+        for row in rows:
+            body.append("<tr>" +
+                        f"<td>{row[0]}</td>" +
+                        f"<td>{row[1]}</td>" +
+                        f"<td>{row[2]}</td>" +
+                        f"<td>{row[3]}</td>" +
+                        f"<td>{row[4]}</td>" +
+                        "</tr>")
+        geo_html = f"<table class='grid'><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
 
     # AEO Findings
-    elems.append(P("AEO Findings (answer & citation readiness)", "Heading2"))
     if not aeo_quality_rows:
-        elems.append(P("No AEO findings." if (site_meta.get("language") or "").lower().startswith("en") else "Geen AEO-issues.", "Normal"))
+        aeo_findings_html = "<p>No AEO findings.</p>"
     else:
         headers = ["Page URL", "Finding", "Severity", "Fix (summary)", "Acceptance Criteria"]
-        colw = [0.26 * width, 0.24 * width, 0.12 * width, 0.18 * width, 0.20 * width]
-        data = [headers]
+        rows = []
         for r in aeo_quality_rows:
-            data.append([_shorten(r["url"], 120), r["finding"], r["severity"].title(), r["fix"], "• " + "<br/>• ".join([xml_escape(x) for x in r["accept"]])])
-        elems.append(_make_table(data, colw))
-    elems.append(PageBreak())
+            accept_ul = "<ul>" + "".join(f"<li>{_h(x)}</li>" for x in r["accept"]) + "</ul>"
+            rows.append([
+                _h(_shorten(r["url"], 120)),
+                _h(r["finding"]),
+                _h(r["severity"].title()),
+                _h(r["fix"]),
+                accept_ul,
+            ])
+        head = "<tr>" + "".join(f"<th>{_h(h)}</th>" for h in headers) + "</tr>"
+        body = []
+        for row in rows:
+            body.append("<tr>" +
+                        f"<td>{row[0]}</td>" +
+                        f"<td>{row[1]}</td>" +
+                        f"<td>{row[2]}</td>" +
+                        f"<td>{row[3]}</td>" +
+                        f"<td>{row[4]}</td>" +
+                        "</tr>")
+        aeo_findings_html = f"<table class='grid'><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
 
     # Appendix — JSON-LD snippets
-    elems.append(P("Appendix — JSON-LD Snippets (paste & adapt)", "Heading2"))
-    brand = site_meta.get("account_name") or "YourBrand"
     home = (site_meta.get("url") or "").strip().rstrip("/") or "https://example.com"
     snippets = [
         ("Organization + WebSite", {"@context": "https://schema.org", "@type": "Organization", "name": brand, "url": f"{home}/", "logo": f"{home}/favicon-512.png", "sameAs": ["https://www.linkedin.com/company/yourbrand", "https://www.wikidata.org/wiki/QXXXXX"]}),
         ("WebSite", {"@context": "https://schema.org", "@type": "WebSite", "name": brand, "url": f"{home}/"}),
         ("BreadcrumbList (example)", {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [{"@type": "ListItem", "position": 1, "name": "Home", "item": f"{home}/"}]}),
     ]
+    appendix_html_blocks = []
     for title_txt, obj in snippets:
-        elems.append(P(title_txt, "H3tight"))
-        elems.append(KeepTogether([Code(json.dumps(obj, indent=2, ensure_ascii=False)), Spacer(1, 6)]))
+        appendix_html_blocks.append(f"<h3>{_h(title_txt)}</h3>{_html_code_block(json.dumps(obj, indent=2, ensure_ascii=False))}")
 
     if aeo_job:
-        elems.append(P("Appendix — AEO JSON-LD per page", "Heading2"))
+        appendix_html_blocks.append("<h2>Appendix — AEO JSON-LD per page</h2>")
         for page in (aeo_job.get("pages") or []):
             pretty = json.dumps(page.get("faq_jsonld") or {}, indent=2, ensure_ascii=False)
             if pretty.strip() and pretty != "{}":
-                elems.append(P(_shorten(_norm_url(page.get("url") or ""), 120), "H3tight"))
-                elems.append(KeepTogether([Code(pretty[:4000]), Spacer(1, 6)]))
+                appendix_html_blocks.append(f"<h3>{_h(_shorten(_norm_url(page.get('url') or ''), 120))}</h3>{_html_code_block(pretty[:4000])}")
 
     if schema_job and schema_job.get("schema"):
-        elems.append(P("Generated (from jobs.schema)", "H3tight"))
+        appendix_html_blocks.append("<h3>Generated (from jobs.schema)</h3>")
         pretty = json.dumps(schema_job["schema"], indent=2, ensure_ascii=False)
-        elems.append(KeepTogether([Code(pretty[:4000]), Spacer(1, 6)]))
+        appendix_html_blocks.append(_html_code_block(pretty[:4000]))
 
-    doc.build(elems)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
+    appendix_html = "\n".join(appendix_html_blocks)
 
-    pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    # Full HTML template
+    css = """
+* { box-sizing: border-box; }
+body { margin: 24px; font: 14px/1.5 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; color: #111; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 18px; margin: 24px 0 8px; padding-top: 6px; border-top: 1px solid #eee; }
+h3 { font-size: 14px; margin: 14px 0 6px; }
+p { margin: 6px 0; }
+small, .muted { color: #666; }
+.grid { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.grid th, .grid td { border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }
+.grid thead th { background: #f6f6f6; }
+.grid td:nth-child(1) { word-break: break-word; }
+.code { background: #0b1020; color: #e6edf3; padding: 10px 12px; border-radius: 6px; overflow: auto; }
+.patch { margin: 10px 0 14px; }
+.patch-title { font-weight: 600; margin-bottom: 6px; }
+.downloads { margin: 8px 0 16px; }
+.downloads a.download { margin-right: 12px; }
+.nowrap pre { white-space: pre; overflow: auto; }
+header { margin-bottom: 12px; }
+hr { border: 0; border-top: 1px solid #eee; margin: 16px 0; }
+"""
+
+    html = f"""<!doctype html>
+<html lang="{lang_attr}">
+<head>
+  <meta charset="utf-8">
+  <title>{_h(title)}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>{css}</style>
+</head>
+<body>
+  <header>
+    <h1>{_h(title)}</h1>
+    <div class="muted">Generated: {_h(now)}</div>
+  </header>
+
+  <section>
+    <p>{_h(exec_summary)}</p>
+    {downloads_html}
+  </section>
+
+  {_html_section("AEO — Answer readiness (scorecards)", aeo_cards_html, "aeo-scorecards")}
+  {_html_section("AEO — Q&A (snippet-ready, ready-to-paste)", aeo_qna_html, "aeo-qna")}
+  {_html_section("SEO — Concrete text fixes (ready-to-paste)", textfix_html, "seo-text")}
+  {_html_section("Duplicate groups — titles", dupe_titles_html, "dup-titles")}
+  {_html_section("Duplicate groups — meta descriptions", dupe_meta_html, "dup-metas")}
+  {_html_section("HTML patches — Canonical & Open Graph", tagpatches_html, "head-patches")}
+  {_html_section("Implementation plan (priority × impact × effort)", plan_html, "plan")}
+  {_html_section("SEO — Other technical issues", other_seo_html, "seo-other")}
+  {_html_section("GEO Recommendations (entity/schema)", geo_html, "geo")}
+  {_html_section("AEO Findings (answer & citation readiness)", aeo_findings_html, "aeo-findings")}
+  {_html_section("Appendix — JSON-LD Snippets (paste & adapt)", appendix_html, "appendix")}
+</body>
+</html>"""
+
+    html_base64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
+
     return {
-        "pdf_base64": pdf_base64,
+        "html_base64": html_base64,
+        "pdf_base64": "",  # keep key for backward compatibility; empty to avoid PDF generation
         "meta": {
             "site_id": str(site_id),
             "generated_at": now,
